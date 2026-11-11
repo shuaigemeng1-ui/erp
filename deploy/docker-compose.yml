@@ -71,7 +71,9 @@ x-app-env: &app-env
   CENTER_DATABASE_URL: "mysql+pymysql://${CENTER_DB_USER:-ventasync}:${CENTER_DB_PASSWORD:-change-me-center-password}@mysql:3306/${CENTER_DB_NAME:-ventasync_center}?charset=utf8mb4"
   # 建库 / 建号 / 迁移使用独立运维身份；单机 Compose 默认用 root，
   # 生产环境必须改为仅具备 CREATE/CREATE USER/GRANT 的最小权限账号（见 README）。
-  PROVISIONER_DATABASE_URL: "mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-change-me-root-password}@mysql:3306/"
+  # 注意：MySQL 密码包含 @ : / ? # 等字符时，必须显式设置 PROVISIONER_DATABASE_URL
+  # 并对密码做 URL 编码（例如 @ -> %40），否则连接串会被错误解析。
+  PROVISIONER_DATABASE_URL: ${PROVISIONER_DATABASE_URL:-mysql+pymysql://root:change-me-root-password@mysql:3306/}
   # 租户库路由（库名与账号由开通任务按前缀生成，凭据只存中心库）
   TENANT_DB_HOST: mysql
   TENANT_DB_PORT: "3306"

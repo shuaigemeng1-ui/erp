@@ -176,7 +176,7 @@ docker compose -f deploy/docker-compose.yml --env-file deploy/.env exec -T mysql
 | --- | --- |
 | 两租户隔离（验证项 1） | **通过**：真实开通 `demo`/`demo2` 两租户；跨租户访问均 404 `TENANT_NOT_FOUND`；商品数据互不可见 |
 | 零外键真实库（验证项 8） | **通过**：中心库 + 2 个租户库 `REFERENTIAL_CONSTRAINTS` 合计 **0 条**；表/字段中文注释齐全 |
-| 备份脚本（验证项 9 前半） | **通过**：中心库/租户库真实 `mysqldump` + `.sha256` 生成；**恢复演练仍未执行** |
+| 备份与恢复（验证项 9） | **通过**：每日 03:30 cron 全量备份；单租户恢复演练完成（29 表/tenant_0004），另一租户数据不变，恢复后自动关推送并重新启用 |
 | 租户生命周期 | **通过**：暂停后业务访问 403 `TENANT_SUSPENDED`，启用后恢复 active |
 | 邀请与权限 | **通过**：邀请链接签发 → 未登录预览 → 接受 → membership active → owner 登录 bootstrap 返回 20 项权限；令牌重复使用 422；已激活后重发 409 |
 | 商品/库存 | **通过**：商品创建、库存 +25、超扣 409 `INVENTORY_NEGATIVE_FORBIDDEN`、流水/审计落库 |
@@ -187,8 +187,8 @@ docker compose -f deploy/docker-compose.yml --env-file deploy/.env exec -T mysql
 | Worker 恢复与推送顺序（验证项 7） | **未验证**：需真实店铺推送场景与 kill Worker 演练 |
 | 备份恢复演练（验证项 9 后半） | **未执行**：需在试点租户上做恢复并核对另一租户不受影响 |
 | 真实店铺闭环（P6） | **未验证**：Shopee 应用/回调域名/测试店铺均未就绪 |
-| HTTPS / 域名 / Cookie Secure | **未启用**：当前为 IP + HTTP；建议绑定域名后由 Caddy 自动签发证书 |
+| HTTPS / 域名 / Cookie Secure | **通过**：`https://erp.alienyan.store`（Let's Encrypt 自动续期 + HSTS），HTTP 301 跳转，Cookie 已为 Secure |
 
-结论：首版系统已真实部署并完成「开通 → 邀请 → 登录 → 商品/库存 → 隔离 → 暂停/启用 → 备份」闭环验证；
-**真实 Shopee 店铺闭环与恢复演练**仍依赖外部前置条件，不得视为已通过。
+结论：首版系统已真实部署并完成「开通 → 邀请 → 登录 → 商品/库存 → 隔离 → 暂停/启用 → HTTPS → 备份 → 恢复演练」闭环验证；
+**真实 Shopee 店铺闭环**仍依赖外部前置条件（Partner 凭据与测试店铺授权），不得视为已通过。
 

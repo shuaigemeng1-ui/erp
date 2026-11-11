@@ -46,10 +46,12 @@ npm run build     # 提交前必须通过
 
 真实服务器部署（Ubuntu 24.04 / 2C2G / Docker Compose / Caddy 反代）已完成并通过端到端验证：
 
-* 访问地址：**http://121.37.45.132/**（平台管理员凭据保存在服务器 `/root/ventasync-credentials.txt`，请登录后立即修改）
+* 访问地址：**https://erp.alienyan.store/**（Let's Encrypt 证书自动续期；`http://121.37.45.132` 自动跳转）
+* 平台管理员凭据保存在服务器 `/root/ventasync-credentials.txt`（600 权限）
 * 架构与步骤：`docs/real-deployment.md`
 * 已验证：双租户真实开通（各 29 表、0 外键）、邀请激活、权限、商品/库存、租户隔离、暂停/启用、登录限流、备份脚本
-* 待外部条件：Shopee 应用与真实测试店铺联调、域名 + HTTPS、备份恢复演练（见 `docs/real-deployment.md` §6-7）
+* P0 已上线：域名 + HTTPS（自动续期）、管理员/MySQL/中心库密码轮换、每日 03:30 全量备份、单租户恢复演练
+* 待外部条件：Shopee 应用与真实测试店铺联调（需 Partner ID/Key 与店铺授权）；详见 `docs/real-deployment.md` §8
 
 
 ## 当前交付状态（2026-11-11 离线验证）

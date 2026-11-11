@@ -328,12 +328,23 @@ curl -fsS http://127.0.0.1:8080/api/v1/auth/csrf
    docker compose -f docker-compose.yml -f docker-compose.server.yml --env-file .env exec -T api python -m app.cli platform-init
    ```
 
-3. 宿主机 Caddy 反代（保留已有站点，仅追加 IP/域名站点）：
+3. 宿主机 Caddy 反代 + 自动 HTTPS（保留已有站点，仅追加域名与 IP 跳转站点；
+   完整示例见 `deploy/caddy/Caddyfile.example`）：
 
    ```caddyfile
-   http://<公网IP> {
+   erp.example.com {
        encode zstd gzip
+       header {
+           Strict-Transport-Security "max-age=31536000; includeSubDomains"
+           X-Content-Type-Options "nosniff"
+           X-Frame-Options "SAMEORIGIN"
+           Referrer-Policy "strict-origin-when-cross-origin"
+       }
        reverse_proxy 127.0.0.1:8081
+   }
+
+   http://203.0.113.10 {
+       redir https://erp.example.com{uri} permanent
    }
    ```
 
@@ -344,12 +355,41 @@ curl -fsS http://127.0.0.1:8080/api/v1/auth/csrf
    systemctl reload caddy
    ```
 
+   启用 HTTPS 后同步修改 `deploy/.env`：
+   `APP_ORIGIN=https://erp.example.com`、`CORS_ALLOW_ORIGINS=https://erp.example.com`、
+   `SESSION_COOKIE_SECURE=true`、`SHOPEE_AUTH_REDIRECT_URL=https://erp.example.com/api/v1/integrations/shopee/oauth/callback`，
+   然后 `docker compose ... up -d` 重建 api/worker/scheduler。
+
 4. 首次登录后：平台管理 → 租户管理 → 创建租户 → 「生成邀请链接」，把链接发给负责人激活；
    若服务器已有其他应用，可按需 `docker stop <容器>` 并 `docker update --restart=no <容器>`
    释放内存（保留 Caddy 与 SSH）。
 
 注意：
 * `docker-compose.server.yml` 使用 `frontend/Dockerfile.runtime`，要求上传 `frontend/dist`；
-* 2C2G 下建议 `CELERY_CONCURRENCY=1`、MySQL buffer pool 128M；实测常驻内存约 1.0GB；
+* 2C2G 下建议 `CELERY_CONCURRENCY=1`、MySQL buffer pool 128M；实测常驻内存约 1.1GB；
 * 前端镜像更新只需重新构建 `nginx` 服务：`docker compose ... build nginx && up -d nginx`。
+
+### 11.1 运维要点（实测踩坑）
+
+* **特殊字符密码**：MySQL root 密码含 `@ : / ? #` 时，Compose 拼接的连接串会被错误解析。
+  必须在 `deploy/.env` 显式设置 `PROVISIONER_DATABASE_URL` 并对密码做 URL 编码
+  （例如 `@` → `%40`），然后重建容器。
+* **nginx 上游动态解析**：`deploy/nginx/nginx.conf` 使用 Docker DNS（`resolver 127.0.0.11 valid=10s`
+  + 变量 `proxy_pass`），api 容器重建/IP 变化后不需要重启 nginx；若自定义配置，请保留该写法或用
+  变量方式避免 502。
+* **备份定时任务**：
+
+  ```cron
+  # /etc/cron.d/ventasync-backup
+  30 3 * * * root cd /opt/ventasync && bash deploy/scripts/backup.sh --all-tenants -o /opt/backups -k 14 >> /var/log/ventasync-backup.log 2>&1
+  ```
+
+* **单租户恢复演练**（正式操作前先在测试租户执行）：
+
+  ```bash
+  # 1) 平台暂停目标租户（恢复脚本拒绝 active）
+  # 2) 恢复（脚本自动校验 sha256、DROP+CREATE、恢复后关闭推送/同步）
+  bash deploy/scripts/restore.sh -f /opt/backups/vs_tenant_1_xxx.sql.gz -d vs_tenant_1 --tenant-id 1 --yes
+  # 3) 核对订单/库存/outbox 后重新开启推送/同步并启用租户
+  ```
 

@@ -2,7 +2,11 @@
 
 > 目标：把本仓库部署到 `121.37.45.132`，MySQL 使用 Docker 容器。
 > 本文只记录架构、步骤与验证证据，不含任何密码/密钥；服务器上的敏感值保存于
-> `/root/ventasync-credentials.txt`（权限 600），请登录后立即修改。
+> `/root/ventasync-credentials.txt`（权限 600），请登录后按需修改。
+>
+> 当前访问地址：**https://erp.alienyan.store/**（Let's Encrypt 证书，Caddy 自动续期；
+> `http://121.37.45.132/` 会 301 跳转到该域名）。
+
 
 ## 1. 服务器初始状态
 
@@ -21,8 +25,9 @@ IP 站点反代（原文件已备份为 `Caddyfile.bak-*`，两个已有域名�
 ## 2. 部署架构
 
 ```text
-公网 :80 ── Caddy（宿主机 systemd）
-              └─ http://121.37.45.132  -> reverse_proxy 127.0.0.1:8081
+公网 :80/:443 ── Caddy（宿主机 systemd，自动 HTTPS + HSTS）
+              ├─ https://erp.alienyan.store  -> reverse_proxy 127.0.0.1:8081
+              └─ http://121.37.45.132        -> 301 -> https://erp.alienyan.store
                     └─ nginx 容器（前端口 80，绑定 127.0.0.1:8081）
                          ├─ 静态：Vue 构建产物 dist（SPA 回退）
                          └─ /api/ -> api 容器（FastAPI + uvicorn，仅内部网络）
@@ -118,16 +123,20 @@ caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl re
 
 1. **Shopee 真实联调未做**：尚无 Shopee 应用（Partner ID/Key、回调地址审核）与已授权测试店铺，
    店铺授权、商品读取、拉单、库存推送的真实链路未验证；平台「渠道应用」仍为未配置状态。
-2. **HTTPS 未启用**：当前通过 IP + HTTP 访问（Cookie `Secure=false`）。建议绑定域名后在 Caddy
-   自动签发证书，并设置 `APP_ORIGIN=https://域名`、`SESSION_COOKIE_SECURE=true`。
-3. **运维身份使用 root**：`PROVISIONER_DATABASE_URL` 当前为 MySQL root（仅用于建库/建号/迁移）。
-   生产应改为最小权限账号。
-4. **备份未定时化**：脚本已验证，但尚未配置 cron/systemd timer；恢复演练未执行。
+2. **HTTPS 已启用**：`https://erp.alienyan.store`（Let's Encrypt，Caddy 自动续期，HSTS；HTTP 自动 301 跳转）。
+   Cookie 已改为 `Secure`，`APP_ORIGIN`/`CORS_ALLOW_ORIGINS` 已切换为 https。
+3. **运维身份仍为 root**：`PROVISIONER_DATABASE_URL` 使用 MySQL root（权限仅用于建库/建号/迁移），
+   已按用户要求统一 root 密码；P1 应替换为最小权限账号（注意：密码含 `@` 等字符时 URL 需编码）。
+4. **备份已定时化**：`/etc/cron.d/ventasync-backup` 每日 03:30 备份中心库 + 全部租户库并保留 14 天；
+   单租户恢复演练已完成（见 §8.4）。
 5. **已停止 2fauth**：如需恢复：`docker update --restart=unless-stopped 2fauth && docker start 2fauth`
    （占用 8080，与当前应用不冲突）。
 6. 测试租户/商品/审计数据仍在库中，正式试点前建议清理或改作演示数据。
 
 ## 7. 下一步计划（建议按优先级执行）
+
+> P0 已于 2026-11-11 完成（Shopee 真实店铺联调依赖外部应用审批，仍待用户提供 Partner 凭据）。
+> P0 实施与验证细节见 §8；以下保留原始计划，未完成项已在 §8.6/§8.7 标注。
 
 ### P0（上线前必须）
 1. **改密与密钥**：修改平台管理员密码、MySQL root 密码、中心库账号密码；更新 `deploy/.env` 并重启；
@@ -159,3 +168,83 @@ caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl re
 13. API/Worker 水平扩容（Nginx 多副本 upstream、Celery 分队列扩缩容）；
 14. 接入真实监控与审计告警；多租户连接池与 MySQL 连接数按租户数扩容评估；
 15. 安全加固：CSP、HSTS、依赖漏洞扫描、定期轮换店铺凭据。
+
+## 8. P0 上线加固实施与验证（2026-11-11 晚）
+
+### 8.1 域名与 HTTPS
+
+| 项 | 结果 |
+| --- | --- |
+| 域名 | `erp.alienyan.store` → A 记录 121.37.45.132（已在 223.5.5.5 / 1.1.1.1 / 8.8.8.8 验证） |
+| 证书 | Let's Encrypt，`notBefore=2026-11-11`、`notAfter=2027-02-09`，自动续期由 Caddy 负责 |
+| 访问 | `https://erp.alienyan.store/` 200、`/healthz` 200、`/api/v1/auth/csrf` 200 |
+| 跳转 | `http://121.37.45.132/` → 301 → `https://erp.alienyan.store/` |
+| 安全头 | HSTS(max-age=1y, includeSubDomains)、CSP、X-Frame-Options、X-Content-Type-Options、Referrer-Policy |
+| Cookie | `vs_session`：HttpOnly + Secure + SameSite=Lax；`vs_csrf`：Secure（JS 可读） |
+| 应用配置 | `APP_ORIGIN=https://erp.alienyan.store`、`CORS_ALLOW_ORIGINS` 同域、`SESSION_COOKIE_SECURE=true`、`SHOPEE_AUTH_REDIRECT_URL=https://erp.alienyan.store/api/v1/integrations/shopee/oauth/callback` |
+| Caddy 文件 | `/etc/caddy/Caddyfile`（每次修改前自动备份 `Caddyfile.bak-*`）；示例已归档到 `deploy/caddy/Caddyfile.example` |
+
+### 8.2 密码与密钥轮换
+
+| 对象 | 处理 | 验证 |
+| --- | --- | --- |
+| 平台管理员 | 旧密码 → 新强密码（大小写+数字+符号，长度 20） | 旧密码 401 `AUTH_INVALID_CREDENTIALS`，新密码 200；其它会话被撤销 |
+| 服务器 root | 按用户要求统一密码 | SSH 重新登录验证通过 |
+| MySQL root（`root@%`、`root@localhost`） | 按用户要求统一密码 | `mysql -uroot` 新密码登录成功；provisioner 建库/删库验证通过 |
+| 中心库运行账号 `ventasync` | 轮换为 32 位随机密码 | API 连接中心库、登录、迁移均正常 |
+| `SECRET_KEY` | 轮换为 32 字节随机值 | 服务重启后登录/CSRF 正常 |
+| `ENCRYPTION_KEY` | **保留未轮换** | 该密钥用于加密租户库密码与渠道凭据；轮换需先重加密 `tenant_databases`，列入后续变更 |
+| `PROVISIONER_DATABASE_URL` | 因 root 密码含 `@`，改为显式 URL 并对密码编码（`@`→`%40`） | `provisioner_engine` 创建/删除临时库成功 |
+
+> 敏感值统一保存在服务器 `/root/ventasync-credentials.txt`（600）；仓库中不包含任何真实密码/密钥。
+
+### 8.3 备份定时化
+
+```cron
+# /etc/cron.d/ventasync-backup
+30 3 * * * root cd /opt/ventasync && bash deploy/scripts/backup.sh --all-tenants -o /opt/backups -k 14 >> /var/log/ventasync-backup.log 2>&1
+```
+
+已按 cron 同款命令真实执行一次：中心库 + `vs_tenant_demo` + `vs_tenant_demo2` 均生成 `.sql.gz` 与 `.sha256`，
+日志写入 `/var/log/ventasync-backup.log`；cron 服务 active。
+
+### 8.4 单租户恢复演练（真实执行）
+
+步骤与结果：
+
+1. 记录另一租户 `vs_tenant_demo2` 基线：products=1、inventory_balances=1、audit_logs=3；
+2. 平台暂停 `demo` 租户（恢复脚本要求非 active）；
+3. 用最新 `vs_tenant_demo_*.sql.gz` 执行 `restore.sh -f ... -d vs_tenant_demo --tenant-id 1 --yes`；
+4. 恢复后：表数 **29**、Alembic 版本 `tenant_0004`、商品 1 条、`stock_push_enabled=0`、
+   `order_sync_enabled=0`（脚本自动关闭推送/同步）；
+5. `demo2` 三张表计数保持 **1 / 1 / 3** 不变 → 单租户恢复不影响其他租户；
+6. 重新开启推送/同步并启用租户；管理员 `bootstrap` 200、商品列表可读 → 恢复后业务可继续使用。
+
+结论：恢复脚本、sha256 校验、恢复后自动关推送、跨租户隔离均真实通过；正式试点前建议再按业务时段做一次演练。
+
+### 8.5 部署期新增修复
+
+| 问题 | 修复 |
+| --- | --- |
+| `api` 容器重建后 nginx 仍缓存旧 IP → 502 | nginx 改为 Docker DNS 动态解析（`resolver 127.0.0.11 valid=10s` + 变量 `proxy_pass`） |
+| root 密码含 `@` 导致 `PROVISIONER_DATABASE_URL` 解析错误 | Compose 支持显式 `PROVISIONER_DATABASE_URL`；文档要求 URL 编码特殊字符 |
+| 切换 HTTPS 后 `Secure` Cookie 在 HTTP 测试环无法写入 | 端到端测试统一走 https 域名；文档记录 |
+| Caddy 修改可能影响已有站点 | 每次修改前备份；`caddy validate` 通过后 reload；已有两个域名仍正常 |
+
+### 8.6 P0 完成情况
+
+| P0 项 | 状态 |
+| --- | --- |
+| 改密与密钥轮换 | **完成**（ENCRYPTION_KEY 因租户库密码加密暂不轮换，已记录） |
+| 域名 + HTTPS + 自动续期 | **完成** |
+| 备份定时化 + 恢复演练 | **完成**（每日 03:30；单租户真实恢复演练通过） |
+| SSH Key / 关闭密码登录 | **未执行**：按用户要求保留 root 密码登录（统一为指定密码）；建议后续单独配置 Key 并关闭密码登录 |
+| Shopee 应用与测试店铺联调 | **待外部条件**：需用户提供 Shopee 开放平台应用（Partner ID/Key、回调审核）与测试店铺授权；回调地址已就绪 |
+
+### 8.7 后续立即要做
+
+1. 提供 Shopee 平台应用凭据 → 平台「渠道应用」配置 → 授权测试店铺 → 完成真实订单/库存闭环；
+2. 创建最小权限 MySQL provisioner 账号并替换 root（P1），建议同时启用 SSH Key；
+3. 配置监控告警与日志采集（P1）；
+4. 按 `deploy/README.md` 做一次试点租户页面验收（成本权限、数据范围、任务状态）。
+

@@ -1,0 +1,22 @@
+[project]
+name = "ventasync-backend"
+version = "1.0.0"
+description = "VentaSync 多租户 SaaS 后端（FastAPI + SQLAlchemy 2 + MySQL）"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["alembic/*/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]

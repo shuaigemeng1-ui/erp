@@ -1,0 +1,236 @@
+:root {
+  --app-aside-bg: #1f2d3d;
+  --app-aside-bg-hover: #2b3a4d;
+  --app-border: #e4e7ed;
+  --app-muted: #909399;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
+  font-size: 14px;
+  color: #303133;
+  background-color: #f5f7fa;
+}
+
+.app-layout {
+  height: 100vh;
+}
+
+.app-aside {
+  background-color: var(--app-aside-bg);
+  transition: width 0.2s ease;
+  overflow: hidden;
+}
+
+.app-brand {
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.app-menu {
+  border-right: none;
+  background-color: transparent;
+}
+
+.app-menu:not(.el-menu--collapse) {
+  width: 100%;
+}
+
+.app-menu .el-menu-item {
+  color: #c0c4cc;
+}
+
+.app-menu .el-menu-item:hover {
+  background-color: var(--app-aside-bg-hover);
+  color: #fff;
+}
+
+.app-menu .el-menu-item.is-active {
+  background-color: #409eff;
+  color: #fff;
+}
+
+.app-menu .el-menu-item-group__title {
+  color: #7a869a;
+  font-size: 12px;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background-color: #fff;
+  border-bottom: 1px solid var(--app-border);
+  padding: 0 16px;
+}
+
+.header-left,
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.header-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.tenant-name {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-main {
+  padding: 16px;
+  background-color: #f5f7fa;
+  overflow: auto;
+}
+
+.page-card + .page-card {
+  margin-top: 12px;
+}
+
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.filter-bar .el-form-item {
+  margin-bottom: 0;
+}
+
+.table-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.toolbar-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pagination-bar {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+.mono {
+  font-family: Consolas, 'SFMono-Regular', Menlo, monospace;
+  font-size: 12px;
+}
+
+.id-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.text-muted {
+  color: var(--app-muted);
+}
+
+.json-block {
+  margin: 0;
+  padding: 8px 12px;
+  max-height: 320px;
+  overflow: auto;
+  background-color: #f7f8fa;
+  border: 1px solid var(--app-border);
+  border-radius: 4px;
+  font-family: Consolas, 'SFMono-Regular', Menlo, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.detail-descriptions {
+  margin-bottom: 12px;
+}
+
+.form-tip {
+  color: var(--app-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.scope-editor {
+  border: 1px dashed var(--app-border);
+  border-radius: 4px;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+
+.auth-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #1f2d3d 0%, #3a5169 100%);
+  padding: 24px;
+}
+
+.auth-card {
+  width: 400px;
+  background-color: #fff;
+  border-radius: 8px;
+  padding: 28px 28px 20px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+}
+
+.auth-title {
+  margin: 0 0 4px;
+  font-size: 20px;
+  text-align: center;
+}
+
+.auth-subtitle {
+  margin: 0 0 20px;
+  color: var(--app-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.auth-footer {
+  margin-top: 8px;
+  text-align: center;
+}
+
+.tenant-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.clickable-row {
+  cursor: pointer;
+}

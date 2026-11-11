@@ -40,7 +40,21 @@ npm run dev
 npm run build     # 提交前必须通过
 ```
 
-部署见 `deploy/README.md`。验收项与证据见 `docs/acceptance.md`。
+部署见 `deploy/README.md`。验收项与证据见 `docs/acceptance.md`，逐条计划对照见 `docs/plan-mapping.md`。
+
+## 当前交付状态（2026-11-11 离线验证）
+
+| 项 | 结果 |
+| --- | --- |
+| 后端应用入口 `app.main:app` | 可导入；67 条路由 / 55 个 OpenAPI 路径 |
+| 后端单元 + 契约测试 | `pytest tests/unit tests/contract -q` → 253 passed |
+| 契约自动校验 | `python scripts/verify_contracts.py` → 36 项全通过 |
+| 中心库 / 租户库迁移 | 15 / 29 张表；`FOREIGN KEY` 0；表与字段中文注释齐全 |
+| 前端生产构建 | `npm run build` 通过（vue-tsc + vite，dist ≈ 1.5 MB） |
+| 部署编排 | `docker compose config -q` 通过（未启动容器） |
+
+真实环境验收（MySQL 8.4 / Redis / Shopee 授权店铺 / 备份恢复演练 / HTTPS）需在部署机执行，
+离线结果不替代，详见 `docs/acceptance.md` §5。
 
 ## 硬性约束
 

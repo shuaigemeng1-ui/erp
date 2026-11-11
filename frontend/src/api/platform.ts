@@ -1,0 +1,90 @@
+import { http, requestPage } from './http'
+import { segment } from './paths'
+import type {
+  AcceptedTask,
+  ChannelApp,
+  ChannelAppPayload,
+  CreateTenantPayload,
+  CreateTenantResult,
+  EntityId,
+  PageParams,
+  PagedData,
+  Plan,
+  PlanPatchPayload,
+  PlanPayload,
+  PlatformAuditLog,
+  PlatformTenant,
+  PlatformTenantDetail,
+  ProvisioningJob,
+  QueryParams,
+} from '@/types'
+
+export interface PlatformTenantQuery extends PageParams {
+  status?: string
+  q?: string
+}
+
+export interface PlatformAuditQuery extends PageParams {
+  action?: string
+  tenant_id?: EntityId
+}
+
+function toList<T>(raw: T[] | { items?: T[] } | null): T[] {
+  if (!raw) return []
+  return Array.isArray(raw) ? raw : (raw.items ?? [])
+}
+
+export const platformApi = {
+  tenants(query: PlatformTenantQuery = {}): Promise<PagedData<PlatformTenant>> {
+    return requestPage<PlatformTenant>('/platform/tenants', query as QueryParams)
+  },
+
+  tenant(tenantId: EntityId): Promise<PlatformTenantDetail> {
+    return http.get<PlatformTenantDetail>(`/platform/tenants/${segment(tenantId)}`)
+  },
+
+  createTenant(payload: CreateTenantPayload): Promise<CreateTenantResult> {
+    return http.post<CreateTenantResult>('/platform/tenants', payload)
+  },
+
+  retryProvision(tenantId: EntityId): Promise<AcceptedTask> {
+    return http.post<AcceptedTask>(`/platform/tenants/${segment(tenantId)}/retry-provision`)
+  },
+
+  suspendTenant(tenantId: EntityId, reason: string): Promise<AcceptedTask> {
+    return http.post<AcceptedTask>(`/platform/tenants/${segment(tenantId)}/suspend`, { reason })
+  },
+
+  activateTenant(tenantId: EntityId): Promise<AcceptedTask> {
+    return http.post<AcceptedTask>(`/platform/tenants/${segment(tenantId)}/activate`)
+  },
+
+  provisioningJob(jobId: EntityId): Promise<ProvisioningJob> {
+    return http.get<ProvisioningJob>(`/platform/provisioning-jobs/${segment(jobId)}`)
+  },
+
+  async plans(): Promise<Plan[]> {
+    const raw = await http.get<Plan[] | { items?: Plan[] }>('/platform/plans')
+    return toList(raw)
+  },
+
+  createPlan(payload: PlanPayload): Promise<Plan> {
+    return http.post<Plan>('/platform/plans', payload)
+  },
+
+  updatePlan(planId: EntityId, payload: PlanPatchPayload): Promise<Plan> {
+    return http.patch<Plan>(`/platform/plans/${segment(planId)}`, payload)
+  },
+
+  channelApp(channel: string, environment: string): Promise<ChannelApp> {
+    return http.get<ChannelApp>(`/platform/channel-apps/${segment(channel)}/${segment(environment)}`)
+  },
+
+  saveChannelApp(channel: string, environment: string, payload: ChannelAppPayload): Promise<ChannelApp> {
+    return http.put<ChannelApp>(`/platform/channel-apps/${segment(channel)}/${segment(environment)}`, payload)
+  },
+
+  auditLogs(query: PlatformAuditQuery = {}): Promise<PagedData<PlatformAuditLog>> {
+    return requestPage<PlatformAuditLog>('/platform/audit-logs', query as QueryParams)
+  },
+}

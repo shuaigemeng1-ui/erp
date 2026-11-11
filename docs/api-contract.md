@@ -58,6 +58,7 @@
 | POST | `/tenants/{tenant_id}/members/invitations` | `member.invite` | `{email, role_bindings: [{role_id, scopes: [{scope_type, scope_ids}]}]}` → `{invitation_id, expires_at}` |
 | PATCH | `/tenants/{tenant_id}/members/{member_id}` | `member.invite` | `{status: active/disabled}`；停用立即撤销会话与未执行手动任务权限 |
 | PUT | `/tenants/{tenant_id}/members/{member_id}/roles` | `role.assign` | `{role_bindings: [...]}` 整体覆盖；校验授予权限不得超出操作者 |
+| POST | `/tenants/{tenant_id}/owner-transfer` | 当前所有者 | `{target_member_id}` 转移所有者（平台可用 `/platform/tenants/{id}/owner-transfer`）；最后有效所有者不可停用/移除角色 |
 | GET | `/tenants/{tenant_id}/roles` | `role.manage` | 角色列表（含权限编码、系统标记） |
 | POST | `/tenants/{tenant_id}/roles` | `role.manage` | `{code, name, permissions: [code], copy_from_role_id?}` |
 | PATCH | `/tenants/{tenant_id}/roles/{role_id}` | `role.manage` | 修改名称与权限 |
@@ -90,6 +91,9 @@
 | POST | `/tenants/{tenant_id}/listings/{listing_id}/link` | `channel.listing.map` | `{product_id, sku_id}`；SKU 必须属于本租户 |
 | POST | `/tenants/{tenant_id}/listings/{listing_id}/unlink` | `channel.listing.map` | 解除映射 |
 
+* `GET /tenants/{tenant_id}/listings` 的 `mapping_status` 过滤值取 `mapped` / `pending` / `ambiguous` / `missing`，另支持 `unmapped`（尚无映射记录）；不传返回全部。列表、总数与筛选使用同一店铺数据范围。
+* 平台商品同步后，本次平台未返回的历史商品标记 `status=inactive`（stale），映射关系保留、不物理删除；人工映射 `mapping_source=manual` 不被自动匹配覆盖。
+
 ### 订单、任务、审计
 
 | 方法 | 路径 | 权限 | 说明 |
@@ -111,6 +115,10 @@
 | --- | --- | --- |
 | GET | `/integrations/shopee/oauth/callback?code&shop_id&state` | 校验一次性授权会话后换取 Token，成功 302 跳转前端店铺页；失败 302 带错误码 |
 | POST | `/integrations/shopee/webhook` | Shopee 推送：验签 + 事件防重后写 `webhook_events`，返回 200；无效签名 401 |
+
+* Webhook 语义：签名校验失败返回 `401 CHANNEL_SIGNATURE_INVALID`；同一事件按 `(tenant_id, channel, external_event_id)` 幂等，重复推送返回 `200` 且不再触发业务处理。
+* 租户暂停期间：已验签推送只暂存 `webhook_events`（`status=received`），不触发订单同步、不改变库存；重新启用后由补偿任务处理。
+* 未处理超过 2 分钟的订单类事件由渠道补偿任务安全重投（最多 5 次），仍失败标记 `status=failed`，等待人工处理。
 
 ## 权限编码
 

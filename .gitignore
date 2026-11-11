@@ -29,3 +29,5 @@ Thumbs.db
 deploy/.env
 deploy/volumes/
 storage/
+build/
+*.tmp.txt

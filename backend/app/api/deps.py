@@ -6,8 +6,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
 from typing import Annotated
 
 from fastapi import Depends, Path, Request
@@ -20,6 +19,14 @@ from app.core.context import (
     set_tenant_context,
 )
 from app.core.errors import AppError, ErrorCode
+from app.core.http import (  # noqa: F401 - 供各模块路由统一引用
+    PageParams,
+    PageResult,
+    accepted,
+    error_body,
+    paged,
+    success,
+)
 from app.db.session import center_session, tenant_session
 from app.modules.access.service import (
     AccessSnapshot,
@@ -81,10 +88,21 @@ PlatformAdmin = Annotated[AuthenticatedUser, Depends(platform_admin)]
 
 
 # --------------------------------------------------------------------------- 租户上下文
-@contextmanager
-def _tenant_dependency(
-    request: Request, tenant_id: int, user: AuthenticatedUser
-) -> Iterator[tuple[TenantContext, AccessSnapshot]]:
+async def tenant_context(
+    request: Request,
+    user: CurrentUser,
+    tenant_id: int = Path(ge=1),
+) -> AsyncIterator[TenantContext]:
+    """构造不可变租户上下文并放入 ContextVar。
+
+    必须是 **async 生成器依赖**：FastAPI 对同步生成器依赖会在不同线程上下文里
+    执行 enter/exit，ContextVar 的 Token 无法跨上下文 reset，且设置的值不会传播到
+    端点线程（历史缺陷）。async 生成器在事件循环同一任务上下文中运行，同步端点
+    通过 ``anyio.to_thread.run_sync`` 复制上下文，能正确读到租户上下文。
+
+    说明：首版同步 SQLAlchemy Session 在事件循环中打开/关闭会短暂阻塞，
+    后续可由 anyio.to_thread.run_sync 包装；数据访问本身仍在线程池执行。
+    """
     with center_session() as center:
         access: TenantAccessInfo | None = load_tenant_access(center, tenant_id, user.user_id)
         if access is None:
@@ -124,15 +142,10 @@ def _tenant_dependency(
         request.state.access_snapshot = snapshot
         token = set_tenant_context(context)
         try:
-            yield context, snapshot
+            yield context
         finally:
             reset_tenant_context(token)
             request.state.tenant_db = None
-
-
-def tenant_context(request: Request, user: CurrentUser, tenant_id: int = Path(ge=1)) -> Iterator[TenantContext]:
-    with _tenant_dependency(request, tenant_id, user) as (context, _):
-        yield context
 
 
 TenantCtx = Annotated[TenantContext, Depends(tenant_context)]

@@ -16,6 +16,7 @@ celery_app = Celery(
     broker=settings.queue_redis_url,
     backend=settings.celery_result_backend,
     include=[
+        "app.modules.identity.tasks",
         "app.modules.tasks.outbox",
         "app.modules.tasks.scheduler",
         "app.modules.tasks.tasks",

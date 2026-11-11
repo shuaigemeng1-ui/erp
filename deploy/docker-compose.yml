@@ -1,0 +1,342 @@
+# =============================================================================
+# VentaSync 首版部署编排（plan.txt §1 / §5 P6）
+#
+# 进程分离（plan.txt「部署」与「迁移使用独立发布任务执行」）：
+#   mysql / redis-cache / redis-queue  数据服务（仅内部网络）
+#   api                                 FastAPI（uvicorn app.main:app），不执行迁移
+#   worker                              Celery Worker（default,outbox,scheduler,channel,sales 五队列）
+#   scheduler                           独立调度进程（python -m app.workers.scheduler）
+#   migrate                             独立发布任务（profile=release），中心库 + 全部租户库 alembic upgrade head
+#   nginx                               公网入口：/api 反代 + 前端静态（frontend/Dockerfile 多阶段构建）
+#
+# 常用命令（在仓库根目录执行）：
+#   cp deploy/.env.example deploy/.env            # 首次部署，按需修改
+#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env config -q      # 仅校验配置，不启动
+#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build  # 启动
+#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env --profile release run --rm migrate
+#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env ps
+#
+# 重要约定：
+# * api / worker 启动不做任何迁移；发布顺序固定为「备份 → migrate → 启动/滚动更新」。
+# * 只对外暴露 nginx；mysql / redis / api 不在宿主机端口暴露。
+# * worker 需要访问 Shopee 等外网，因此同时接入 edge 网络；数据服务只在 internal 网络。
+# * 所有密码、SECRET_KEY 必须在 deploy/.env 中替换，禁止把 .env 提交到仓库。
+# =============================================================================
+
+name: ${COMPOSE_PROJECT_NAME:-ventasync}
+
+# ------------------------------------------------------------------ 复用片段
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# 后端四类进程共用同一镜像与基础网络（api/worker/scheduler 额外接入 edge）
+x-backend: &backend
+  build:
+    context: ../backend
+    dockerfile: Dockerfile
+  image: ventasync-backend:${APP_IMAGE_TAG:-local}
+  logging: *default-logging
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - backend
+
+# 应用运行环境。API / Worker / 调度器 / 迁移任务读取同一份配置，
+# 仅外部地址指向容器服务名；生产环境用 deploy/.env 覆盖。
+x-app-env: &app-env
+  # 基础
+  APP_NAME: ${APP_NAME:-VentaSync}
+  APP_ENV: ${APP_ENV:-production}
+  API_PREFIX: ${API_PREFIX:-/api/v1}
+  DEBUG: ${DEBUG:-false}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  TZ: UTC
+  # 同源 Cookie 会话的来源校验地址（对外访问地址，必须与浏览器地址一致）
+  APP_ORIGIN: ${APP_ORIGIN:-http://localhost:8080}
+  # 安全（生产必须替换；SECRET_KEY 至少 32 位随机字符）
+  SECRET_KEY: ${SECRET_KEY:-change-me-to-a-random-32-bytes-secret}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+  SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-vs_session}
+  SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+  SESSION_COOKIE_SAME_SITE: ${SESSION_COOKIE_SAME_SITE:-lax}
+  CSRF_COOKIE_NAME: ${CSRF_COOKIE_NAME:-vs_csrf}
+  SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-43200}
+  # 中心库（运行账号只能访问中心库）
+  CENTER_DATABASE_URL: "mysql+pymysql://${CENTER_DB_USER:-ventasync}:${CENTER_DB_PASSWORD:-change-me-center-password}@mysql:3306/${CENTER_DB_NAME:-ventasync_center}?charset=utf8mb4"
+  # 建库 / 建号 / 迁移使用独立运维身份；单机 Compose 默认用 root，
+  # 生产环境必须改为仅具备 CREATE/CREATE USER/GRANT 的最小权限账号（见 README）。
+  PROVISIONER_DATABASE_URL: "mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-change-me-root-password}@mysql:3306/"
+  # 租户库路由（库名与账号由开通任务按前缀生成，凭据只存中心库）
+  TENANT_DB_HOST: mysql
+  TENANT_DB_PORT: "3306"
+  TENANT_DB_PREFIX: ${TENANT_DB_PREFIX:-vs_tenant_}
+  TENANT_DB_USER_PREFIX: ${TENANT_DB_USER_PREFIX:-vs_t_}
+  TENANT_POOL_SIZE: ${TENANT_POOL_SIZE:-5}
+  TENANT_MAX_OVERFLOW: ${TENANT_MAX_OVERFLOW:-5}
+  TENANT_POOL_RECYCLE_SECONDS: ${TENANT_POOL_RECYCLE_SECONDS:-1800}
+  TENANT_ENGINE_CACHE_SIZE: ${TENANT_ENGINE_CACHE_SIZE:-64}
+  # Redis：缓存/会话与队列/结果分开两个实例（清缓存不会清除待执行任务）
+  CACHE_REDIS_URL: redis://redis-cache:6379/0
+  QUEUE_REDIS_URL: redis://redis-queue:6379/0
+  CELERY_RESULT_BACKEND: redis://redis-queue:6379/1
+  CELERY_TASK_ALWAYS_EAGER: "false"
+  # HTTP / 分页 / 跨域（同源部署时 CORS 只保留对外地址）
+  DEFAULT_PAGE_SIZE: ${DEFAULT_PAGE_SIZE:-20}
+  MAX_PAGE_SIZE: ${MAX_PAGE_SIZE:-200}
+  CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:8080}
+  # 对象存储（S3 兼容；留空则文件功能不可用，不阻塞首版订单/库存闭环）
+  S3_ENDPOINT: ${S3_ENDPOINT:-}
+  S3_BUCKET: ${S3_BUCKET:-}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+  S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+  FILE_PUBLIC_BASE_URL: ${FILE_PUBLIC_BASE_URL:-}
+  # Shopee（应用凭据由平台管理员在后台配置并加密存中心库，这里只放环境地址）
+  SHOPEE_API_BASE: ${SHOPEE_API_BASE:-https://partner.shopeemobile.com}
+  SHOPEE_AUTH_BASE: ${SHOPEE_AUTH_BASE:-https://partner.shopeemobile.com}
+  SHOPEE_AUTH_REDIRECT_URL: ${SHOPEE_AUTH_REDIRECT_URL:-http://localhost:8080/api/v1/integrations/shopee/oauth/callback}
+  SHOPEE_HTTP_TIMEOUT_SECONDS: ${SHOPEE_HTTP_TIMEOUT_SECONDS:-20}
+  SHOPEE_HTTP_MAX_RETRIES: ${SHOPEE_HTTP_MAX_RETRIES:-3}
+  # 首次平台管理员（仅 platform-init 命令使用，不开放公共注册）
+  BOOTSTRAP_PLATFORM_ADMIN_EMAIL: ${BOOTSTRAP_PLATFORM_ADMIN_EMAIL:-}
+  BOOTSTRAP_PLATFORM_ADMIN_PASSWORD: ${BOOTSTRAP_PLATFORM_ADMIN_PASSWORD:-}
+  BOOTSTRAP_PLATFORM_ADMIN_NAME: ${BOOTSTRAP_PLATFORM_ADMIN_NAME:-平台管理员}
+  # 定时任务
+  OUTBOX_DISPATCH_INTERVAL_SECONDS: ${OUTBOX_DISPATCH_INTERVAL_SECONDS:-15}
+  OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-100}
+  SYNC_RUN_STALE_MINUTES: ${SYNC_RUN_STALE_MINUTES:-30}
+
+services:
+  # ------------------------------------------------------------------ 数据库
+  mysql:
+    image: mysql:8.4
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+      - --innodb-buffer-pool-size=${MYSQL_INNODB_BUFFER_POOL_SIZE:-256M}
+      - --max-connections=${MYSQL_MAX_CONNECTIONS:-300}
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-change-me-root-password}
+      # 允许其它容器以 root 连接（仅单机 Compose 的简化；生产请用独立运维账号）
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_DATABASE: ${CENTER_DB_NAME:-ventasync_center}
+      MYSQL_USER: ${CENTER_DB_USER:-ventasync}
+      MYSQL_PASSWORD: ${CENTER_DB_PASSWORD:-change-me-center-password}
+      TZ: UTC
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
+    stop_grace_period: 60s
+
+  # 缓存 / 登录会话：允许 LRU 淘汰（会话键带 TTL，被淘汰等价于登出）
+  redis-cache:
+    image: redis:7
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - ${CACHE_REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - volatile-lru
+    environment:
+      TZ: UTC
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # 任务队列 / Celery 结果：noeviction + AOF，清缓存不能清除待执行任务
+  redis-queue:
+    image: redis:7
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+      - --maxmemory
+      - ${QUEUE_REDIS_MAXMEMORY:-512mb}
+      - --maxmemory-policy
+      - noeviction
+    environment:
+      TZ: UTC
+    volumes:
+      - redis_queue_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ------------------------------------------------------------------ 应用进程
+  api:
+    <<: *backend
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --forwarded-allow-ips
+      - "*"
+    environment: *app-env
+    networks:
+      - edge
+      - backend
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  worker:
+    <<: *backend
+    command:
+      - celery
+      - -A
+      - app.workers.celery_app
+      - worker
+      - -Q
+      - default,outbox,scheduler,channel,sales
+      - --loglevel
+      - ${CELERY_LOG_LEVEL:-INFO}
+      - --concurrency
+      - ${CELERY_CONCURRENCY:-4}
+    environment: *app-env
+    networks:
+      - edge
+      - backend
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app inspect ping --timeout 10 >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+  # 独立调度进程：扫描 sync_schedules 投递任务（不放进 API 副本）
+  scheduler:
+    <<: *backend
+    command: ["python", "-m", "app.workers.scheduler"]
+    environment: *app-env
+    networks:
+      - edge
+      - backend
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  # ------------------------------------------------------------------ 前端入口
+  # 前端静态由 frontend/Dockerfile（node:22-alpine → nginx:alpine）构建；
+  # 本服务挂载 deploy/nginx/nginx.conf 覆盖站点配置，实现 /api 反代 + SPA 回退。
+  nginx:
+    image: ventasync-frontend:${APP_IMAGE_TAG:-local}
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+    ports:
+      - ${HTTP_PORT:-8080}:80
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - edge
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ------------------------------------------------------------------ 发布任务
+  # 迁移只在发布时执行：docker compose --profile release run --rm migrate
+  # api / worker 启动不会自动迁移（plan.txt 实施约束）。
+  migrate:
+    <<: *backend
+    command: ["python", "scripts/migrate_all.py"]
+    environment: *app-env
+    profiles:
+      - release
+    networks:
+      - backend
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  mysql_data:
+    name: ${COMPOSE_PROJECT_NAME:-ventasync}_mysql_data
+  redis_queue_data:
+    name: ${COMPOSE_PROJECT_NAME:-ventasync}_redis_queue_data
+
+networks:
+  # 公网入口网络：只有 nginx、api、worker、scheduler 接入
+  edge:
+    driver: bridge
+  # 数据/内部网络：mysql、redis 只在这里，且禁止访问外网
+  backend:
+    driver: bridge
+    internal: true

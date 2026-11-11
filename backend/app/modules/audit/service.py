@@ -5,15 +5,17 @@
 * 与业务写操作同一租户库事务；
 * 记录租户、操作人、动作、对象、结果摘要、request_id；
 * 禁止在审计 payload 中保存明文密码 / Token。
-
-实现负责人：backend-identity（audit 模块）。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+
+from app.core.context import get_request_id
+from app.modules.audit.models_tenant import AuditLog
 
 
 def record(
@@ -29,5 +31,70 @@ def record(
     request_id: str = "",
     ip: str = "",
 ) -> int:
-    """写一条租户审计日志，返回日志 ID。"""
-    raise NotImplementedError("audit.service.record 尚未实现")
+    """写一条租户审计日志，返回日志 ID。
+
+    本函数只 ``flush``，不提交事务：由调用方（Service）与业务写入一起提交。
+    """
+    row = AuditLog(
+        tenant_id=tenant_id,
+        actor_id=actor_id,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        summary=(summary or "")[:255],
+        payload=payload,
+        ip=ip or "",
+        request_id=request_id or _safe_request_id(),
+    )
+    db.add(row)
+    db.flush()
+    return int(row.id)
+
+
+def _safe_request_id() -> str:
+    try:
+        return get_request_id()
+    except Exception:  # noqa: BLE001 - 无请求上下文（Worker / CLI）时使用空标识
+        return ""
+
+
+def audit_payload(row: AuditLog) -> dict[str, Any]:
+    """审计日志响应结构（ID 一律字符串、时间 UTC ISO）。"""
+    from app.modules.identity.service import iso_utc
+
+    return {
+        "id": str(row.id),
+        "tenant_id": str(row.tenant_id),
+        "actor_id": str(row.actor_id) if row.actor_id else None,
+        "action": row.action,
+        "resource_type": row.resource_type,
+        "resource_id": str(row.resource_id) if row.resource_id else None,
+        "summary": row.summary,
+        "payload": row.payload,
+        "ip": row.ip,
+        "request_id": row.request_id,
+        "created_at": iso_utc(row.created_at),
+    }
+
+
+def list_logs(
+    db: Session, *, tenant_id: int, page: int, page_size: int, action: str = ""
+) -> dict[str, Any]:
+    """租户审计分页查询（列表与总数使用同一过滤条件）。"""
+    stmt = select(AuditLog).where(AuditLog.tenant_id == tenant_id)
+    if action:
+        stmt = stmt.where(AuditLog.action == action)
+    total = int(db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one())
+    rows = (
+        db.execute(
+            stmt.order_by(AuditLog.id.desc()).offset((page - 1) * page_size).limit(page_size)
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "items": [audit_payload(row) for row in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }

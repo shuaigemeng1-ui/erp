@@ -37,6 +37,9 @@ x-backend: &backend
   build:
     context: ../backend
     dockerfile: Dockerfile
+    args:
+      # 中国大陆服务器可设置 PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+      PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
   image: ventasync-backend:${APP_IMAGE_TAG:-local}
   logging: *default-logging
   security_opt:
@@ -293,7 +296,7 @@ services:
       args:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
     ports:
-      - ${HTTP_PORT:-8080}:80
+      - "${HTTP_BIND:-0.0.0.0}:${HTTP_PORT:-8080}:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     networks:

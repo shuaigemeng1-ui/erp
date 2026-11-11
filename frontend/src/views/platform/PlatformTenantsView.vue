@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
-import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
+import { computed, nextTick, onMounted, reactive, ref } from 'vue'
+import { ElMessage, ElMessageBox, type FormInstance, type FormRules, type InputInstance } from 'element-plus'
 import { Refresh, Search } from '@element-plus/icons-vue'
 import { platformApi } from '@/api/platform'
 import { useTableQuery } from '@/composables/useTableQuery'
@@ -9,6 +9,7 @@ import StatusTag from '@/components/StatusTag.vue'
 import IdCopy from '@/components/IdCopy.vue'
 import JsonBlock from '@/components/JsonBlock.vue'
 import { formatDateTime, stringOrUndefined, textOrDash } from '@/utils/format'
+import type { StatusMeta } from '@/utils/dict'
 import type { Plan, PlatformTenant, PlatformTenantDetail, ProvisioningJob } from '@/types'
 
 const query = reactive({
@@ -114,6 +115,126 @@ function jobStatusType(job: ProvisioningJob): 'success' | 'warning' | 'danger' |
   if (job.status === 'failed') return 'danger'
   if (job.status === 'running') return 'warning'
   return 'info'
+}
+
+/* ------------------------------ 负责人邀请 ------------------------------ */
+/** 服务器无邮件通道：平台管理员生成一次性邀请链接，复制后线下发给负责人。 */
+const invitationStatusMeta: Record<string, StatusMeta> = {
+  pending: { label: '待接受', type: 'warning' },
+  invited: { label: '待接受', type: 'warning' },
+  accepted: { label: '已接受', type: 'success' },
+  revoked: { label: '已撤销', type: 'info' },
+  expired: { label: '已过期', type: 'danger' },
+}
+
+const ownerInvitation = computed(
+  () => detail.value?.owner_invitation ?? detail.value?.ownerInvitation ?? null,
+)
+
+const ownerInvitationExpired = computed((): boolean => {
+  const invitation = ownerInvitation.value
+  if (!invitation) return false
+  if (invitation.status === 'expired') return true
+  if (invitation.status === 'accepted' || invitation.status === 'revoked') return false
+  if (!invitation.expires_at) return false
+  const expiresAt = Date.parse(invitation.expires_at)
+  return Number.isFinite(expiresAt) && expiresAt <= Date.now()
+})
+
+/** 无邀请或已过期/已撤销时允许生成 */
+const canIssueInvitation = computed(
+  () => !ownerInvitation.value || ownerInvitationExpired.value || ownerInvitation.value.status === 'revoked',
+)
+
+/** 邀请仍有效时允许重新生成（旧的链接会立即失效，需要二次确认） */
+const canRegenerateInvitation = computed(
+  () => Boolean(ownerInvitation.value) && !canIssueInvitation.value && ownerInvitation.value?.status !== 'accepted',
+)
+
+const invitationCreating = ref(false)
+const invitationDialogVisible = ref(false)
+const invitationLink = ref('')
+const invitationEmail = ref('')
+const invitationExpiresAt = ref<string | null>(null)
+const invitationInputRef = ref<InputInstance>()
+
+function buildInvitationUrl(invitationUrl: string): string {
+  const path = (invitationUrl ?? '').trim()
+  if (!path) return ''
+  if (/^https?:\/\//i.test(path)) return path
+  return `${window.location.origin}${path.startsWith('/') ? path : `/${path}`}`
+}
+
+async function issueOwnerInvitation(): Promise<void> {
+  const current = detail.value
+  if (!current) return
+  invitationCreating.value = true
+  try {
+    const result = await platformApi.issueOwnerInvitation(current.id)
+    invitationEmail.value = result.email || current.owner_email || ''
+    invitationExpiresAt.value = result.expires_at
+    invitationLink.value = buildInvitationUrl(result.invitation_url)
+    invitationDialogVisible.value = true
+    // 刷新详情，回显最新的邀请状态（刷新失败不影响已生成的链接）
+    try {
+      detail.value = await platformApi.tenant(current.id)
+    } catch {
+      // 忽略：保持当前详情
+    }
+  } finally {
+    invitationCreating.value = false
+  }
+}
+
+async function regenerateOwnerInvitation(): Promise<void> {
+  try {
+    await ElMessageBox.confirm('重新生成后，之前发出的激活链接将立即失效。确认继续？', '重新生成邀请链接', {
+      type: 'warning',
+      confirmButtonText: '确认重新生成',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  await issueOwnerInvitation()
+}
+
+function selectInvitationLink(): void {
+  invitationInputRef.value?.focus()
+  invitationInputRef.value?.select()
+}
+
+async function copyInvitationLink(): Promise<void> {
+  const link = invitationLink.value
+  if (!link) return
+
+  // 1) 安全上下文（https）优先使用 Clipboard API
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(link)
+      ElMessage.success('邀请链接已复制')
+      return
+    }
+  } catch {
+    // 继续走降级方案
+  }
+
+  // 2) 非安全上下文（http 部署）降级：选中输入框内容后尝试 execCommand
+  await nextTick()
+  selectInvitationLink()
+  let copied = false
+  try {
+    copied = document.execCommand('copy')
+  } catch {
+    copied = false
+  }
+  if (copied) {
+    ElMessage.success('邀请链接已复制')
+    return
+  }
+
+  // 3) 最后降级：提示手动复制（链接已全选）
+  ElMessage.warning('自动复制失败，链接已选中，请按 Ctrl+C 手动复制')
 }
 
 /* ------------------------------ 生命周期操作 ------------------------------ */
@@ -317,6 +438,48 @@ onMounted(async () => {
         <el-descriptions-item label="更新时间">{{ formatDateTime(detail.updated_at) }}</el-descriptions-item>
       </el-descriptions>
 
+      <div style="margin: 12px 0 4px">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px">
+          <span style="font-weight: 600">负责人邀请</span>
+          <div>
+            <el-button
+              v-if="canRegenerateInvitation"
+              text
+              type="warning"
+              size="small"
+              :loading="invitationCreating"
+              @click="regenerateOwnerInvitation"
+            >
+              重新生成
+            </el-button>
+            <el-button
+              v-if="canIssueInvitation"
+              type="primary"
+              size="small"
+              :loading="invitationCreating"
+              @click="issueOwnerInvitation"
+            >
+              {{ ownerInvitation ? '重新生成邀请链接' : '生成邀请链接' }}
+            </el-button>
+          </div>
+        </div>
+        <el-descriptions v-if="ownerInvitation" :column="2" border size="small" class="detail-descriptions">
+          <el-descriptions-item label="邀请邮箱">{{ textOrDash(ownerInvitation.email) }}</el-descriptions-item>
+          <el-descriptions-item label="邀请状态">
+            <StatusTag :status="ownerInvitation.status" :map="invitationStatusMeta" />
+          </el-descriptions-item>
+          <el-descriptions-item label="邀请时间">{{ formatDateTime(ownerInvitation.invited_at) }}</el-descriptions-item>
+          <el-descriptions-item label="过期时间">{{ formatDateTime(ownerInvitation.expires_at) }}</el-descriptions-item>
+        </el-descriptions>
+        <el-alert
+          v-else
+          title="尚未生成负责人邀请链接，负责人无法激活账号。"
+          type="warning"
+          :closable="false"
+          show-icon
+        />
+      </div>
+
       <div style="font-weight: 600; margin: 12px 0 8px">开通步骤</div>
       <el-table :data="detail.provisioning_jobs ?? []" border size="small" empty-text="暂无开通任务">
         <el-table-column label="步骤" prop="step" min-width="140" />
@@ -343,4 +506,30 @@ onMounted(async () => {
       </div>
     </template>
   </el-drawer>
+
+  <!-- 负责人邀请链接 -->
+  <el-dialog v-model="invitationDialogVisible" title="负责人邀请链接" width="640px" destroy-on-close>
+    <el-form label-width="88px">
+      <el-form-item label="邀请邮箱">{{ textOrDash(invitationEmail) }}</el-form-item>
+      <el-form-item label="过期时间">{{ formatDateTime(invitationExpiresAt) }}</el-form-item>
+      <el-form-item label="邀请链接">
+        <el-input
+          ref="invitationInputRef"
+          :model-value="invitationLink"
+          readonly
+          @focus="selectInvitationLink"
+        />
+      </el-form-item>
+    </el-form>
+    <el-alert
+      title="服务器无邮件通道：请复制链接后通过其他渠道发给负责人，链接一次性有效。"
+      type="warning"
+      :closable="false"
+      show-icon
+    />
+    <template #footer>
+      <el-button @click="invitationDialogVisible = false">关闭</el-button>
+      <el-button type="primary" @click="copyInvitationLink">复制链接</el-button>
+    </template>
+  </el-dialog>
 </template>

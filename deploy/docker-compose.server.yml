@@ -1,0 +1,50 @@
+# =============================================================================
+# 单机低配服务器部署覆盖（示例：2C2G 云服务器，已有 Caddy 占用 80/443）
+#
+# 用法（在 deploy/ 目录）：
+#   docker compose -f docker-compose.yml -f docker-compose.server.yml \
+#     --env-file .env up -d --build
+#
+# 与基础编排的差异：
+# 1. 前端改用 frontend/Dockerfile.runtime（使用本地构建好的 dist，服务器不跑 Node 构建）。
+# 2. nginx 只绑定 127.0.0.1:${HTTP_PORT}，由宿主机 Caddy 反代到公网 80/443。
+# 3. MySQL 降低 buffer pool、关闭 performance_schema，限制各容器内存上限，
+#    适配 2GB 内存 + 2GB swap 的机器。
+# 4. Celery 并发由 .env 的 CELERY_CONCURRENCY 控制（建议 1）。
+# =============================================================================
+services:
+  mysql:
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+      - --innodb-buffer-pool-size=${MYSQL_INNODB_BUFFER_POOL_SIZE:-128M}
+      - --max-connections=${MYSQL_MAX_CONNECTIONS:-100}
+      - --performance-schema=OFF
+      - --skip-name-resolve
+    mem_limit: ${MYSQL_MEM_LIMIT:-700m}
+
+  redis-cache:
+    mem_limit: ${CACHE_REDIS_MEM_LIMIT:-96m}
+
+  redis-queue:
+    mem_limit: ${QUEUE_REDIS_MEM_LIMIT:-160m}
+
+  api:
+    mem_limit: ${API_MEM_LIMIT:-420m}
+
+  worker:
+    mem_limit: ${WORKER_MEM_LIMIT:-420m}
+
+  scheduler:
+    mem_limit: ${SCHEDULER_MEM_LIMIT:-160m}
+
+  nginx:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile.runtime
+    image: ventasync-frontend:${APP_IMAGE_TAG:-runtime}
+    mem_limit: ${NGINX_MEM_LIMIT:-64m}
+    # 端口映射由基础编排的 ${HTTP_BIND}:${HTTP_PORT}:80 控制；
+    # 本机在 deploy/.env 设置 HTTP_BIND=127.0.0.1、HTTP_PORT=8081，
+    # 仅由宿主机 Caddy 反向代理到公网 80/443。

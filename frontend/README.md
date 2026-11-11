@@ -56,7 +56,7 @@ src/
 | `/members` | 成员（邀请/停用/角色与数据范围） | `member.read` |
 | `/roles` | 角色（列表/新建/编辑权限勾选/删除） | `role.manage` |
 | `/audit-logs` | 租户审计 | `audit.read` |
-| `/platform/tenants` | 平台租户管理（创建/重试开通/暂停/启用/详情） | 平台管理员 |
+| `/platform/tenants` | 平台租户管理（创建/重试开通/暂停/启用/详情/负责人邀请链接生成与复制） | 平台管理员 |
 | `/platform/plans` | 套餐与功能额度 | 平台管理员 |
 | `/platform/channel-apps` | Shopee 应用凭据（密钥不回显） | 平台管理员 |
 | `/platform/audit-logs` | 平台审计 | 平台管理员 |
@@ -75,6 +75,7 @@ src/
 ## 说明与已知限制
 
 * 本工程未连接真实后端（后端并行开发中），页面在无后端时展示空列表/错误提示，不阻塞路由与构建。
+* 服务器无邮件通道：平台租户详情抽屉的「负责人邀请」可生成一次性激活链接（`POST /platform/tenants/{id}/owner-invitation`），弹窗支持复制；http 部署下 Clipboard API 不可用时降级为选中输入框 + `execCommand`，最后提示手动 Ctrl+C。
 * 商品编辑按契约 PATCH 商品字段；SKU 在新建时写入，编辑时不提交 SKU 变更（契约未定义 SKU 局部更新）。
 * `vite.config.ts` 会把构建临时目录指向工程内 `.tmp-build/`：部分受限 Windows 环境禁止删除系统临时目录中的 esbuild 临时文件，会导致构建失败；该目录已被 `.gitignore` 忽略。
 * 元素数量/金额沿用后端字符串，展示层仅格式化不改类型；JSON 原始数据用 `pre` 折叠展示。

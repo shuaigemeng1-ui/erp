@@ -302,6 +302,30 @@ def transfer_owner(
     )
 
 
+@tenant_router.post(
+    "/tenants/{tenant_id}/members/invitations/{invitation_id}/resend",
+    summary="重新签发成员邀请",
+)
+def resend_invitation(
+    ctx: TenantCtx,
+    snapshot: AccessSnapshotDep,
+    db: TenantDb,
+    center: CenterDb,
+    invitation_id: int = Path(ge=1, description="邀请ID"),
+    _: RequirePermission = Depends(require_permission(Permission.MEMBER_INVITE.value)),
+) -> dict:
+    """轮换邀请令牌（旧令牌立即失效），返回明文 token 与激活链接一次。"""
+    return success(
+        service.resend_invitation(
+            center,
+            db,
+            tenant_id=ctx.tenant_id,
+            invitation_id=invitation_id,
+            actor_id=ctx.user_id,
+        )
+    )
+
+
 # --------------------------------------------------------------------------- 角色与权限
 @tenant_router.get("/tenants/{tenant_id}/roles", summary="角色列表")
 def list_roles(

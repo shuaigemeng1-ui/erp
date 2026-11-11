@@ -99,6 +99,27 @@ def create_tenant(payload: TenantCreateRequest, center: CenterDb, admin: Platfor
     return accepted(data)
 
 
+@router.post("/tenants/{tenant_id}/owner-invitation", summary="重新签发租户负责人邀请")
+def issue_owner_invitation(center: CenterDb, admin: PlatformAdmin, tenant_id: int = Path(ge=1)) -> dict:
+    """轮换负责人邀请令牌并返回明文一次（无邮件通道时由平台管理员交付激活链接）。
+
+    旧 pending 邀请立即失效；库中只保存 SHA-256 摘要，租户详情只返回摘要信息。
+    """
+    payload = service.issue_owner_invitation(center, tenant_id, actor_user_id=admin.user_id)
+    platform_service.record_platform_audit(
+        center,
+        actor_user_id=admin.user_id,
+        action="platform.tenant.owner_invitation",
+        resource_type="invitation",
+        resource_id=int(payload["invitation_id"]),
+        tenant_id=tenant_id,
+        summary=f"重新签发负责人邀请：{payload['email']}",
+        payload={"email": payload["email"], "expires_at": payload["expires_at"]},
+    )
+    center.commit()
+    return success(payload)
+
+
 @router.get("/tenants/{tenant_id}", summary="租户详情")
 def get_tenant(
     center: CenterDb,

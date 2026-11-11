@@ -307,3 +307,49 @@ curl -fsS http://127.0.0.1:8080/api/v1/auth/csrf
 ```
 
 真实环境验收项（两租户隔离、真实店铺闭环、备份恢复演练等）见 `docs/acceptance.md`。
+
+## 11. 低配单机 + 已有 Caddy（2C2G 实测方案）
+
+适用于中国大陆 2C2G 云服务器、且宿主机已有 Caddy 占用 80/443 的场景（本仓库已在
+`121.37.45.132` 实际验证，见 `docs/real-deployment.md`）。
+
+1. 构建产物准备：本地 `cd frontend && npm run build`，把整个项目（含 `frontend/dist`）上传到服务器；
+2. 使用低配覆盖文件启动（不跑 Node 构建、限制内存、只绑定回环端口）：
+
+   ```bash
+   cp deploy/.env.example deploy/.env        # 修改全部 change-me；建议：
+   # HTTP_BIND=127.0.0.1  HTTP_PORT=8081
+   # APP_ORIGIN=http://<公网IP>  CORS_ALLOW_ORIGINS=http://<公网IP>
+   # PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/  PIP_TRUSTED_HOST=mirrors.aliyun.com
+   # CELERY_CONCURRENCY=1  MYSQL_INNODB_BUFFER_POOL_SIZE=128M  MYSQL_MAX_CONNECTIONS=100
+   cd deploy
+   docker compose -f docker-compose.yml -f docker-compose.server.yml --env-file .env up -d --build
+   docker compose -f docker-compose.yml -f docker-compose.server.yml --env-file .env --profile release run --rm migrate
+   docker compose -f docker-compose.yml -f docker-compose.server.yml --env-file .env exec -T api python -m app.cli platform-init
+   ```
+
+3. 宿主机 Caddy 反代（保留已有站点，仅追加 IP/域名站点）：
+
+   ```caddyfile
+   http://<公网IP> {
+       encode zstd gzip
+       reverse_proxy 127.0.0.1:8081
+   }
+   ```
+
+   ```bash
+   cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak-$(date +%Y%m%d-%H%M%S)
+   # 追加站点后：
+   caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+   systemctl reload caddy
+   ```
+
+4. 首次登录后：平台管理 → 租户管理 → 创建租户 → 「生成邀请链接」，把链接发给负责人激活；
+   若服务器已有其他应用，可按需 `docker stop <容器>` 并 `docker update --restart=no <容器>`
+   释放内存（保留 Caddy 与 SSH）。
+
+注意：
+* `docker-compose.server.yml` 使用 `frontend/Dockerfile.runtime`，要求上传 `frontend/dist`；
+* 2C2G 下建议 `CELERY_CONCURRENCY=1`、MySQL buffer pool 128M；实测常驻内存约 1.0GB；
+* 前端镜像更新只需重新构建 `nginx` 服务：`docker compose ... build nginx && up -d nginx`。
+

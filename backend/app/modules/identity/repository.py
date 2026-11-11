@@ -203,6 +203,28 @@ def list_pending_invitations(
     )
 
 
+def get_invitation(center: Session, tenant_id: int, invitation_id: int) -> TenantInvitation | None:
+    return center.execute(
+        select(TenantInvitation).where(
+            TenantInvitation.tenant_id == tenant_id,
+            TenantInvitation.id == invitation_id,
+        )
+    ).scalar_one_or_none()
+
+
+def get_latest_invitation(center: Session, tenant_id: int, email: str) -> TenantInvitation | None:
+    """某邮箱最近一条邀请（不限状态，供详情展示与重新签发）。"""
+    return center.execute(
+        select(TenantInvitation)
+        .where(
+            TenantInvitation.tenant_id == tenant_id,
+            TenantInvitation.email == email,
+        )
+        .order_by(TenantInvitation.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
 def list_invitations(center: Session, tenant_id: int, *, offset: int = 0, limit: int = 20) -> list[TenantInvitation]:
     return list(
         center.execute(

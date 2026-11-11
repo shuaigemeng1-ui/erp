@@ -16,6 +16,10 @@
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim AS builder
 
+# 可选 pip 源（中国大陆服务器可传 --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/）
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_TRUSTED_HOST=
+
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_ROOT_USER_ACTION=ignore
@@ -24,7 +28,8 @@ WORKDIR /build
 
 # 先复制依赖清单，单独构建 wheel 层，命中缓存时不重复下载
 COPY requirements.txt ./
-RUN pip wheel --wheel-dir /wheels -r requirements.txt
+RUN pip wheel --wheel-dir /wheels --index-url "${PIP_INDEX_URL}" \
+        ${PIP_TRUSTED_HOST:+--trusted-host "${PIP_TRUSTED_HOST}"} -r requirements.txt
 
 
 FROM python:3.12-slim AS runtime

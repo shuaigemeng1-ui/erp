@@ -37,10 +37,35 @@ export interface TenantDatabaseStatus {
   credentials_version?: number
 }
 
+/** 租户负责人邀请（中心库 tenant_invitations，详情接口只返回脱敏摘要） */
+export interface OwnerInvitation {
+  invitation_id?: EntityId
+  email: string
+  status: string
+  expires_at?: string | null
+  invited_at?: string | null
+}
+
+/** POST /platform/tenants/{tenant_id}/owner-invitation 的返回 */
+export interface OwnerInvitationCreated {
+  invitation_id: EntityId
+  email: string
+  status?: string
+  token?: string
+  /** 相对路径，如 /activate/{token}；前端拼接当前站点 origin */
+  invitation_url: string
+  expires_at: string
+  invited_at?: string | null
+}
+
 export interface PlatformTenantDetail extends PlatformTenant {
   provisioning_jobs?: ProvisioningJob[]
   database?: TenantDatabaseStatus | null
   member_count?: number
+  /** 后端字段为 owner_invitation（snake_case） */
+  owner_invitation?: OwnerInvitation | null
+  /** camelCase 兼容别名，两种返回都能读取 */
+  ownerInvitation?: OwnerInvitation | null
 }
 
 export interface PlanFeature {

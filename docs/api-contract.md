@@ -29,7 +29,8 @@
 | --- | --- | --- |
 | GET | `/platform/tenants?page&page_size&status&q` | 租户分页列表 |
 | POST | `/platform/tenants` | `{code, name, timezone, plan_id?, owner_email}` → 202 `{task_id, tenant}` |
-| GET | `/platform/tenants/{id}` | 租户详情（含开通步骤、数据库状态） |
+| GET | `/platform/tenants/{id}` | 租户详情（含开通步骤、数据库状态、负责人邀请摘要 `owner_invitation`，不含 token） |
+| POST | `/platform/tenants/{id}/owner-invitation` | 重新签发负责人邀请：轮换令牌，返回 `{invitation_id, token, invitation_url, email, expires_at}`（明文只返回一次） |
 | POST | `/platform/tenants/{id}/retry-provision` | 失败开通重试 → 202 |
 | POST | `/platform/tenants/{id}/suspend` | `{reason}`；暂停后禁止租户业务访问与主动同步 |
 | POST | `/platform/tenants/{id}/activate` | 重新启用（先核对平台状态） |
@@ -56,6 +57,7 @@
 | --- | --- | --- | --- |
 | GET | `/tenants/{tenant_id}/members?page&q&status` | `member.read` | 成员列表（含角色与数据范围摘要） |
 | POST | `/tenants/{tenant_id}/members/invitations` | `member.invite` | `{email, role_bindings: [{role_id, scopes: [{scope_type, scope_ids}]}]}` → `{invitation_id, expires_at}` |
+| POST | `/tenants/{tenant_id}/members/invitations/{invitation_id}/resend` | `member.invite` | 轮换令牌并返回 `{invitation_id, token, invitation_url, email, expires_at}`；旧令牌立即失效 |
 | PATCH | `/tenants/{tenant_id}/members/{member_id}` | `member.invite` | `{status: active/disabled}`；停用立即撤销会话与未执行手动任务权限 |
 | PUT | `/tenants/{tenant_id}/members/{member_id}/roles` | `role.assign` | `{role_bindings: [...]}` 整体覆盖；校验授予权限不得超出操作者 |
 | POST | `/tenants/{tenant_id}/owner-transfer` | 当前所有者 | `{target_member_id}` 转移所有者（平台可用 `/platform/tenants/{id}/owner-transfer`）；最后有效所有者不可停用/移除角色 |

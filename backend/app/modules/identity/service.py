@@ -379,13 +379,17 @@ def accept_invitation(
         logger.warning("租户 %s 缺少数据库路由，邀请已接受但未写入角色绑定", tenant.id)
     else:
         with tenant_session(route) as db, run_in_transaction(db):
-            _write_bindings(
-                db,
-                tenant_id=int(tenant.id),
-                member_id=int(membership.id),
-                bindings=bindings,
-                assigned_by=None,
-            )
+            if bindings:
+                _write_bindings(
+                    db,
+                    tenant_id=int(tenant.id),
+                    member_id=int(membership.id),
+                    bindings=bindings,
+                    assigned_by=None,
+                )
+            else:
+                # 邀请未预置角色时保留开通流程已写入的绑定，避免接受邀请后失去权限
+                logger.info("邀请 %s 未预置角色绑定，保留既有绑定", invitation.id)
             bump_permission_version(db, int(tenant.id))
             record_audit(
                 db,
@@ -525,6 +529,174 @@ def _bindings_from_json(raw: Any) -> list[RoleBindingChoice]:
             scopes.append(ScopeChoice(scope_type=scope_type, scope_ids=tuple(scope_ids)))
         result.append(RoleBindingChoice(role_id=role_id, scopes=tuple(scopes)))
     return result
+
+
+# --------------------------------------------------------------------------- 负责人邀请重签
+INVITATION_ACTIVATION_PATH = "/activate/{token}"
+OWNER_INVITATION_AUDIT_ACTION = "platform.tenant.owner_invitation"
+RESEND_INVITATION_AUDIT_ACTION = "member.invitation.resend"
+
+
+def invitation_url(token: str) -> str:
+    """激活链接路径（前端路由 ``/activate/{token}``，绝对地址由部署域名拼接）。"""
+    return INVITATION_ACTIVATION_PATH.format(token=token)
+
+
+def invitation_payload(
+    invitation: TenantInvitation, *, token: str | None = None
+) -> dict[str, Any]:
+    """邀请响应结构。
+
+    只有轮换 / 新建令牌的那一次响应携带明文 ``token`` 与 ``invitation_url``；
+    详情类接口不得调用本函数的 token 分支（库中只存 SHA-256 摘要）。
+    """
+    payload: dict[str, Any] = {
+        "invitation_id": str(invitation.id),
+        "email": invitation.email,
+        "status": invitation.status,
+        "expires_at": iso_utc(invitation.expires_at),
+        "invited_at": iso_utc(invitation.created_at),
+    }
+    if token:
+        payload["token"] = token
+        payload["invitation_url"] = invitation_url(token)
+    return payload
+
+
+def _owner_email(center: Session, tenant: Tenant) -> str:
+    if not tenant.owner_user_id:
+        return ""
+    owner = repo.get_user(center, int(tenant.owner_user_id))
+    return owner.email if owner is not None else ""
+
+
+def latest_owner_invitation(center: Session, tenant: Tenant) -> TenantInvitation | None:
+    """租户负责人最近一条邀请（不限状态，供详情展示）。"""
+    email = _owner_email(center, tenant)
+    if not email:
+        return None
+    return repo.get_latest_invitation(center, int(tenant.id), email)
+
+
+def _owner_role_bindings_json(db: Session, tenant_id: int) -> list[dict[str, Any]]:
+    """负责人邀请预置的角色与数据范围（owner 角色 + 全部范围）。"""
+    owner_role = _owner_role(db, tenant_id)
+    if owner_role is None:
+        raise AppError(ErrorCode.CONFLICT, "租户缺少所有者角色，请先完成租户开通")
+    return [
+        {
+            "role_id": int(owner_role.id),
+            "scopes": [{"scope_type": "all", "scope_ids": []}],
+        }
+    ]
+
+
+def issue_owner_invitation(
+    center: Session, tenant_id: int, *, actor_user_id: int | None = None
+) -> dict[str, Any]:
+    """重新签发租户负责人邀请（平台管理员，无邮件通道时由管理员手工交付链接）。
+
+    * 旧 pending 邀请全部置 ``revoked``（保证同一邮箱只有一个可用令牌）；
+    * 令牌只存 SHA-256 摘要，明文只在本次响应返回一次；
+    * 负责人已激活时返回 ``409``，避免通过邀请重置既有账号。
+    """
+    from app.core.config import settings as app_settings
+
+    tenant = repo.get_tenant(center, tenant_id)
+    if tenant is None:
+        raise AppError(ErrorCode.TENANT_NOT_FOUND)
+    if tenant.status != TenantStatus.ACTIVE.value:
+        raise AppError(ErrorCode.TENANT_NOT_ACTIVE, "租户尚未开通完成，无法签发负责人邀请")
+    email = _owner_email(center, tenant)
+    if not email:
+        raise AppError(ErrorCode.CONFLICT, "租户缺少负责人，无法签发邀请")
+    membership = repo.get_membership(center, tenant_id, int(tenant.owner_user_id or 0))
+    if membership is None:
+        raise AppError(ErrorCode.CONFLICT, "负责人成员关系不存在，无法签发邀请")
+    if membership.status == MembershipStatus.ACTIVE.value:
+        raise AppError(ErrorCode.CONFLICT, "负责人已激活，无需重新邀请")
+
+    route = load_tenant_db_route(center, tenant_id)
+    if route is None:
+        raise AppError(ErrorCode.TENANT_DATABASE_UNAVAILABLE, "租户数据库不可用，无法签发邀请")
+    with tenant_session(route) as db:
+        role_bindings_json = _owner_role_bindings_json(db, tenant_id)
+
+    token = random_token()
+    with run_in_transaction(center):
+        for stale in repo.list_pending_invitations(center, tenant_id, email):
+            stale.status = InvitationStatus.REVOKED.value
+            center.add(stale)
+        if membership.status != MembershipStatus.INVITED.value:
+            membership.status = MembershipStatus.INVITED.value
+            center.add(membership)
+        invitation = TenantInvitation(
+            tenant_id=tenant_id,
+            email=email,
+            token_hash=_token_hash(token),
+            role_ids=role_bindings_json,
+            status=InvitationStatus.PENDING.value,
+            expires_at=utc_after(app_settings.invitation_ttl_seconds),
+            invited_by=actor_user_id,
+        )
+        center.add(invitation)
+        center.flush()
+        payload = invitation_payload(invitation, token=token)
+    payload["membership_id"] = str(membership.id)
+    return payload
+
+
+def resend_invitation(
+    center: Session,
+    db: Session,
+    *,
+    tenant_id: int,
+    invitation_id: int,
+    actor_id: int,
+) -> dict[str, Any]:
+    """重新签发租户成员邀请（member.invite）：轮换令牌并写租户审计。"""
+    from app.core.config import settings as app_settings
+
+    tenant = repo.get_tenant(center, tenant_id)
+    if tenant is None:
+        raise AppError(ErrorCode.TENANT_NOT_FOUND)
+    invitation = repo.get_invitation(center, tenant_id, invitation_id)
+    if invitation is None:
+        raise AppError(ErrorCode.NOT_FOUND, "邀请不存在")
+    if invitation.status == InvitationStatus.ACCEPTED.value:
+        raise AppError(ErrorCode.CONFLICT, "邀请已被接受，不能重新签发")
+    email = invitation.email
+    role_bindings_json = invitation.role_ids or []
+    token = random_token()
+    with run_in_transaction(center):
+        for stale in repo.list_pending_invitations(center, tenant_id, email):
+            stale.status = InvitationStatus.REVOKED.value
+            center.add(stale)
+        new_invitation = TenantInvitation(
+            tenant_id=tenant_id,
+            email=email,
+            token_hash=_token_hash(token),
+            role_ids=role_bindings_json,
+            status=InvitationStatus.PENDING.value,
+            expires_at=utc_after(app_settings.invitation_ttl_seconds),
+            invited_by=actor_id,
+        )
+        center.add(new_invitation)
+        center.flush()
+        payload = invitation_payload(new_invitation, token=token)
+    with run_in_transaction(db):
+        bump_permission_version(db, tenant_id)
+        record_audit(
+            db,
+            tenant_id=tenant_id,
+            action=RESEND_INVITATION_AUDIT_ACTION,
+            resource_type="invitation",
+            resource_id=int(payload["invitation_id"]),
+            actor_id=actor_id,
+            summary=f"重新签发成员邀请：{email}",
+            payload={"email": email, "previous_invitation_id": str(invitation_id)},
+        )
+    return payload
 
 
 # --------------------------------------------------------------------------- 角色绑定
@@ -1280,13 +1452,14 @@ def bootstrap_payload(
 
 # --------------------------------------------------------------------------- 平台辅助
 def tenant_detail_payload(center: Session, tenant: Tenant) -> dict[str, Any]:
-    """平台租户详情：基础信息 + 数据库状态 + 开通步骤 + 负责人。"""
+    """平台租户详情：基础信息 + 数据库状态 + 开通步骤 + 负责人 + 负责人邀请摘要。"""
     database = repo.get_tenant_database(center, int(tenant.id))
     owner_email = ""
     if tenant.owner_user_id:
         owner = repo.get_user(center, int(tenant.owner_user_id))
         owner_email = owner.email if owner else ""
     jobs = repo.list_provisioning_jobs(center, int(tenant.id))
+    owner_invitation = latest_owner_invitation(center, tenant)
     return {
         "id": str(tenant.id),
         "code": tenant.code,
@@ -1299,6 +1472,8 @@ def tenant_detail_payload(center: Session, tenant: Tenant) -> dict[str, Any]:
         "suspended_at": iso_utc(tenant.suspended_at),
         "suspended_reason": tenant.suspended_reason,
         "created_at": iso_utc(tenant.created_at),
+        # 负责人邀请摘要：不含 token（明文令牌只在重新签发接口返回一次）
+        "owner_invitation": invitation_payload(owner_invitation) if owner_invitation else None,
         "database": (
             {
                 "host": database.host,

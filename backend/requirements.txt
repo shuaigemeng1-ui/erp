@@ -3,12 +3,14 @@ uvicorn[standard]==0.42.0
 pydantic==2.12.5
 pydantic-settings==2.14.2
 SQLAlchemy==2.0.48
-PyMySQL==1.4.6
+PyMySQL==1.1.2
 alembic==1.18.4
-redis==5.3.1
+redis==6.4.0
 celery==5.4.0
 httpx==0.28.1
 cryptography==50.0.1
 bcrypt==4.0.1
 python-multipart==0.0.32
 email-validator==2.3.0
+# Celery 的 Redis 传输（kombu）在运行期导入 packaging，需要显式声明
+packaging==26.0

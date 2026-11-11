@@ -51,6 +51,8 @@ export type {
   Plan,
   PlanFeature,
   PlanPatchPayload,
+  OwnerInvitation,
+  OwnerInvitationCreated,
   PlanPayload,
   PlatformAuditLog,
   PlatformTenant,

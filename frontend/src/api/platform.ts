@@ -9,6 +9,7 @@ import type {
   EntityId,
   PageParams,
   PagedData,
+  OwnerInvitationCreated,
   Plan,
   PlanPatchPayload,
   PlanPayload,
@@ -49,6 +50,11 @@ export const platformApi = {
 
   retryProvision(tenantId: EntityId): Promise<AcceptedTask> {
     return http.post<AcceptedTask>(`/platform/tenants/${segment(tenantId)}/retry-provision`)
+  },
+
+  /** 服务器无邮件通道：由平台管理员生成负责人邀请链接并复制发送 */
+  issueOwnerInvitation(tenantId: EntityId): Promise<OwnerInvitationCreated> {
+    return http.post<OwnerInvitationCreated>(`/platform/tenants/${segment(tenantId)}/owner-invitation`)
   },
 
   suspendTenant(tenantId: EntityId, reason: string): Promise<AcceptedTask> {

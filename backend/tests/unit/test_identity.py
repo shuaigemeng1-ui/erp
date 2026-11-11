@@ -1036,8 +1036,17 @@ def test_owner_role_cannot_be_removed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # --------------------------------------------------------------------------- 路由级 SQLite 集成（无 MySQL / 无 Redis）
-def _route_client(monkeypatch: pytest.MonkeyPatch, *, user_id: int = 10):
-    """把中心库 / 租户库 Session 替换为 SQLite 内存库，走真实依赖链与路由。"""
+def _route_client(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    user_id: int = 10,
+    sessions: tuple[object, object] | None = None,
+):
+    """把中心库 / 租户库 Session 替换为 SQLite 内存库，走真实依赖链与路由。
+
+    返回 ``(client, center, tenant, session_state)``；``session_state["user_id"]`` 可在测试中
+    切换以模拟不同登录账号（登录态由中间件从该值读取）。
+    """
     from contextlib import contextmanager
 
     from fastapi.testclient import TestClient
@@ -1045,10 +1054,14 @@ def _route_client(monkeypatch: pytest.MonkeyPatch, *, user_id: int = 10):
     import app.api.deps as deps
     import app.main as main_module
     from app.modules.access import service as access_service
+    from app.modules.identity import service as identity_service
 
-    center_factory, tenant_factory, _, _ = _build_sqlite_sessions()
-    center = center_factory()
-    tenant = tenant_factory()
+    if sessions is None:
+        center_factory, tenant_factory, _, _ = _build_sqlite_sessions()
+        center = center_factory()
+        tenant = tenant_factory()
+    else:
+        center, tenant = sessions
 
     @contextmanager
     def center_cm():
@@ -1058,15 +1071,20 @@ def _route_client(monkeypatch: pytest.MonkeyPatch, *, user_id: int = 10):
     def tenant_cm(route=None):  # noqa: ANN001 - 入参由 deps.tenant_session(route) 传入
         yield tenant
 
+    state = {"user_id": user_id}
     monkeypatch.setattr(deps, "center_session", center_cm)
     monkeypatch.setattr(deps, "tenant_session", tenant_cm)
-    monkeypatch.setattr(main_module, "load_session_payload", lambda request: {"user_id": user_id, "csrf": "x"})
+    # identity.service 内部打开租户库会话（接受邀请 / 签发负责人邀请）同样使用 SQLite
+    monkeypatch.setattr(identity_service, "tenant_session", tenant_cm)
+    monkeypatch.setattr(
+        main_module, "load_session_payload", lambda request: {"user_id": state["user_id"], "csrf": "x"}
+    )
     monkeypatch.setattr(main_module, "touch_session", lambda session_id, payload: None)
     monkeypatch.setattr(main_module, "verify_csrf", lambda request, payload: None)
     monkeypatch.setattr(main_module, "verify_request_origin", lambda request: None)
     monkeypatch.setattr(access_service, "cache_get_json", lambda key: None)
     monkeypatch.setattr(access_service, "cache_set_json", lambda key, value, ttl_seconds=300: None)
-    return TestClient(main_module.app), center, tenant
+    return TestClient(main_module.app), center, tenant, state
 
 
 def _seed_tenant_settings(tenant) -> None:
@@ -1077,7 +1095,7 @@ def _seed_tenant_settings(tenant) -> None:
 
 
 def test_owner_transfer_route_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, center, tenant = _route_client(monkeypatch)
+    client, center, tenant, _state = _route_client(monkeypatch)
     _seed_tenant(center, tenant)
     _seed_tenant_settings(tenant)
 
@@ -1099,7 +1117,7 @@ def test_owner_transfer_route_success(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_last_owner_disable_route_returns_409(monkeypatch: pytest.MonkeyPatch) -> None:
-    client, center, tenant = _route_client(monkeypatch)
+    client, center, tenant, _state = _route_client(monkeypatch)
     _seed_tenant(center, tenant)
     _seed_tenant_settings(tenant)
 
@@ -1124,7 +1142,7 @@ def test_login_route_rate_limited_after_five_failures(monkeypatch: pytest.Monkey
     monkeypatch.setattr(rate_limit, "cache_redis", lambda: fake_redis)
     monkeypatch.setattr(identity_router, "create_session", lambda user_id: ("sid", {}, "csrf"))
     monkeypatch.setattr(identity_router, "delete_session", lambda session_id, user_id=None: None)
-    client, center, tenant = _route_client(monkeypatch)
+    client, center, tenant, _state = _route_client(monkeypatch)
     _seed_tenant(center, tenant)
     _seed_tenant_settings(tenant)
     from app.modules.identity import repository as identity_repo
@@ -1166,7 +1184,7 @@ def test_platform_create_tenant_returns_202_without_inline_pipeline(monkeypatch:
     """平台创建租户只登记并投递任务：202、mode=async、请求内不执行流水线。"""
     from app.modules.identity import provisioning
 
-    client, center, tenant = _route_client(monkeypatch, user_id=20)
+    client, center, tenant, _state = _route_client(monkeypatch, user_id=20)
     # 平台管理员账号 + 平台角色
     from app.modules.identity.models_center import PlatformRole, PlatformUserRole, User
 
@@ -1275,5 +1293,360 @@ def test_provision_tenant_task_eager_executes_and_reports_failure(monkeypatch: p
     )
     failure = tasks.provision_tenant_job.apply(args=[5])
     assert failure.failed() is True
+
+
+# --------------------------------------------------------------------------- 负责人邀请重签
+def _seed_invitable_tenant(center, db):
+    """负责人成员为 invited、租户已 active（可签发邀请）的 SQLite 测试数据。"""
+    from app.modules.identity import repository as identity_repo
+
+    roles = _seed_tenant(center, db)
+    membership = identity_repo.get_membership_by_id(center, 1, 100)
+    assert membership is not None
+    membership.status = "invited"
+    center.commit()
+    return roles
+
+
+def _patch_service_tenant_session(monkeypatch: pytest.MonkeyPatch, tenant) -> None:
+    """服务层内部打开租户库会话时使用 SQLite 测试会话（不连接 MySQL）。"""
+    from contextlib import contextmanager
+
+    from app.modules.identity import service as identity_service
+
+    @contextmanager
+    def tenant_cm(route=None):  # noqa: ANN001 - 入参由 tenant_session(route) 传入
+        yield tenant
+
+    monkeypatch.setattr(identity_service, "tenant_session", tenant_cm)
+
+
+def test_issue_owner_invitation_rotates_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """重新签发负责人邀请：旧令牌立即失效，库中只存 SHA-256 摘要。"""
+    from app.modules.identity import repository as identity_repo
+    from app.modules.identity import service
+
+    center_factory, tenant_factory, _, _ = _build_sqlite_sessions()
+    center, tenant = center_factory(), tenant_factory()
+    _seed_invitable_tenant(center, tenant)
+    _patch_service_tenant_session(monkeypatch, tenant)
+
+    first = service.issue_owner_invitation(center, 1, actor_user_id=20)
+    assert first["email"] == "owner@example.com"
+    assert first["status"] == "pending"
+    assert first["invitation_url"] == f"/activate/{first['token']}"
+    assert service.preview_invitation(center, first["token"])["status"] == "pending"
+
+    stored = identity_repo.get_invitation(center, 1, int(first["invitation_id"]))
+    assert stored is not None
+    assert stored.token_hash == sha256_hex(first["token"])
+    assert stored.token_hash != first["token"]
+    assert len(stored.token_hash) == 64
+
+    second = service.issue_owner_invitation(center, 1, actor_user_id=20)
+    assert second["token"] != first["token"]
+    with pytest.raises(AppError) as old_token:
+        service.preview_invitation(center, first["token"])
+    assert old_token.value.code is ErrorCode.AUTH_TOKEN_INVALID
+    # 新令牌可用，且同一邮箱只保留一个 pending 邀请
+    service.preview_invitation(center, second["token"])
+    pending = identity_repo.list_pending_invitations(center, 1, "owner@example.com")
+    assert len(pending) == 1
+    assert pending[0].token_hash == sha256_hex(second["token"])
+
+
+def test_owner_invitation_expired_and_used_error_codes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import timedelta
+
+    from app.core.security import utc_now
+    from app.modules.identity import repository as identity_repo
+    from app.modules.identity import service
+
+    center_factory, tenant_factory, _, _ = _build_sqlite_sessions()
+    center, tenant = center_factory(), tenant_factory()
+    _seed_invitable_tenant(center, tenant)
+    _patch_service_tenant_session(monkeypatch, tenant)
+
+    expired_payload = service.issue_owner_invitation(center, 1)
+    expired_row = identity_repo.get_invitation(center, 1, int(expired_payload["invitation_id"]))
+    assert expired_row is not None
+    expired_row.expires_at = utc_now() - timedelta(minutes=1)
+    center.commit()
+    with pytest.raises(AppError) as expired:
+        service.preview_invitation(center, expired_payload["token"])
+    assert expired.value.code is ErrorCode.AUTH_TOKEN_EXPIRED
+
+    used_payload = service.issue_owner_invitation(center, 1)
+    used_row = identity_repo.get_invitation(center, 1, int(used_payload["invitation_id"]))
+    assert used_row is not None
+    used_row.status = "accepted"
+    center.commit()
+    with pytest.raises(AppError) as used:
+        service.preview_invitation(center, used_payload["token"])
+    assert used.value.code is ErrorCode.AUTH_TOKEN_USED
+
+
+def test_owner_invitation_requires_active_tenant_and_invited_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.modules.identity import repository as identity_repo
+    from app.modules.identity import service
+
+    center_factory, tenant_factory, _, _ = _build_sqlite_sessions()
+    center, tenant = center_factory(), tenant_factory()
+    _seed_tenant(center, tenant)
+    _patch_service_tenant_session(monkeypatch, tenant)  # 负责人 active
+
+    with pytest.raises(AppError) as already_active:
+        service.issue_owner_invitation(center, 1)
+    assert already_active.value.code is ErrorCode.CONFLICT
+
+    membership = identity_repo.get_membership_by_id(center, 1, 100)
+    assert membership is not None
+    membership.status = "invited"
+    tenant_row = identity_repo.get_tenant(center, 1)
+    assert tenant_row is not None
+    tenant_row.status = "provisioning"
+    center.commit()
+    with pytest.raises(AppError) as not_active:
+        service.issue_owner_invitation(center, 1)
+    assert not_active.value.code is ErrorCode.TENANT_NOT_ACTIVE
+
+
+def test_tenant_detail_exposes_invitation_summary_without_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.modules.identity import repository as identity_repo
+    from app.modules.identity import service
+
+    center_factory, tenant_factory, _, _ = _build_sqlite_sessions()
+    center, tenant = center_factory(), tenant_factory()
+    _seed_invitable_tenant(center, tenant)
+    _patch_service_tenant_session(monkeypatch, tenant)
+    issued = service.issue_owner_invitation(center, 1)
+
+    tenant_row = identity_repo.get_tenant(center, 1)
+    assert tenant_row is not None
+    detail = service.tenant_detail_payload(center, tenant_row)
+    summary = detail["owner_invitation"]
+    assert summary["invitation_id"] == issued["invitation_id"]
+    assert summary["email"] == "owner@example.com"
+    assert summary["status"] == "pending"
+    assert summary["expires_at"] and summary["invited_at"]
+    assert "token" not in summary
+    assert "invitation_url" not in summary
+
+
+def test_resend_invitation_rotates_and_audits(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.modules.audit.models_tenant import AuditLog
+    from app.modules.identity import service
+
+    center_factory, tenant_factory, _, _ = _build_sqlite_sessions()
+    center, tenant = center_factory(), tenant_factory()
+    _seed_invitable_tenant(center, tenant)
+    _patch_service_tenant_session(monkeypatch, tenant)
+    first = service.issue_owner_invitation(center, 1)
+
+    rotated = service.resend_invitation(
+        center, tenant, tenant_id=1, invitation_id=int(first["invitation_id"]), actor_id=10
+    )
+    assert rotated["token"] != first["token"]
+    assert rotated["invitation_url"] == f"/activate/{rotated['token']}"
+    with pytest.raises(AppError) as old_token:
+        service.preview_invitation(center, first["token"])
+    assert old_token.value.code is ErrorCode.AUTH_TOKEN_INVALID
+    service.preview_invitation(center, rotated["token"])
+
+    audit_rows = tenant.query(AuditLog).filter(AuditLog.action == "member.invitation.resend").all()
+    assert len(audit_rows) == 1
+    assert audit_rows[0].payload["previous_invitation_id"] == first["invitation_id"]
+
+    accepted = service.preview_invitation(center, rotated["token"])
+    assert accepted["email"] == "owner@example.com"
+
+
+# --------------------------------------------------------------------------- 平台邀请接口（路由）
+def _seed_platform_admin(center, user_id: int = 20) -> None:
+    from app.modules.identity.models_center import PlatformRole, PlatformUserRole, User
+
+    center.add(
+        User(
+            id=user_id,
+            email="admin@example.com",
+            password_hash="h",
+            display_name="Admin",
+            status="active",
+            locale="zh-CN",
+        )
+    )
+    center.add(PlatformRole(id=1, code="platform_admin", name="平台管理员", description=""))
+    center.add(PlatformUserRole(id=1, user_id=user_id, role_id=1, granted_by=None))
+    center.commit()
+
+
+def test_platform_owner_invitation_route_returns_token_and_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.platform.models_center import PlatformAuditLog
+
+    client, center, tenant, _state = _route_client(monkeypatch, user_id=20)
+    _seed_platform_admin(center)
+    _seed_invitable_tenant(center, tenant)
+
+    response = client.post(
+        "/api/v1/platform/tenants/1/owner-invitation", headers={"X-CSRF-Token": "x"}
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["email"] == "owner@example.com"
+    assert data["invitation_url"] == f"/activate/{data['token']}"
+    assert data["expires_at"]
+
+    audit_rows = (
+        center.query(PlatformAuditLog)
+        .filter(PlatformAuditLog.action == "platform.tenant.owner_invitation")
+        .all()
+    )
+    assert len(audit_rows) == 1
+    assert "token" not in (audit_rows[0].payload or {})
+
+    detail = client.get("/api/v1/platform/tenants/1").json()["data"]
+    assert detail["owner_invitation"]["email"] == "owner@example.com"
+    assert detail["owner_invitation"]["status"] == "pending"
+    assert "token" not in detail["owner_invitation"]
+    assert "token" not in response.json()["data"]["invitation_url"]
+
+
+def test_platform_owner_invitation_requires_platform_admin(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, center, tenant, _state = _route_client(monkeypatch, user_id=10)
+    _seed_invitable_tenant(center, tenant)
+
+    response = client.post(
+        "/api/v1/platform/tenants/1/owner-invitation", headers={"X-CSRF-Token": "x"}
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == ErrorCode.PLATFORM_PERMISSION_REQUIRED.value
+
+
+def test_e2e_create_tenant_eager_invitation_accept_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """完整链路：创建租户（eager 开通）→ 签发负责人邀请 → 接受 → bootstrap 有权限。"""
+    from types import SimpleNamespace
+
+    from app.core.security import encrypt_secret
+    from app.modules.identity import provisioning
+    from app.modules.identity import repository as identity_repo
+    from app.modules.identity import router as identity_router
+    from app.modules.identity import service as identity_service
+    from app.modules.identity.models_center import TenantDatabase
+
+    center_factory, tenant_factory, _, _ = _build_sqlite_sessions()
+    center, tenant = center_factory(), tenant_factory()
+    client, center, tenant, state = _route_client(
+        monkeypatch, user_id=20, sessions=(center, tenant)
+    )
+    _seed_platform_admin(center, user_id=20)
+    monkeypatch.setattr(identity_router, "create_session", lambda user_id: ("sid", {}, "csrf"))
+    monkeypatch.setattr(provisioning.settings, "celery_task_always_eager", True)
+
+    def fake_provision(center_session, tenant_id, *, operator_user_id=None):  # noqa: ANN001
+        """模拟开通流水线的初始化步骤（角色 / 负责人绑定 / 数据库路由 / 激活）。"""
+        tenant_row = identity_repo.get_tenant(center_session, tenant_id)
+        assert tenant_row is not None and tenant_row.owner_user_id is not None
+        owner = identity_repo.get_user(center_session, int(tenant_row.owner_user_id))
+        assert owner is not None
+        membership = identity_repo.get_membership(center_session, tenant_id, int(owner.id))
+        assert membership is not None
+        center_session.add(
+            TenantDatabase(
+                tenant_id=tenant_id,
+                host="127.0.0.1",
+                port=3306,
+                database_name="vs_demo",
+                username="u",
+                password_cipher=encrypt_secret("p"),
+                credentials_version=1,
+                schema_version="tenant_0004",
+                status="ready",
+            )
+        )
+        tenant_row.status = "active"
+        center_session.add(tenant_row)
+        center_session.commit()
+        roles = identity_service.seed_predefined_roles(tenant, tenant_id)
+        identity_service._write_bindings(
+            tenant,
+            tenant_id=tenant_id,
+            member_id=int(membership.id),
+            bindings=[
+                identity_service.RoleBindingChoice(
+                    role_id=int(roles["owner"].id),
+                    scopes=(identity_service.ScopeChoice(scope_type="all", scope_ids=()),),
+                )
+            ],
+            assigned_by=None,
+        )
+        tenant.commit()
+        return SimpleNamespace(
+            as_dict=lambda: {
+                "tenant_id": str(tenant_id),
+                "status": "active",
+                "steps": [],
+                "failed_step": "",
+                "error_message": "",
+            },
+            failed_step="",
+        )
+
+    monkeypatch.setattr(provisioning, "provision_tenant", fake_provision)
+
+    # 1) 创建租户（eager 模式同步执行开通流水线）
+    created = client.post(
+        "/api/v1/platform/tenants",
+        json={"code": "demo2", "name": "演示租户2", "owner_email": "owner2@example.com"},
+        headers={"X-CSRF-Token": "x"},
+    )
+    assert created.status_code == 202, created.text
+    created_data = created.json()["data"]
+    assert created_data["mode"] == "sync-eager"
+    tenant_id = int(created_data["tenant"]["id"])
+    assert created_data["tenant"]["status"] == "active"
+
+    # 2) 重新签发负责人邀请（无邮件通道时管理员拿到链接）
+    issued = client.post(
+        f"/api/v1/platform/tenants/{tenant_id}/owner-invitation", headers={"X-CSRF-Token": "x"}
+    )
+    assert issued.status_code == 200, issued.text
+    invitation = issued.json()["data"]
+    assert invitation["invitation_url"] == f"/activate/{invitation['token']}"
+
+    # 3) 负责人接受邀请（设置密码）
+    accepted = client.post(
+        "/api/v1/auth/invitations/accept",
+        json={
+            "token": invitation["token"],
+            "password": "Str0ng-Password!2026",
+            "display_name": "负责人",
+        },
+        headers={"X-CSRF-Token": "x"},
+    )
+    assert accepted.status_code == 200, accepted.text
+    accepted_data = accepted.json()["data"]
+    owner_user_id = int(accepted_data["user"]["id"])
+    assert any(item["id"] == str(tenant_id) for item in accepted_data["tenants"])
+
+    center.expire_all()
+    owner_membership = identity_repo.get_membership(center, tenant_id, owner_user_id)
+    assert owner_membership is not None and owner_membership.status == "active"
+
+    # 4) 负责人 bootstrap：成员状态正常且有权限
+    state["user_id"] = owner_user_id
+    bootstrap = client.get(f"/api/v1/tenants/{tenant_id}/bootstrap")
+    assert bootstrap.status_code == 200, bootstrap.text
+    bootstrap_data = bootstrap.json()["data"]
+    assert "owner" in bootstrap_data["member"]["roles"]
+    assert "role.manage" in bootstrap_data["permissions"]
+    assert bootstrap_data["permission_version"] >= 1
+
+    # 5) 邀请已被使用，旧令牌再次预览返回 AUTH_TOKEN_USED
+    reused = client.get(f"/api/v1/auth/invitations/{invitation['token']}")
+    assert reused.status_code == 422, reused.text
+    assert reused.json()["error"]["code"] == ErrorCode.AUTH_TOKEN_USED.value
+
 
 

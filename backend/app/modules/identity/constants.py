@@ -118,6 +118,7 @@ PLATFORM_AUDIT_ACTIONS: dict[str, str] = {
     "tenant.suspend": "暂停租户",
     "tenant.activate": "启用租户",
     "tenant.owner_transfer": "转移租户所有者",
+    "platform.tenant.owner_invitation": "重新签发负责人邀请",
     "plan.create": "创建套餐",
     "plan.update": "调整套餐",
     "channel_app.update": "保存渠道应用",

@@ -3,18 +3,23 @@ import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import PlatformSystemSettingsView from './PlatformSystemSettingsView.vue'
 import PlatformChannelAppsView from './PlatformChannelAppsView.vue'
+import PlatformEmailView from './PlatformEmailView.vue'
 
-type ConfigTab = 'storage' | 'channels'
+type ConfigTab = 'storage' | 'channels' | 'email'
 
 const route = useRoute()
 const router = useRouter()
 
 function tabFromQuery(): ConfigTab {
-  return route.query.tab === 'channels' ? 'channels' : 'storage'
+  if (route.query.tab === 'channels') return 'channels'
+  if (route.query.tab === 'email') return 'email'
+  return 'storage'
 }
 
 const activeTab = ref<ConfigTab>(tabFromQuery())
-const activeLabel = computed(() => (activeTab.value === 'channels' ? '渠道应用' : '对象存储'))
+const activeLabel = computed(() =>
+  activeTab.value === 'channels' ? '渠道应用' : activeTab.value === 'email' ? '邮件服务' : '对象存储',
+)
 
 watch(activeTab, (tab) => {
   if (route.query.tab === tab) return
@@ -46,6 +51,9 @@ watch(
       </el-tab-pane>
       <el-tab-pane label="渠道应用" name="channels" lazy>
         <PlatformChannelAppsView />
+      </el-tab-pane>
+      <el-tab-pane label="邮件服务" name="email" lazy>
+        <PlatformEmailView />
       </el-tab-pane>
     </el-tabs>
   </div>

@@ -89,6 +89,14 @@ export type {
   StoreStatus,
 } from './channels'
 export type {
+  EmailProfile,
+  EmailProfilePayload,
+  EmailProfilesResponse,
+  EmailProvider,
+  EmailProviderMeta,
+  EmailTestResult,
+} from './email'
+export type {
   Order,
   OrderDetail,
   OrderItem,

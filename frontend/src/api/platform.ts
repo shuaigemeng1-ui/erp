@@ -2,6 +2,12 @@ import { http, requestPage } from './http'
 import { segment } from './paths'
 import type { PlatformSystemSettings, StorageConnectionResult, StorageProfile, StorageProfilePayload } from '@/types/storage'
 import type {
+  EmailProfile,
+  EmailProfilePayload,
+  EmailProfilesResponse,
+  EmailTestResult,
+} from '@/types/email'
+import type {
   AcceptedTask,
   ChannelApp,
   ChannelAppPayload,
@@ -55,6 +61,29 @@ export const platformApi = {
 
   testStorageProfile(id: EntityId): Promise<StorageConnectionResult> {
     return http.post<StorageConnectionResult>(`/platform/storage-profiles/${segment(id)}/test`)
+  },
+
+  emailProfiles(): Promise<EmailProfilesResponse> {
+    return http.get<EmailProfilesResponse>('/platform/email-profiles')
+  },
+
+  createEmailProfile(payload: EmailProfilePayload): Promise<EmailProfile> {
+    return http.post<EmailProfile>('/platform/email-profiles', payload)
+  },
+
+  updateEmailProfile(id: EntityId, payload: EmailProfilePayload): Promise<EmailProfile> {
+    return http.put<EmailProfile>(`/platform/email-profiles/${segment(id)}`, payload)
+  },
+
+  setDefaultEmailProfile(id: EntityId): Promise<EmailProfile> {
+    return http.post<EmailProfile>(`/platform/email-profiles/${segment(id)}/default`)
+  },
+
+  testEmailProfile(id: EntityId, to: string, subject?: string): Promise<EmailTestResult> {
+    return http.post<EmailTestResult>(`/platform/email-profiles/${segment(id)}/test`, {
+      to,
+      ...(subject ? { subject } : {}),
+    })
   },
 
   tenants(query: PlatformTenantQuery = {}): Promise<PagedData<PlatformTenant>> {

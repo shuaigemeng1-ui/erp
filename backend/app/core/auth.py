@@ -77,6 +77,9 @@ def is_csrf_exempt(path: str) -> bool:
     """回调 / 健康检查使用签名或公开校验，不走用户 CSRF。"""
     if path in {"/healthz", "/livez"}:
         return True
+    # Agent 使用节点 Bearer 令牌认证，不携带浏览器 Cookie；不能要求 CSRF。
+    if path.startswith(f"{settings.api_prefix}/agent/"):
+        return True
     return path.startswith(f"{settings.api_prefix}/integrations/")
 
 

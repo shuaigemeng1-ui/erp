@@ -77,6 +77,17 @@ def node_metrics(
     return success(service.list_metrics(center, node_id, minutes=minutes))
 
 
+@router.get("/nodes/{node_id}/aggregates", summary="节点指标聚合趋势")
+def node_aggregates(
+    center: CenterDb,
+    _: PlatformAdmin,
+    node_id: int,
+    resolution: str = Query(default="5m", pattern="^(5m|1h)$"),
+    hours: int = Query(default=24, ge=1, le=720),
+) -> dict:
+    return success(service.list_metric_aggregates(center, node_id, resolution=resolution, hours=hours))
+
+
 @router.get("/nodes/{node_id}/checks", summary="节点公网探测记录")
 def node_checks(
     center: CenterDb,

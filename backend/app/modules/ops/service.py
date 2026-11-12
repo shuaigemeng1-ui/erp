@@ -787,6 +787,7 @@ def run_center_maintenance(center, *, probe_interval_seconds: int = 60) -> dict[
             except Exception:  # noqa: BLE001 - 单节点探测失败不影响其他节点
                 failed += 1
         _last_probe_at = now
+    aggregate_metrics(center)
     notifications = check_backup_alerts(center)
     notified = notify_open_alerts(center)
     cleaned = cleanup_old_monitoring_data(center)
@@ -1167,3 +1168,133 @@ def check_backup_alerts(center) -> int:
     else:
         center.commit()
     return created
+
+
+_agg_last_at: datetime | None = None
+
+
+def aggregate_metrics(center, *, force: bool = False) -> int:
+    """把近 2 小时原始指标聚合为 5 分钟桶，再由 5 分钟桶聚合小时桶。"""
+    from app.modules.ops.models_center import NodeMetricAggregate
+
+    global _agg_last_at
+    now = _now()
+    if not force and _agg_last_at is not None and (now - _agg_last_at).total_seconds() < 300:
+        return 0
+    _agg_last_at = now
+    nodes = center.execute(select(ServerNode.id)).scalars().all()
+    written = 0
+    for node_id in nodes:
+        rows = center.execute(
+            select(NodeMetricSample).where(
+                NodeMetricSample.node_id == node_id,
+                NodeMetricSample.sampled_at >= now - timedelta(hours=2),
+            )
+        ).scalars().all()
+        buckets: dict[datetime, list[NodeMetricSample]] = {}
+        for row in rows:
+            bucket = row.sampled_at.replace(second=0, microsecond=0, minute=(row.sampled_at.minute // 5) * 5)
+            buckets.setdefault(bucket, []).append(row)
+        for bucket, items in buckets.items():
+            disk_max = 0.0
+            for item in items:
+                for disk in item.disks or []:
+                    try:
+                        disk_max = max(disk_max, float(disk.get("percent") or 0))
+                    except (TypeError, ValueError):
+                        continue
+            values = {
+                "sample_count": len(items),
+                "cpu_avg": sum(float(i.cpu_percent or 0) for i in items) / len(items),
+                "cpu_max": max(float(i.cpu_percent or 0) for i in items),
+                "memory_avg": sum(float(i.memory_percent or 0) for i in items) / len(items),
+                "memory_max": max(float(i.memory_percent or 0) for i in items),
+                "load_avg": sum(float(i.load1 or 0) for i in items) / len(items),
+                "disk_max": disk_max,
+            }
+            row = center.execute(
+                select(NodeMetricAggregate).where(
+                    NodeMetricAggregate.node_id == node_id,
+                    NodeMetricAggregate.resolution == "5m",
+                    NodeMetricAggregate.bucket_start == bucket,
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                center.add(NodeMetricAggregate(node_id=node_id, resolution="5m", bucket_start=bucket,
+                                               created_at=now, **values))
+            else:
+                for key, value in values.items():
+                    setattr(row, key, value)
+            written += 1
+    center.commit()
+    # 小时桶：由 5 分钟桶合并，供 7/30 天趋势使用。
+    for node_id in nodes:
+        rows5 = center.execute(
+            select(NodeMetricAggregate).where(
+                NodeMetricAggregate.node_id == node_id,
+                NodeMetricAggregate.resolution == "5m",
+                NodeMetricAggregate.bucket_start >= now - timedelta(days=2),
+            )
+        ).scalars().all()
+        buckets: dict[datetime, list] = {}
+        for row in rows5:
+            buckets.setdefault(row.bucket_start.replace(minute=0), []).append(row)
+        for bucket, items in buckets.items():
+            count = sum(int(i.sample_count or 0) for i in items) or len(items)
+            values = {
+                "sample_count": count,
+                "cpu_avg": sum(float(i.cpu_avg or 0) for i in items) / len(items),
+                "cpu_max": max(float(i.cpu_max or 0) for i in items),
+                "memory_avg": sum(float(i.memory_avg or 0) for i in items) / len(items),
+                "memory_max": max(float(i.memory_max or 0) for i in items),
+                "load_avg": sum(float(i.load_avg or 0) for i in items) / len(items),
+                "disk_max": max(float(i.disk_max or 0) for i in items),
+            }
+            row = center.execute(
+                select(NodeMetricAggregate).where(
+                    NodeMetricAggregate.node_id == node_id,
+                    NodeMetricAggregate.resolution == "1h",
+                    NodeMetricAggregate.bucket_start == bucket,
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                center.add(NodeMetricAggregate(node_id=node_id, resolution="1h", bucket_start=bucket,
+                                               created_at=now, **values))
+            else:
+                for key, value in values.items():
+                    setattr(row, key, value)
+    center.commit()
+    return written
+
+
+def list_metric_aggregates(center, node_id: int, *, resolution: str = "5m", hours: int = 24) -> dict[str, Any]:
+    from app.modules.ops.models_center import NodeMetricAggregate
+
+    node = center.get(ServerNode, int(node_id))
+    if node is None:
+        raise AppError(ErrorCode.NOT_FOUND, "节点不存在")
+    since = _now() - timedelta(hours=max(1, min(hours, 24 * 30)))
+    rows = center.execute(
+        select(NodeMetricAggregate)
+        .where(
+            NodeMetricAggregate.node_id == node.id,
+            NodeMetricAggregate.resolution == resolution,
+            NodeMetricAggregate.bucket_start >= since,
+        )
+        .order_by(NodeMetricAggregate.bucket_start.asc())
+        .limit(1000)
+    ).scalars().all()
+    return {
+        "node_id": str(node.id),
+        "resolution": resolution,
+        "items": [
+            {
+                "bucket_start": _iso(row.bucket_start),
+                "sample_count": int(row.sample_count or 0),
+                "cpu_avg": float(row.cpu_avg or 0), "cpu_max": float(row.cpu_max or 0),
+                "memory_avg": float(row.memory_avg or 0), "memory_max": float(row.memory_max or 0),
+                "load_avg": float(row.load_avg or 0), "disk_max": float(row.disk_max or 0),
+            }
+            for row in rows
+        ],
+    }

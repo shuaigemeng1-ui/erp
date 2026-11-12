@@ -261,3 +261,24 @@ class MaintenanceWindow(IdMixin, TimestampMixin, CenterBase):
     ends_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, comment="结束时间UTC")
     reason: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="", comment="维护原因")
     created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="创建人用户ID")
+
+
+class NodeMetricAggregate(IdMixin, CenterBase):
+    __tablename__ = "node_metric_aggregates"
+    __table_args__ = (
+        UniqueConstraint("node_id", "resolution", "bucket_start", name="uq_node_metric_agg_bucket"),
+        Index("ix_node_metric_agg_node_res_start", "node_id", "resolution", "bucket_start"),
+        table_options("节点指标聚合表"),
+    )
+
+    node_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="节点ID")
+    resolution: Mapped[str] = mapped_column(String(8), nullable=False, comment="聚合粒度：5m/1h")
+    bucket_start: Mapped[datetime] = mapped_column(DateTime, nullable=False, comment="桶开始UTC")
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="样本数")
+    cpu_avg: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False, default=0, comment="CPU平均%")
+    cpu_max: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False, default=0, comment="CPU最大%")
+    memory_avg: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False, default=0, comment="内存平均%")
+    memory_max: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False, default=0, comment="内存最大%")
+    load_avg: Mapped[float] = mapped_column(Numeric(8, 2), nullable=False, default=0, comment="负载平均")
+    disk_max: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False, default=0, comment="磁盘最高%")
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, comment="创建UTC")

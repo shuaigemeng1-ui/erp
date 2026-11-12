@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import hashlib
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -28,6 +29,8 @@ class Settings(BaseSettings):
     app_name: str = "ERP"
     app_env: str = "development"  # development | test | production
     api_prefix: str = "/api/v1"
+    # 部署形态：center=统一管理中心，tenant=租户独立实例，gateway=独立集成网关
+    deployment_mode: Literal["center", "tenant", "gateway"] = "center"
     debug: bool = False
     log_level: str = "INFO"
     # 前端站点源，用于 Cookie 会话的请求来源校验

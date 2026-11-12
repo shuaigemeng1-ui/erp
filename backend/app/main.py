@@ -68,6 +68,21 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                     user_token = set_current_user_id(int(payload["user_id"]))
                     touch_session(session_id, payload)
                 verify_request_origin(request)
+                mode = settings.deployment_mode
+                path = request.url.path
+                if mode == "tenant" and path.startswith(f"{settings.api_prefix}/platform"):
+                    return JSONResponse(
+                        status_code=404,
+                        content=error_body("NOT_FOUND", "当前实例未开放平台管理接口"),
+                    )
+                if mode == "gateway" and not (
+                    path in {"/healthz", "/livez"}
+                    or path.startswith(f"{settings.api_prefix}/gateway")
+                ):
+                    return JSONResponse(
+                        status_code=404,
+                        content=error_body("NOT_FOUND", "当前网关未开放该接口"),
+                    )
                 if request.method in UNSAFE_METHODS and not is_csrf_exempt(request.url.path):
                     verify_csrf(request, payload)
             except AppError as exc:
@@ -88,6 +103,10 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             if user_token is not None:
                 reset_current_user_id(user_token)
             reset_request_id(request_id_token)
+
+
+def runtime_health() -> dict:
+    return {"ok": True, "mode": settings.deployment_mode, "app": settings.app_name}
 
 
 def create_app() -> FastAPI:
@@ -117,6 +136,14 @@ def create_app() -> FastAPI:
             allow_headers=["*"],
             expose_headers=["x-request-id"],
         )
+
+    @application.get(f"{settings.api_prefix}/runtime", tags=["runtime"])
+    def runtime_info() -> dict:
+        return {"ok": True, "mode": settings.deployment_mode, "app": settings.app_name}
+
+    @application.get(f"{settings.api_prefix}/gateway/health", tags=["gateway"])
+    def gateway_health() -> dict:
+        return {"ok": True, "mode": settings.deployment_mode}
 
     application.include_router(api_router, prefix=settings.api_prefix)
 

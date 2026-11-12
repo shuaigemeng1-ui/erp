@@ -113,6 +113,7 @@ class ListingLinkIn(BaseModel):
 class StoreOut(BaseModel):
     id: str = Field(description="店铺ID")
     channel: str = Field(description="渠道编码")
+    store_code: str = Field(description="ERP 内部店铺编码")
     name: str = Field(description="店铺名称")
     external_store_id: str = Field(description="平台店铺ID")
     region: str | None = Field(default=None, description="站点区域")
@@ -128,10 +129,24 @@ class StoreOut(BaseModel):
     refresh_token_expires_at: str | None = Field(default=None, description="刷新令牌过期时间（UTC）")
 
 
+class StoreCreateIn(BaseModel):
+    """新建店铺：先选渠道、填 ERP 显示名称，授权前状态为待授权。"""
+
+    channel: Literal["shopee", "tiktok"] = Field(description="渠道：shopee / tiktok")
+    name: str = Field(min_length=1, max_length=128, description="ERP 中显示的店铺名称")
+    environment: Literal["production", "test"] | None = Field(
+        default=None, description="应用环境，缺省按部署环境选择"
+    )
+    region: str | None = Field(default=None, max_length=16, description="站点区域，如 UK/US")
+
+
 class AuthorizeOut(BaseModel):
     auth_url: str = Field(description="平台授权地址（一次性会话）")
     expires_at: str = Field(description="授权会话过期时间（UTC）")
     environment: str = Field(description="本次授权使用的应用环境")
+    store_code: str = Field(default="", description="ERP 内部店铺编码")
+    service_id: str = Field(default="", description="TikTok Shop Service ID / App ID")
+    market: str = Field(default="ROW", description="TikTok 授权市场 ROW/US")
 
 
 class DisconnectOut(BaseModel):
@@ -172,6 +187,7 @@ def store_payload(summary: Any) -> dict[str, Any]:
     return {
         "id": id_string(summary.id),
         "channel": summary.channel,
+        "store_code": summary.store_code,
         "name": summary.name,
         "external_store_id": summary.external_store_id,
         "region": summary.region,
@@ -227,6 +243,9 @@ def authorize_payload(item: dict[str, Any]) -> dict[str, Any]:
         "auth_url": item.get("auth_url") or "",
         "expires_at": utc_iso(item.get("expires_at")) or "",
         "environment": item.get("environment") or "",
+        "store_code": item.get("store_code") or "",
+        "service_id": item.get("service_id") or "",
+        "market": item.get("market") or "ROW",
     }
 
 

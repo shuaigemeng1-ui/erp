@@ -10,6 +10,7 @@ import type {
   PagedData,
   QueryParams,
   Store,
+  StoreCreatePayload,
 } from '@/types'
 
 export interface ListingQuery extends PageParams {
@@ -37,11 +38,21 @@ export const channelsApi = {
     return http.post<AuthorizeResult>(tenantPath(tenantId, '/stores/shopee/authorize'), payload)
   },
 
+  createStore(tenantId: EntityId, payload: StoreCreatePayload): Promise<Store> {
+    return http.post<Store>(tenantPath(tenantId, '/stores'), payload)
+  },
+
   authorizeTikTok(
     tenantId: EntityId,
     payload: { environment?: 'production' | 'test'; redirect_path?: string } = {},
   ): Promise<AuthorizeResult> {
     return http.post<AuthorizeResult>(tenantPath(tenantId, '/stores/tiktok/authorize'), payload)
+  },
+
+  authorizeStore(tenantId: EntityId, storeId: EntityId): Promise<AuthorizeResult> {
+    return http.post<AuthorizeResult>(
+      tenantPath(tenantId, `/stores/${segment(storeId)}/tiktok/authorize`),
+    )
   },
 
   disconnectStore(tenantId: EntityId, storeId: EntityId): Promise<void> {

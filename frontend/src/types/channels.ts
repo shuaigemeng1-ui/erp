@@ -1,6 +1,11 @@
 import type { Decimal, EntityId } from './common'
 
-export type StoreStatus = 'connected' | 'reauth_required' | 'disconnected' | string
+export type StoreStatus =
+  | 'connected'
+  | 'pending_authorization'
+  | 'reauth_required'
+  | 'disconnected'
+  | string
 
 export interface StoreCredential {
   status?: string
@@ -11,6 +16,7 @@ export interface StoreCredential {
 export interface Store {
   id: EntityId
   channel: string
+  store_code: string
   name: string
   external_store_id: string
   region?: string | null
@@ -51,6 +57,16 @@ export interface AuthorizeResult {
   auth_url: string
   expires_at: string
   environment?: string
+  store_code?: string
+  service_id?: string
+  market?: string
+}
+
+export interface StoreCreatePayload {
+  channel: 'tiktok' | 'shopee'
+  name: string
+  environment?: 'production' | 'test'
+  region?: string
 }
 
 export interface ListingLinkPayload {

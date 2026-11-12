@@ -50,6 +50,7 @@ from app.modules.channels.constants import (
     LINK_STATUSES,
     LISTING_FILTER_UNMAPPED,
     STORE_STATUS_CONNECTED,
+    STORE_STATUS_PENDING_AUTHORIZATION,
     STORE_STATUS_REAUTH_REQUIRED,
 )
 from app.modules.channels.models_tenant import ChannelListing
@@ -90,6 +91,35 @@ def list_stores(
         page.page,
         page.page_size,
     )
+
+
+@router.post("/tenants/{tenant_id}/stores")
+def create_tenant_store(
+    request: Request,
+    body: schemas.StoreCreateIn,
+    tenant_id: int = Path(ge=1),
+    ctx: TenantContext = Depends(tenant_context),
+    db: Session = Depends(get_tenant_db),
+    _: AccessSnapshot = Depends(require_permission(Permission.STORE_CONNECT.value)),
+) -> dict[str, Any]:
+    """新建店铺：选择渠道 + 填写 ERP 名称，状态为待授权，之后复制授权链接。"""
+    store_id = service.create_store(
+        db,
+        tenant_id=tenant_id,
+        channel=body.channel,
+        name=body.name,
+        environment=body.environment,
+        region=body.region,
+        actor_id=ctx.user_id,
+        request_id=ctx.request_id,
+        ip=_client_ip(request),
+    )
+    items, _total = service.list_store_summaries(
+        db, tenant_id, store_ids=frozenset({store_id}), offset=0, limit=1
+    )
+    if not items:
+        raise AppError(ErrorCode.INTERNAL_ERROR, "店铺创建成功但读取失败")
+    return success(schemas.store_payload(items[0]))
 
 
 @router.post("/tenants/{tenant_id}/stores/shopee/authorize")
@@ -461,6 +491,38 @@ def _handle_webhook(raw_body: bytes, signature: str, request_url: str) -> dict[s
     )
 
 # --------------------------------------------------------------------------- TikTok Shop
+@router.post("/tenants/{tenant_id}/stores/{store_id}/tiktok/authorize")
+def authorize_tiktok_store_link(
+    request: Request,
+    tenant_id: int = Path(ge=1),
+    store_id: int = Path(ge=1),
+    ctx: TenantContext = Depends(tenant_context),
+    db: Session = Depends(get_tenant_db),
+    center: Session = Depends(get_center_db),
+    snapshot: AccessSnapshot = Depends(require_permission(Permission.STORE_CONNECT.value)),
+) -> dict[str, Any]:
+    """为「待授权」店铺生成 TikTok Shop 授权链接（Service ID + state）。"""
+    allowed = service.allowed_store_ids(snapshot.effective, Permission.STORE_CONNECT.value)
+    if not service.store_in_scope(store_id, allowed):
+        raise AppError(ErrorCode.NOT_FOUND, "店铺不存在或不可见")
+    store = service.get_store_or_raise(db, tenant_id, store_id)
+    if store.channel != CHANNEL_TIKTOK:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "该店铺不是 TikTok Shop 渠道")
+    result = tiktok_oauth.start_authorization(
+        center,
+        db,
+        tenant_id=tenant_id,
+        member_id=ctx.member_id,
+        store_id=store_id,
+        environment=store.environment,
+        redirect_path=f"/tenants/{tenant_id}/stores",
+        actor_id=ctx.user_id,
+        request_id=ctx.request_id,
+        ip=_client_ip(request),
+    )
+    return success(schemas.authorize_payload(result))
+
+
 @router.post("/tenants/{tenant_id}/stores/tiktok/authorize")
 def authorize_tiktok_store(
     request: Request,

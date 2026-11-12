@@ -50,6 +50,12 @@ class Store(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
             "external_store_id",
             name="uq_stores_tenant_id_channel_external_store_id",
         ),
+        UniqueConstraint(
+            "tenant_id",
+            "channel",
+            "store_code",
+            name="uq_stores_tenant_id_channel_store_code",
+        ),
         table_options("店铺表"),
     )
 
@@ -70,8 +76,15 @@ class Store(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
         server_default=text("''"),
         comment="店铺名称",
     )
+    store_code: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="",
+        server_default=text("''"),
+        comment="ERP 内部店铺编码（新建店铺时生成，授权前也可用）",
+    )
     external_store_id: Mapped[str] = mapped_column(
-        String(64), nullable=False, comment="平台店铺ID（Shopee shop_id）"
+        String(64), nullable=False, comment="平台店铺ID（授权前暂存内部编码）"
     )
     region: Mapped[str | None] = mapped_column(
         String(16), nullable=True, comment="站点区域，如 SG/MY/PH"

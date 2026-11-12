@@ -84,6 +84,7 @@ export type {
   ListingLinkPayload,
   MappingStatus,
   Store,
+  StoreCreatePayload,
   StoreCredential,
   StoreStatus,
 } from './channels'

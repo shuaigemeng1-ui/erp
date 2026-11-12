@@ -42,7 +42,10 @@ class PlatformChannelApp(IdMixin, TimestampMixin, CenterBase):
         BigInteger, nullable=True, comment="平台合作方ID（Shopee Partner ID）"
     )
     app_id: Mapped[str | None] = mapped_column(
-        String(64), nullable=True, comment="应用 ID（TikTok Shop Partner Center 的 App ID）"
+        String(64), nullable=True, comment="应用 ID（TikTok Shop Partner Center 的 App ID / Service ID）"
+    )
+    region: Mapped[str | None] = mapped_column(
+        String(16), nullable=True, default="ROW", comment="TikTok Shop 授权市场：ROW/US"
     )
     app_key: Mapped[str | None] = mapped_column(
         String(128), nullable=True, comment="应用 Key（TikTok Shop App Key；Shopee 用 partner_id）"

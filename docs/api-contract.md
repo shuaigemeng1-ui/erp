@@ -88,6 +88,8 @@
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
 | GET | `/tenants/{tenant_id}/stores` | `store.read` | 店铺列表（凭据只返回状态与过期时间） |
+| POST | `/tenants/{tenant_id}/stores` | `store.connect` | 新建店铺 `{channel, name}`，状态 `pending_authorization` |
+| POST | `/tenants/{tenant_id}/stores/{store_id}/tiktok/authorize` | `store.connect` | 为待授权店铺生成 Service ID 授权链接 |
 | POST | `/tenants/{tenant_id}/stores/shopee/authorize` | `store.connect` | 生成一次性授权会话 → `{auth_url, expires_at}` |
 | POST | `/tenants/{tenant_id}/stores/tiktok/authorize` | 登录 + `store.connect` | `{environment?, redirect_path?}`；返回 TikTok Shop 授权地址 `auth_url` |
 | POST | `/tenants/{tenant_id}/stores/{store_id}/disconnect` | `store.connect` | 断开授权（停止依赖该凭据的任务） |

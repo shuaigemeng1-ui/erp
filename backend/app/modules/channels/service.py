@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import secrets
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -138,6 +139,7 @@ class ChannelAppConfig:
     updated_at: datetime | None = None
     # TikTok Shop 使用 App Key / App Secret；Shopee 使用 partner_* 字段
     app_id: str = ""
+    region: str = "ROW"
     app_key: str = ""
     app_secret: str = ""
 
@@ -146,7 +148,7 @@ class ChannelAppConfig:
         if self.status != "active":
             return False
         if self.channel == CHANNEL_TIKTOK:
-            return bool(self.app_key and self.app_secret)
+            return bool(self.app_id and self.app_key and self.app_secret)
         return bool(self.partner_id and self.partner_key)
 
 
@@ -156,6 +158,7 @@ class StoreSummary:
 
     id: int
     channel: str
+    store_code: str
     name: str
     external_store_id: str
     region: str | None
@@ -321,6 +324,7 @@ def _config_from_row(row: PlatformChannelApp) -> ChannelAppConfig:
         status=row.status or "active",
         updated_at=row.updated_at,
         app_id=row.app_id or "",
+        region=(row.region or "ROW").upper(),
         app_key=row.app_key or "",
         app_secret=app_secret,
     )
@@ -349,6 +353,7 @@ def channel_app_public_view(
             "environment": "",
             "partner_id": None,
             "app_id": "",
+            "region": "ROW",
             "app_key": "",
             "has_partner_key": False,
             "has_partner_secret": False,
@@ -363,6 +368,7 @@ def channel_app_public_view(
         "environment": config.environment,
         "partner_id": str(config.partner_id) if config.partner_id is not None else None,
         "app_id": config.app_id,
+        "region": config.region,
         "app_key": config.app_key,
         "has_partner_key": bool(config.partner_key),
         "has_partner_secret": bool(config.partner_secret),
@@ -383,6 +389,7 @@ def save_channel_app(
     partner_key: str | None = None,
     partner_secret: str | None = None,
     app_id: str | None = None,
+    region: str | None = None,
     app_key: str | None = None,
     app_secret: str | None = None,
     redirect_url: str | None = None,
@@ -409,6 +416,11 @@ def save_channel_app(
     if channel_value == CHANNEL_TIKTOK:
         if app_id is not None:
             row.app_id = app_id.strip() or None
+        if region is not None:
+            normalized_region = region.strip().upper()
+            if normalized_region not in {"ROW", "US"}:
+                raise AppError(ErrorCode.VALIDATION_ERROR, "TikTok 授权市场只能是 ROW 或 US")
+            row.region = normalized_region
         next_app_key = (app_key if app_key is not None else (row.app_key or "")).strip()
         if not next_app_key:
             raise AppError(ErrorCode.VALIDATION_ERROR, "TikTok App Key 不能为空")
@@ -497,6 +509,73 @@ def get_store_or_raise(db: Session, tenant_id: int, store_id: int) -> Store:
     return store
 
 
+def _generate_store_code(db: Session, tenant_id: int, channel: str) -> str:
+    prefix = "TK" if channel == CHANNEL_TIKTOK else "SP"
+    for _ in range(20):
+        code = f"{prefix}{secrets.token_hex(4).upper()}"
+        if repo.find_store_by_code(db, tenant_id, channel, code) is None:
+            return code
+    raise AppError(ErrorCode.INTERNAL_ERROR, "生成店铺编码失败，请重试")
+
+
+def create_store(
+    db: Session,
+    *,
+    tenant_id: int,
+    channel: str,
+    name: str,
+    environment: str | None = None,
+    region: str | None = None,
+    actor_id: int | None = None,
+    request_id: str = "",
+    ip: str = "",
+) -> int:
+    """新建店铺：只写入渠道、ERP 名称与内部编码，状态为待授权。
+
+    真正的平台店铺 ID / 凭据在用户完成授权回调后写入；在此之前该店铺
+    不参与任何同步任务（任务只处理 connected / reauth_required）。
+    """
+    resolved_environment = normalize_environment(environment) or resolve_environment(settings.app_env)
+    channel_value, environment_value = _require_channel_environment(channel, resolved_environment)
+    name_value = (name or "").strip()
+    if not name_value:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "店铺名称不能为空")
+    if len(name_value) > 128:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "店铺名称不能超过 128 个字符")
+    region_value = (region or "").strip().upper() or None
+    now = utc_now()
+    code = _generate_store_code(db, tenant_id, channel_value)
+    store = Store(
+        tenant_id=tenant_id,
+        channel=channel_value,
+        environment=environment_value,
+        store_code=code,
+        name=name_value,
+        external_store_id=code,
+        region=region_value,
+        timezone="UTC",
+        status=STORE_STATUS_PENDING_AUTHORIZATION,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(store)
+    db.flush()
+    record_audit(
+        db,
+        tenant_id=tenant_id,
+        action="store.created",
+        resource_type="store",
+        resource_id=store.id,
+        actor_id=actor_id,
+        summary=f"新建店铺：{name_value}（{channel_value}，待授权）",
+        payload={"channel": channel_value, "store_code": code, "status": store.status},
+        request_id=request_id,
+        ip=ip,
+    )
+    db.commit()
+    return store.id
+
+
 def list_store_summaries(
     db: Session,
     tenant_id: int,
@@ -513,6 +592,7 @@ def list_store_summaries(
         StoreSummary(
             id=store.id,
             channel=store.channel,
+            store_code=store.store_code,
             name=store.name,
             external_store_id=store.external_store_id,
             region=store.region,
@@ -617,38 +697,63 @@ def upsert_store_from_authorization(
     member_id: int | None = None,
     shop_cipher: str | None = None,
     warehouse_id: str | None = None,
+    store_id: int | None = None,
 ) -> int:
-    """授权成功后写入店铺与加密凭据；重新授权更新原店铺，不重复创建。"""
+    """授权成功后写入店铺与加密凭据。
+
+    ``store_id`` 存在时更新「先建店铺」记录（待授权 → 已连接），否则按平台
+    店铺 ID 查找/创建，以兼容历史授权链接。
+    """
     now = utc_now()
     external_id = normalize_external_id(external_store_id)
     if not external_id:
         raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "店铺ID为空")
-    store = repo.find_store_by_external(db, tenant_id, channel, external_id)
-    if store is None:
-        store = Store(
-            tenant_id=tenant_id,
-            channel=channel,
-            environment=environment,
-            name=store_name or f"{_channel_label(channel)} 店铺 {external_id}",
-            external_store_id=external_id,
-            region=region,
-            timezone="UTC",
-            status=STORE_STATUS_CONNECTED,
-            authorized_at=now,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(store)
-        db.flush()
-    else:
+    store: Store | None = None
+    if store_id is not None:
+        store = repo.get_store(db, tenant_id, int(store_id))
+        if store is None or store.channel != channel:
+            raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "待授权店铺不存在或渠道不匹配")
+        existing = repo.find_store_by_external(db, tenant_id, channel, external_id)
+        if existing is not None and existing.id != store.id:
+            raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "该平台店铺已绑定其他 ERP 店铺")
+        store.store_code = store.store_code or _generate_store_code(db, tenant_id, channel)
+        store.external_store_id = external_id
         store.environment = environment
-        store.name = store_name or store.name
         store.region = region or store.region
         store.status = STORE_STATUS_CONNECTED
         store.authorized_at = now
         store.disconnected_at = None
         store.last_error = None
         store.updated_at = now
+    else:
+        store = repo.find_store_by_external(db, tenant_id, channel, external_id)
+        if store is None:
+            store = Store(
+                tenant_id=tenant_id,
+                channel=channel,
+                environment=environment,
+                store_code=_generate_store_code(db, tenant_id, channel),
+                name=store_name or f"{_channel_label(channel)} 店铺 {external_id}",
+                external_store_id=external_id,
+                region=region,
+                timezone="UTC",
+                status=STORE_STATUS_CONNECTED,
+                authorized_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(store)
+            db.flush()
+        else:
+            store.store_code = store.store_code or _generate_store_code(db, tenant_id, channel)
+            store.environment = environment
+            store.name = store_name or store.name
+            store.region = region or store.region
+            store.status = STORE_STATUS_CONNECTED
+            store.authorized_at = now
+            store.disconnected_at = None
+            store.last_error = None
+            store.updated_at = now
     if warehouse_id:
         store.warehouse_id = str(warehouse_id)[:64]
     credential = repo.get_credential(db, tenant_id, store.id)

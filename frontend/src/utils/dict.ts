@@ -20,6 +20,7 @@ export const statusMeta: Record<string, StatusMeta> = {
   success: { label: '成功', type: 'success' },
   failed: { label: '失败', type: 'danger' },
   partial: { label: '部分成功', type: 'warning' },
+  pending_authorization: { label: '待授权', type: 'warning' },
   connected: { label: '已连接', type: 'success' },
   reauth_required: { label: '需重新授权', type: 'danger' },
   disconnected: { label: '已断开', type: 'info' },

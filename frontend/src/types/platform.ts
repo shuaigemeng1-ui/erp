@@ -102,6 +102,7 @@ export interface ChannelApp {
   environment: string
   partner_id: string | null
   app_id?: string | null
+  region?: string | null
   app_key?: string | null
   has_partner_key: boolean
   has_partner_secret: boolean
@@ -115,6 +116,7 @@ export interface ChannelAppPayload {
   partner_key?: string
   partner_secret?: string
   app_id?: string
+  region?: string
   app_key?: string
   app_secret?: string
   redirect_url: string

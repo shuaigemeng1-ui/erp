@@ -24,6 +24,7 @@ const channelForm = reactive({
   partner_key: '',
   partner_secret: '',
   app_id: '',
+  region: 'ROW',
   app_key: '',
   app_secret: '',
   redirect_url: '',
@@ -38,6 +39,7 @@ async function load(): Promise<void> {
     app.value = await platformApi.channelApp(channel.value, environment.value)
     channelForm.partner_id = app.value.partner_id ?? ''
     channelForm.app_id = app.value.app_id ?? ''
+    channelForm.region = app.value.region ?? 'ROW'
     channelForm.app_key = app.value.app_key ?? ''
     channelForm.redirect_url = app.value.redirect_url || redirectPlaceholder.value
     channelForm.partner_key = ''
@@ -72,6 +74,7 @@ async function save(): Promise<void> {
     const payload: ChannelAppPayload = { redirect_url: channelForm.redirect_url.trim() }
     if (isTikTok.value) {
       payload.app_id = channelForm.app_id.trim()
+      payload.region = channelForm.region
       payload.app_key = channelForm.app_key.trim()
       // 密钥不回显：只有填写时才提交
       if (channelForm.app_secret.trim()) payload.app_secret = channelForm.app_secret.trim()
@@ -121,6 +124,9 @@ onMounted(load)
         <el-descriptions-item label="App ID">
           <span class="mono">{{ textOrDash(app?.app_id) }}</span>
         </el-descriptions-item>
+        <el-descriptions-item label="授权市场">
+          {{ app?.region || 'ROW' }}
+        </el-descriptions-item>
         <el-descriptions-item label="应用密钥（App Key）">
           <span class="mono">{{ textOrDash(app?.app_key) }}</span>
         </el-descriptions-item>
@@ -149,6 +155,13 @@ onMounted(load)
       <template v-if="isTikTok">
         <el-form-item label="App ID">
           <el-input v-model="channelForm.app_id" placeholder="TikTok Shop Partner Center 的 App ID（数字）" />
+          <div class="form-tip">授权链接使用它作为 service_id；保存后才能生成店铺授权链接。</div>
+        </el-form-item>
+        <el-form-item label="授权市场">
+          <el-select v-model="channelForm.region" style="width: 100%">
+            <el-option label="ROW（东南亚/英国等）" value="ROW" />
+            <el-option label="US（美国）" value="US" />
+          </el-select>
         </el-form-item>
         <el-form-item label="应用密钥（App Key）">
           <el-input v-model="channelForm.app_key" placeholder="TikTok Shop 的 App Key（应用密钥）" />

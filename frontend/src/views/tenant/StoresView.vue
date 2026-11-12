@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { channelsApi } from '@/api/channels'
@@ -7,24 +7,28 @@ import { useTenantStore } from '@/stores/tenant'
 import StatusTag from '@/components/StatusTag.vue'
 import IdCopy from '@/components/IdCopy.vue'
 import { formatDateTime, textOrDash } from '@/utils/format'
-import type { Store } from '@/types'
+import type { AuthorizeResult, Store } from '@/types'
 
 const tenant = useTenantStore()
 const tid = (): string => tenant.requireTenantId()
 
 const loading = ref(false)
 const stores = ref<Store[]>([])
-const authorizing = ref(false)
 const disconnectLoadingId = ref('')
+const authLoadingStoreId = ref('')
 
 const canConnect = computed(() => tenant.has('store.connect'))
 
-const authorizeVisible = ref(false)
-const authorizeChannel = ref<'shopee' | 'tiktok'>('tiktok')
-const generatedAuthUrl = ref('')
-const authorizeChannelLabel = computed(() =>
-  authorizeChannel.value === 'tiktok' ? 'TikTok Shop' : 'Shopee',
-)
+const createVisible = ref(false)
+const creating = ref(false)
+const createForm = reactive<{ channel: 'tiktok' | 'shopee'; name: string }>({
+  channel: 'tiktok',
+  name: '',
+})
+
+const authVisible = ref(false)
+const authStore = ref<Store | null>(null)
+const authResult = ref<AuthorizeResult | null>(null)
 
 async function load(): Promise<void> {
   loading.value = true
@@ -35,10 +39,98 @@ async function load(): Promise<void> {
   }
 }
 
-function openAuthorize(): void {
-  authorizeChannel.value = 'tiktok'
-  generatedAuthUrl.value = ''
-  authorizeVisible.value = true
+function openCreate(): void {
+  createForm.channel = 'tiktok'
+  createForm.name = ''
+  createVisible.value = true
+}
+
+async function copyText(value: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value)
+      return true
+    }
+  } catch {
+    // fall through to execCommand fallback
+  }
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = value
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    document.execCommand('copy')
+    textarea.remove()
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function submitCreate(): Promise<void> {
+  const name = createForm.name.trim()
+  if (!name) {
+    ElMessage.warning('请填写 ERP 中显示的店铺名称')
+    return
+  }
+  creating.value = true
+  try {
+    const created = await channelsApi.createStore(tid(), {
+      channel: createForm.channel,
+      name,
+    })
+    createVisible.value = false
+    ElMessage.success(`店铺「${name}」已创建，状态：待授权`)
+    await load()
+    if (created.channel === 'tiktok') {
+      await openAuthorizationLink(created)
+    }
+  } finally {
+    creating.value = false
+  }
+}
+
+async function openAuthorizationLink(store: Store): Promise<void> {
+  authStore.value = store
+  authResult.value = null
+  authVisible.value = true
+  authLoadingStoreId.value = String(store.id)
+  try {
+    const result = await channelsApi.authorizeStore(tid(), store.id)
+    authResult.value = result
+    const copied = await copyText(result.auth_url)
+    if (copied) {
+      ElMessage.success('授权链接已生成并复制')
+    } else {
+      ElMessage.warning('授权链接已生成，请点击「复制授权链接」手动复制')
+    }
+  } catch {
+    authVisible.value = false
+  } finally {
+    authLoadingStoreId.value = ''
+  }
+}
+
+async function copyAuthLink(): Promise<void> {
+  if (!authResult.value) return
+  const copied = await copyText(authResult.value.auth_url)
+  if (copied) {
+    ElMessage.success('授权链接已复制')
+  } else {
+    ElMessage.error('复制失败，请手动选中链接复制')
+  }
+}
+
+function openAuthTab(): void {
+  if (!authResult.value) return
+  const win = window.open(authResult.value.auth_url, '_blank')
+  if (win) {
+    win.opener = null
+  } else {
+    ElMessage.warning('浏览器拦截了新窗口，请复制授权链接后手动打开')
+  }
 }
 
 function channelLabel(channel: string): string {
@@ -47,61 +139,7 @@ function channelLabel(channel: string): string {
   return channel
 }
 
-async function confirmAuthorize(): Promise<void> {
-  // 先同步开一个空白窗口，避免 await 之后被浏览器拦截弹窗
-  const newWindow = window.open('', '_blank')
-  authorizing.value = true
-  try {
-    const result =
-      authorizeChannel.value === 'tiktok'
-        ? await channelsApi.authorizeTikTok(tid())
-        : await channelsApi.authorizeShopee(tid())
-    generatedAuthUrl.value = result.auth_url
-    if (newWindow) {
-      newWindow.opener = null
-      newWindow.location.href = result.auth_url
-      ElMessage.success(`已在新标签页打开 ${authorizeChannelLabel.value} 授权页`)
-    } else {
-      ElMessage.warning('浏览器拦截了新窗口，请点击「复制授权链接」后手动打开')
-    }
-  } catch {
-    newWindow?.close()
-  } finally {
-    authorizing.value = false
-  }
-}
-
-function reopenAuthUrl(): void {
-  if (!generatedAuthUrl.value) return
-  const win = window.open(generatedAuthUrl.value, '_blank')
-  if (win) {
-    win.opener = null
-  } else {
-    ElMessage.warning('浏览器拦截了新窗口，请点击「复制授权链接」后手动打开')
-  }
-}
-
-async function copyAuthUrl(): Promise<void> {
-  const url = generatedAuthUrl.value
-  if (!url) return
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(url)
-    } else {
-      throw new Error('clipboard unavailable')
-    }
-  } catch {
-    const textarea = document.createElement('textarea')
-    textarea.value = url
-    textarea.style.position = 'fixed'
-    textarea.style.opacity = '0'
-    document.body.appendChild(textarea)
-    textarea.select()
-    document.execCommand('copy')
-    textarea.remove()
-  }
-  ElMessage.success('授权链接已复制')
-}
+const authStoreLabel = computed(() => authStore.value?.name ?? '')
 
 async function disconnect(store: Store): Promise<void> {
   try {
@@ -113,7 +151,7 @@ async function disconnect(store: Store): Promise<void> {
   } catch {
     return
   }
-  disconnectLoadingId.value = store.id
+  disconnectLoadingId.value = String(store.id)
   try {
     await channelsApi.disconnectStore(tid(), store.id)
     ElMessage.success('已断开授权')
@@ -127,6 +165,10 @@ function credentialStatus(store: Store): string {
   return store.credential?.status ?? store.credential_status ?? store.status
 }
 
+function platformStoreId(store: Store): string {
+  return store.status === 'pending_authorization' ? '' : store.external_store_id
+}
+
 onMounted(load)
 </script>
 
@@ -136,33 +178,30 @@ onMounted(load)
       <div class="toolbar-actions">
         <el-button :icon="Refresh" @click="load">刷新</el-button>
       </div>
-      <el-button v-if="canConnect" type="primary" @click="openAuthorize">授权店铺</el-button>
+      <el-button v-if="canConnect" type="primary" @click="openCreate">新建店铺</el-button>
     </div>
 
     <el-table v-loading="loading" :data="stores" border size="small" row-key="id">
-      <el-table-column label="ID" width="110">
+      <el-table-column label="ID" width="100">
         <template #default="{ row }"><IdCopy :id="row.id" /></template>
       </el-table-column>
-      <el-table-column prop="name" label="店铺名称" min-width="160" />
-      <el-table-column label="渠道" width="100">
+      <el-table-column prop="name" label="店铺名称" min-width="180" />
+      <el-table-column label="店铺编码" width="130">
+        <template #default="{ row }"><span class="mono">{{ textOrDash(row.store_code) }}</span></template>
+      </el-table-column>
+      <el-table-column label="渠道" width="110">
         <template #default="{ row }">{{ channelLabel(row.channel) }}</template>
       </el-table-column>
-      <el-table-column label="店铺 ID" width="150">
-        <template #default="{ row }"><span class="mono">{{ textOrDash(row.external_store_id) }}</span></template>
+      <el-table-column label="平台店铺 ID" width="160">
+        <template #default="{ row }">
+          <span class="mono">{{ textOrDash(platformStoreId(row as Store)) }}</span>
+        </template>
       </el-table-column>
-      <el-table-column label="站点" width="90">
-        <template #default="{ row }">{{ textOrDash(row.region) }}</template>
-      </el-table-column>
-      <el-table-column label="状态" width="120">
+      <el-table-column label="状态" width="110">
         <template #default="{ row }"><StatusTag :status="row.status" /></template>
       </el-table-column>
-      <el-table-column label="凭据状态" width="130">
+      <el-table-column label="凭据状态" width="120">
         <template #default="{ row }"><StatusTag :status="credentialStatus(row as Store)" /></template>
-      </el-table-column>
-      <el-table-column label="Token 过期" width="170">
-        <template #default="{ row }">
-          {{ formatDateTime(row.credential?.access_token_expires_at ?? row.access_token_expires_at) }}
-        </template>
       </el-table-column>
       <el-table-column label="授权时间" width="170">
         <template #default="{ row }">{{ formatDateTime(row.authorized_at) }}</template>
@@ -170,79 +209,130 @@ onMounted(load)
       <el-table-column label="最近同步" width="170">
         <template #default="{ row }">{{ formatDateTime(row.last_synced_at) }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="110" fixed="right">
+      <el-table-column label="操作" width="150" fixed="right">
         <template #default="{ row }">
-          <el-button
-            v-if="canConnect && row.status !== 'disconnected'"
-            text
-            type="danger"
-            size="small"
-            :loading="disconnectLoadingId === row.id"
-            @click="disconnect(row as Store)"
-          >
-            断开
-          </el-button>
+          <template v-if="canConnect">
+            <el-button
+              v-if="
+                row.channel === 'tiktok' &&
+                (row.status === 'pending_authorization' || row.status === 'reauth_required')
+              "
+              text
+              type="primary"
+              size="small"
+              :loading="authLoadingStoreId === String(row.id)"
+              @click="openAuthorizationLink(row as Store)"
+            >
+              复制授权链接
+            </el-button>
+            <el-button
+              v-if="row.status === 'connected'"
+              text
+              type="danger"
+              size="small"
+              :loading="disconnectLoadingId === String(row.id)"
+              @click="disconnect(row as Store)"
+            >
+              断开
+            </el-button>
+            <span
+              v-if="row.status === 'pending_authorization' && row.channel !== 'tiktok'"
+              class="muted"
+            >
+              待接入授权
+            </span>
+          </template>
         </template>
       </el-table-column>
     </el-table>
   </el-card>
 
-  <el-dialog v-model="authorizeVisible" title="授权店铺" width="480px" destroy-on-close>
-    <el-form label-width="86px" style="margin-bottom: 8px">
-      <el-form-item label="授权渠道">
-        <el-radio-group v-model="authorizeChannel">
+  <el-dialog v-model="createVisible" title="新建店铺" width="500px" destroy-on-close>
+    <el-form label-width="90px">
+      <el-form-item label="渠道" required>
+        <el-radio-group v-model="createForm.channel">
           <el-radio-button label="tiktok">TikTok Shop</el-radio-button>
           <el-radio-button label="shopee">Shopee</el-radio-button>
         </el-radio-group>
       </el-form-item>
+      <el-form-item label="店铺名称" required>
+        <el-input
+          v-model="createForm.name"
+          maxlength="128"
+          show-word-limit
+          placeholder="例如：英国店 / aligo UK"
+        />
+      </el-form-item>
     </el-form>
     <el-alert type="info" :closable="false" show-icon>
-      <p>点击「前往授权」会在新标签页打开 {{ authorizeChannelLabel }} 授权页，授权完成后自动回到本页。授权会话一次性有效。</p>
-      <p class="authorize-hint">
-        <template v-if="authorizeChannel === 'tiktok'">
-          若提示「平台 TikTok Shop 应用未配置」，请先在 平台管理 → 渠道应用（TikTok Shop）填写 App ID / 应用密钥 / 应用密码，并将回调地址加入 TikTok 应用白名单。
-        </template>
-        <template v-else>
-          若提示「平台 Shopee 应用未配置」，请先在 平台管理 → 渠道应用 填写 Partner ID / Partner Key / Secret。
-        </template>
-      </p>
-      <div v-if="generatedAuthUrl" class="auth-link-box">
-        <div class="auth-link-label">授权链接（可复制到任意浏览器打开）</div>
-        <el-input :model-value="generatedAuthUrl" readonly>
-          <template #append>
-            <el-button @click="copyAuthUrl">复制</el-button>
-          </template>
-        </el-input>
-      </div>
+      <p>创建后店铺状态为「待授权」，不会参与订单/库存同步。</p>
+      <p>TikTok Shop 会立即生成授权链接并自动复制；把它发给该店铺的主账号打开完成授权。</p>
+      <p v-if="createForm.channel === 'shopee'">Shopee 暂未接入「先建店铺后授权」，创建后可先保留记录。</p>
     </el-alert>
     <template #footer>
-      <template v-if="generatedAuthUrl">
-        <el-button @click="authorizeVisible = false">关闭</el-button>
-        <el-button @click="copyAuthUrl">复制授权链接</el-button>
-        <el-button type="primary" @click="reopenAuthUrl">再次打开</el-button>
-      </template>
-      <template v-else>
-        <el-button @click="authorizeVisible = false">取消</el-button>
-        <el-button type="primary" :loading="authorizing" @click="confirmAuthorize">前往授权</el-button>
-      </template>
+      <el-button @click="createVisible = false">取消</el-button>
+      <el-button type="primary" :loading="creating" @click="submitCreate">创建店铺</el-button>
     </template>
+  </el-dialog>
+
+  <el-dialog v-model="authVisible" title="TikTok Shop 授权链接" width="600px" destroy-on-close>
+    <div v-if="authResult" class="auth-link-dialog">
+      <el-descriptions :column="2" border size="small">
+        <el-descriptions-item label="ERP 店铺">{{ authStoreLabel }}</el-descriptions-item>
+        <el-descriptions-item label="店铺编码">
+          <span class="mono">{{ textOrDash(authStore?.store_code) }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="Service ID">
+          <span class="mono">{{ textOrDash(authResult.service_id) }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="授权市场">{{ authResult.market || 'ROW' }}</el-descriptions-item>
+      </el-descriptions>
+      <div class="auth-link-label">完整授权链接</div>
+      <el-input
+        :model-value="authResult.auth_url"
+        readonly
+        type="textarea"
+        :rows="5"
+        resize="none"
+      />
+      <el-alert type="warning" :closable="false" show-icon class="auth-link-alert">
+        <p>请复制链接，用该店铺的 TikTok 主账号在任意浏览器打开并同意授权。</p>
+        <p>链接一次性有效（约 10 分钟）；授权成功后本页刷新即可看到状态变为「已连接」。</p>
+      </el-alert>
+      <div class="auth-link-actions">
+        <el-button @click="authVisible = false">关闭</el-button>
+        <el-button @click="copyAuthLink">复制授权链接</el-button>
+        <el-button type="primary" @click="openAuthTab">打开授权页</el-button>
+      </div>
+    </div>
+    <el-skeleton v-else :rows="4" animated />
   </el-dialog>
 </template>
 
 <style scoped>
-.authorize-hint {
-  margin-top: 6px;
-  color: var(--el-text-color-secondary);
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.auth-link-box {
-  margin-top: 12px;
+.auth-link-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .auth-link-label {
-  margin-bottom: 6px;
+  margin-top: 4px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.auth-link-alert {
+  margin-top: 2px;
+}
+
+.auth-link-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.muted {
   color: var(--el-text-color-secondary);
   font-size: 12px;
 }

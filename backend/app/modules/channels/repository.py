@@ -113,6 +113,17 @@ def find_store_by_external(
     return db.execute(stmt).scalar_one_or_none()
 
 
+def find_store_by_code(
+    db: Session, tenant_id: int, channel: str, store_code: str
+) -> Store | None:
+    stmt = select(Store).where(
+        Store.tenant_id == tenant_id,
+        Store.channel == channel,
+        Store.store_code == store_code,
+    )
+    return db.execute(stmt).scalar_one_or_none()
+
+
 def list_stores(
     db: Session,
     tenant_id: int,

@@ -16,6 +16,7 @@ import secrets
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlencode
 
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
@@ -35,6 +36,11 @@ from app.modules.channels.tiktok.client import (
 )
 
 logger = logging.getLogger("ventasync.channels.tiktok.oauth")
+
+AUTHORIZATION_BASE_URLS = {
+    "ROW": "https://services.tiktokshop.com/open/authorize",
+    "US": "https://services.us.tiktokshop.com/open/authorize",
+}
 
 OAUTH_SESSION_PREFIX = "vs:tiktok:oauth"
 OAUTH_SESSION_TTL_SECONDS = 600
@@ -61,14 +67,30 @@ def authorization_session_key(tenant_id: int, nonce: str) -> str:
     return f"{OAUTH_SESSION_PREFIX}:{int(tenant_id)}:{nonce}"
 
 
+def build_authorization_url(
+    *, service_id: str, state: str, market: str = "ROW"
+) -> str:
+    """TikTok Shop 卖家授权链接：Service ID + 一次性 state（参考项目同款）。"""
+    normalized_service_id = (service_id or "").strip()
+    normalized_market = (market or "ROW").strip().upper()
+    if not normalized_service_id:
+        raise AppError(ErrorCode.CHANNEL_APP_NOT_CONFIGURED, "平台未配置 TikTok App ID（Service ID）")
+    if normalized_market not in AUTHORIZATION_BASE_URLS:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "TikTok 授权市场只能是 ROW 或 US")
+    query = urlencode({"service_id": normalized_service_id, "state": state})
+    return f"{AUTHORIZATION_BASE_URLS[normalized_market]}?{query}"
+
+
 def create_authorization_session(
     *,
     tenant_id: int,
     member_id: int,
     environment: str,
     redirect_path: str,
-    app_key: str,
-    auth_base: str = "",
+    service_id: str,
+    market: str = "ROW",
+    store_id: int | None = None,
+    store_code: str = "",
     ttl_seconds: int = OAUTH_SESSION_TTL_SECONDS,
 ) -> dict[str, Any]:
     env = normalize_environment(environment) or resolve_environment(settings.app_env)
@@ -80,18 +102,18 @@ def create_authorization_session(
         "member_id": int(member_id),
         "environment": env,
         "redirect_path": safe_redirect_path(redirect_path, f"/tenants/{tenant_id_int}/stores"),
+        "store_id": int(store_id) if store_id else None,
+        "store_code": (store_code or "").strip(),
+        "service_id": (service_id or "").strip(),
+        "market": (market or "ROW").strip().upper(),
         "created_at": utc_now().isoformat(),
         "expires_at": expires_at.isoformat(),
     }
-    client = TikTokClient(
-        app_key=app_key,
-        app_secret="placeholder",  # 生成授权地址只用 app_key，不参与签名
-        auth_base=auth_base or settings.tiktok_auth_base,
+    auth_url = build_authorization_url(
+        service_id=payload["service_id"],
+        state=state,
+        market=payload["market"],
     )
-    try:
-        auth_url = client.auth_url(state)
-    finally:
-        client.close()
     try:
         cache_redis().setex(
             authorization_session_key(tenant_id_int, nonce),
@@ -101,7 +123,16 @@ def create_authorization_session(
     except Exception as exc:  # noqa: BLE001
         logger.exception("保存 TikTok 授权会话失败")
         raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "缓存服务不可用") from exc
-    return {"auth_url": auth_url, "expires_at": expires_at, "environment": env, "state": state}
+    return {
+        "auth_url": auth_url,
+        "expires_at": expires_at,
+        "environment": env,
+        "state": state,
+        "store_id": payload["store_id"],
+        "store_code": payload["store_code"],
+        "service_id": payload["service_id"],
+        "market": payload["market"],
+    }
 
 
 def validate_authorization_session(
@@ -130,6 +161,8 @@ def validate_authorization_session(
             expires_at = expires_at.astimezone(timezone.utc).replace(tzinfo=None)
         if expires_at <= current:
             raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权会话已过期，请重新发起授权")
+    raw_store_id = payload.get("store_id")
+    store_id = int(raw_store_id) if raw_store_id not in (None, "", 0, "0") else None
     return {
         "tenant_id": tenant_id,
         "member_id": member_id,
@@ -137,6 +170,10 @@ def validate_authorization_session(
         "redirect_path": safe_redirect_path(
             str(payload.get("redirect_path") or ""), f"/tenants/{tenant_id}/stores"
         ),
+        "store_id": store_id,
+        "store_code": str(payload.get("store_code") or ""),
+        "service_id": str(payload.get("service_id") or ""),
+        "market": str(payload.get("market") or "ROW"),
     }
 
 
@@ -167,28 +204,49 @@ def start_authorization(
     *,
     tenant_id: int,
     member_id: int,
+    store_id: int | None = None,
     environment: str | None = None,
     redirect_path: str | None = None,
     actor_id: int | None = None,
     request_id: str = "",
     ip: str = "",
 ) -> dict[str, Any]:
-    """发起 TikTok Shop 授权，返回一次性授权会话与 ``auth_url``。"""
+    """发起 TikTok Shop 授权，返回一次性授权会话与 ``auth_url``。
+
+    ``store_id`` 存在时表示「先建店铺后授权」：链接只绑定该店铺，回调更新
+    该店铺并置为已连接；不传则兼容旧流程，由回调按平台店铺 ID 创建。
+    """
     from app.modules.channels import service as channel_service
 
-    env = normalize_environment(environment) or resolve_environment(settings.app_env)
+    store = None
+    if store_id is not None:
+        store = channel_service.get_store_or_raise(db, tenant_id, int(store_id))
+        if store.channel != CHANNEL_TIKTOK:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "该店铺不是 TikTok Shop 渠道")
+        if store.status not in {
+            channel_service.STORE_STATUS_PENDING_AUTHORIZATION,
+            channel_service.STORE_STATUS_REAUTH_REQUIRED,
+            channel_service.STORE_STATUS_CONNECTED,
+        }:
+            raise AppError(ErrorCode.STORE_NOT_CONNECTED, "当前店铺状态不允许发起授权")
+        env = normalize_environment(environment) or store.environment
+    else:
+        env = normalize_environment(environment) or resolve_environment(settings.app_env)
     config = channel_service.require_channel_app(center, env, channel=CHANNEL_TIKTOK)
-    callback_url = config.redirect_url or channel_service.default_callback_url(
-        channel=CHANNEL_TIKTOK
-    )
-    if not callback_url.startswith("http"):
-        raise AppError(ErrorCode.CHANNEL_APP_NOT_CONFIGURED, "平台未配置可用的 OAuth 回调地址")
+    if not config.app_id:
+        raise AppError(ErrorCode.CHANNEL_APP_NOT_CONFIGURED, "平台未配置 TikTok App ID（Service ID）")
+    market = (config.region or "ROW").strip().upper()
+    if market not in {"ROW", "US"}:
+        market = "ROW"
     session = create_authorization_session(
         tenant_id=tenant_id,
         member_id=member_id,
         environment=env,
         redirect_path=safe_redirect_path(redirect_path, f"/tenants/{tenant_id}/stores"),
-        app_key=config.app_key,
+        service_id=config.app_id,
+        market=market,
+        store_id=store.id if store is not None else None,
+        store_code=store.store_code if store is not None else "",
     )
     channel_service.record_audit(
         db,
@@ -197,7 +255,14 @@ def start_authorization(
         resource_type="store",
         actor_id=actor_id,
         summary=f"发起 TikTok Shop 店铺授权（{env}）",
-        payload={"channel": CHANNEL_TIKTOK, "environment": env, "callback_url": callback_url},
+        payload={
+            "channel": CHANNEL_TIKTOK,
+            "environment": env,
+            "store_id": session.get("store_id"),
+            "store_code": session.get("store_code"),
+            "service_id": session.get("service_id"),
+            "market": session.get("market"),
+        },
         request_id=request_id,
         ip=ip,
     )
@@ -283,6 +348,7 @@ def complete_authorization(
             member_id=int(session.get("member_id") or 0) or None,
             shop_cipher=shop_cipher,
             warehouse_id=warehouse_id or None,
+            store_id=int(session["store_id"]) if session.get("store_id") else None,
         )
         channel_service.claim_store_registry(
             center,
@@ -304,6 +370,7 @@ def complete_authorization(
                 "channel": CHANNEL_TIKTOK,
                 "environment": environment,
                 "external_store_id": external_id,
+                "store_code": str(session.get("store_code") or ""),
             },
         )
         tenant_db.commit()
@@ -322,6 +389,7 @@ def complete_authorization(
         "store_id": store_id,
         "environment": environment,
         "external_store_id": external_id,
+        "store_code": str(session.get("store_code") or ""),
         "redirect_path": str(
             session.get("redirect_path") or f"/tenants/{tenant_id}/stores"
         ),

@@ -38,6 +38,7 @@ from app.modules.channels.shopee.client import (
     resolve_base_url,
     token_expiry,
 )
+from app.modules.channels.state import build_signed_state, parse_signed_state
 from app.modules.channels.shopee.signature import (
     append_query_params,
     build_authorize_url,
@@ -94,9 +95,7 @@ def create_authorization_session(
 ) -> dict[str, Any]:
     """创建一次性授权会话并返回 ``{auth_url, expires_at, environment}``。"""
     env = normalize_environment(environment) or resolve_environment(settings.app_env)
-    state = build_state(tenant_id)
-    tenant_id_int, nonce = parse_state(state)
-    expires_at = utc_after(max(60, int(ttl_seconds)))
+    tenant_id_int = int(tenant_id)
     payload = {
         "tenant_id": tenant_id_int,
         "member_id": int(member_id),
@@ -105,8 +104,9 @@ def create_authorization_session(
         "store_id": int(store_id) if store_id else None,
         "store_code": (store_code or "").strip(),
         "created_at": utc_now().isoformat(),
-        "expires_at": expires_at.isoformat(),
+        "nonce": secrets.token_urlsafe(18),
     }
+    state = build_signed_state(payload)
     callback_url = append_query_params(redirect_url, {"state": state})
     auth_url = build_authorize_url(
         auth_base=auth_base,
@@ -114,16 +114,14 @@ def create_authorization_session(
         partner_key=partner_key,
         redirect_url=callback_url,
     )
-    try:
-        cache_redis().setex(
-            authorization_session_key(tenant_id_int, nonce),
-            max(60, int(ttl_seconds)),
-            json.dumps(payload, ensure_ascii=False),
-        )
-    except Exception as exc:  # noqa: BLE001 - 缓存不可用统一转 503
-        logger.exception("保存 Shopee 授权会话失败")
-        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "缓存服务不可用") from exc
-    return {"auth_url": auth_url, "expires_at": expires_at, "environment": env, "state": state}
+    return {
+        "auth_url": auth_url,
+        "expires_at": None,
+        "environment": env,
+        "state": state,
+        "store_id": payload["store_id"],
+        "store_code": payload["store_code"],
+    }
 
 
 def validate_authorization_session(
@@ -174,13 +172,12 @@ def validate_authorization_session(
     }
 
 
-def consume_authorization_session(state: str | None) -> dict[str, Any]:
-    """读取并立即删除一次性授权会话（Redis TTL 之外再保证一次有效）。"""
+def _consume_legacy_session(state: str | None) -> dict[str, Any]:
+    """兼容旧版 Redis 一次性会话。"""
     tenant_id, nonce = parse_state(state)
     key = authorization_session_key(tenant_id, nonce)
     try:
         client = cache_redis()
-        # Redis >= 6.2 支持 GETDEL，保证「读取即删除」的一次性语义
         if hasattr(client, "getdel"):
             raw = client.getdel(key)
         else:
@@ -197,6 +194,19 @@ def consume_authorization_session(state: str | None) -> dict[str, Any]:
     except (TypeError, json.JSONDecodeError) as exc:
         raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权会话已损坏") from exc
     return validate_authorization_session(payload, expected_tenant_id=tenant_id)
+
+
+def consume_authorization_session(state: str | None) -> dict[str, Any]:
+    """解析回调 state：优先自包含签名 state，兼容旧 Redis 会话。"""
+    token = (state or "").strip()
+    try:
+        payload = parse_signed_state(token)
+    except AppError as signed_error:
+        try:
+            return _consume_legacy_session(token)
+        except AppError:
+            raise signed_error from None
+    return validate_authorization_session(payload)
 
 
 # --------------------------------------------------------------------------- 回调

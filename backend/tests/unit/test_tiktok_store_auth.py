@@ -71,3 +71,12 @@ def test_signed_state_rejects_tampered_payload() -> None:
     tampered = payload_part[:-1] + ("A" if payload_part[-1] != "A" else "B")
     with pytest.raises(AppError):
         parse_signed_state(f"{tampered}.{signature}")
+
+
+def test_signed_state_without_expiry_is_permanently_valid() -> None:
+    payload = _state_payload(store_id=13, store_code="TKCCCCCCCC")
+    payload.pop("expires_at", None)
+    state = build_signed_state(payload)
+    parsed = consume_authorization_session(state)
+    assert parsed["store_id"] == 13
+    assert parsed["store_code"] == "TKCCCCCCCC"

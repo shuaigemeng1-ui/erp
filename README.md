@@ -107,7 +107,7 @@ npm run build     # 提交前必须通过
    - 后端用平台应用 `App ID` 作为 TikTok `service_id`，拼接
      `https://services.tiktokshop.com/open/authorize?service_id=...&state=...`
      （US 应用使用 `services.us.tiktokshop.com`）；
-   - 链接绑定该 ERP 店铺的一次性 state，可直接复制给店铺主账号在任意浏览器打开；
+   - 链接绑定该 ERP 店铺的签名 state，**长期有效**，可直接复制给店铺主账号在任意浏览器打开；
 4. 店铺主账号授权后，TikTok 回调到
    `/api/v1/integrations/tiktok/oauth/callback`，后端换取 token、读取 shops，
    把原「待授权」店铺更新为 **已连接**，并保存加密凭据。

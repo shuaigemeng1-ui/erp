@@ -1,7 +1,7 @@
 """TikTok Shop 店铺授权（OAuth）流程。
 
 * 发起授权：平台统一配置 TikTok App Key/Secret，租户只做店铺授权；
-* 一次性授权会话存 Redis，绑定租户 / 成员 / 环境 / 前端回跳路径；
+* 授权 state 使用 HMAC 签名，绑定租户 / 成员 / 店铺 / 环境，链接长期有效；
 * 回调不依赖用户会话：校验 state 后换取 token，再读取授权店铺（含 shop_cipher）；
 * 店铺和加密凭据写入租户库，中心库登记店铺归属，写租户审计；
 * 外部 HTTP 请求在数据库事务之外执行，避免长时间持有事务。
@@ -31,6 +31,7 @@ from app.modules.channels.constants import (
     resolve_environment,
 )
 from app.modules.channels.shopee.signature import append_query_params, safe_redirect_path
+from app.modules.channels.state import build_signed_state, parse_signed_state
 from app.modules.channels.tiktok.client import (
     TikTokApiError,
     TikTokClient,
@@ -70,57 +71,10 @@ def authorization_session_key(tenant_id: int, nonce: str) -> str:
     return f"{OAUTH_SESSION_PREFIX}:{int(tenant_id)}:{nonce}"
 
 
-def _b64url_encode(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
-
-
-def _b64url_decode(value: str) -> bytes:
-    padding = "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode(value + padding)
-
-
-def build_signed_state(payload: Mapping[str, Any]) -> str:
-    """把店铺授权上下文签名进 state，回调不依赖 Redis 也能定位店铺。
-
-    与参考项目 TikTok Shop 授权 state 同思路：payload + HMAC-SHA256，
-    支付加载的 state 中包含 tenant_id / store_id / store_code / environment。
-    """
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    encoded = _b64url_encode(body)
-    signature = hmac.new(
-        settings.secret_key_bytes, encoded.encode("ascii"), hashlib.sha256
-    ).digest()
-    return f"{encoded}.{_b64url_encode(signature)}"
-
-
-def parse_signed_state(state: str | None) -> dict[str, Any]:
-    token = (state or "").strip()
-    try:
-        encoded, signature = token.split(".", 1)
-    except ValueError as exc:
-        raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权 state 格式无效") from exc
-    expected = hmac.new(
-        settings.secret_key_bytes, encoded.encode("ascii"), hashlib.sha256
-    ).digest()
-    try:
-        provided = _b64url_decode(signature)
-    except Exception as exc:  # noqa: BLE001
-        raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权 state 签名无效") from exc
-    if not hmac.compare_digest(expected, provided):
-        raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权 state 签名无效")
-    try:
-        payload = json.loads(_b64url_decode(encoded).decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权 state 内容无效") from exc
-    if not isinstance(payload, dict):
-        raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权 state 内容无效")
-    return payload
-
-
 def build_authorization_url(
     *, service_id: str, state: str, market: str = "ROW"
 ) -> str:
-    """TikTok Shop 卖家授权链接：Service ID + 一次性 state（参考项目同款）。"""
+    """TikTok Shop 卖家授权链接：Service ID + 签名 state（长期有效）。"""
     normalized_service_id = (service_id or "").strip()
     normalized_market = (market or "ROW").strip().upper()
     if not normalized_service_id:
@@ -145,7 +99,6 @@ def create_authorization_session(
 ) -> dict[str, Any]:
     env = normalize_environment(environment) or resolve_environment(settings.app_env)
     tenant_id_int = int(tenant_id)
-    expires_at = utc_after(max(60, int(ttl_seconds)))
     payload = {
         "tenant_id": tenant_id_int,
         "member_id": int(member_id),
@@ -156,7 +109,6 @@ def create_authorization_session(
         "service_id": (service_id or "").strip(),
         "market": (market or "ROW").strip().upper(),
         "created_at": utc_now().isoformat(),
-        "expires_at": expires_at.isoformat(),
         "nonce": secrets.token_urlsafe(18),
     }
     state = build_signed_state(payload)
@@ -167,7 +119,7 @@ def create_authorization_session(
     )
     return {
         "auth_url": auth_url,
-        "expires_at": expires_at,
+        "expires_at": None,
         "environment": env,
         "state": state,
         "store_id": payload["store_id"],
@@ -266,7 +218,7 @@ def start_authorization(
     request_id: str = "",
     ip: str = "",
 ) -> dict[str, Any]:
-    """发起 TikTok Shop 授权，返回一次性授权会话与 ``auth_url``。
+    """发起 TikTok Shop 授权，返回长期有效的签名授权链接。
 
     ``store_id`` 存在时表示「先建店铺后授权」：链接只绑定该店铺，回调更新
     该店铺并置为已连接；不传则兼容旧流程，由回调按平台店铺 ID 创建。

@@ -299,7 +299,7 @@ onMounted(load)
       />
       <el-alert type="warning" :closable="false" show-icon class="auth-link-alert">
         <p>请复制链接，用该店铺的 TikTok 主账号在任意浏览器打开并同意授权。</p>
-        <p>链接一次性有效（约 10 分钟）；授权成功后本页刷新即可看到状态变为「已连接」。</p>
+        <p>链接长期有效，请妥善保管；授权成功后本页刷新即可看到状态变为「已连接」。</p>
       </el-alert>
       <div class="auth-link-actions">
         <el-button @click="authVisible = false">关闭</el-button>

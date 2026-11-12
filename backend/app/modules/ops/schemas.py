@@ -113,3 +113,30 @@ class AlertAckIn(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     note: str = Field(default="", max_length=500)
+
+
+class ReleaseCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    version: str = Field(min_length=1, max_length=64)
+    image_tag: str = Field(default="", max_length=255)
+    image_digest: str = Field(default="", max_length=255)
+    notes: str = Field(default="", max_length=500)
+
+
+class OperationCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    job_type: Literal["deploy", "upgrade", "restart", "backup", "logs", "config"]
+    target_version: str = Field(default="", max_length=64)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str = Field(default="", max_length=128)
+
+
+class AgentJobEvent(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    status: str = Field(default="running", max_length=16)
+    step_no: int | None = Field(default=None, ge=1, le=100)
+    step_name: str = Field(default="", max_length=64)
+    step_status: str = Field(default="", max_length=16)
+    message: str = Field(default="", max_length=1000)
+    result: dict[str, Any] | None = None
+    error: str = Field(default="", max_length=500)

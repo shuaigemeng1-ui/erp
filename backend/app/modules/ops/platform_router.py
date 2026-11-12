@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, Query
 from app.api.deps import CenterDb, PlatformAdmin
 from app.core.http import PageParams, paged, success
 from app.modules.ops import service
-from app.modules.ops.schemas import AlertAckIn, InstanceCreate, InstanceUpdate
+from app.modules.ops.schemas import AlertAckIn, InstanceCreate, InstanceUpdate, OperationCreate, ReleaseCreate
 
 router = APIRouter(prefix="/platform", tags=["platform-ops"])
 
@@ -85,6 +85,33 @@ def node_checks(
     limit: int = Query(default=20, ge=1, le=100),
 ) -> dict:
     return success(service.list_checks(center, node_id, limit=limit))
+
+
+@router.get("/releases", summary="发布版本列表")
+def releases(center: CenterDb, _: PlatformAdmin) -> dict:
+    return success(service.list_releases(center))
+
+
+@router.post("/releases", summary="登记发布版本")
+def create_release(center: CenterDb, admin: PlatformAdmin, payload: ReleaseCreate) -> dict:
+    return success(service.create_release(center, payload, actor_user_id=admin.user_id))
+
+
+@router.get("/operations", summary="运维任务列表")
+def operations(center: CenterDb, _: PlatformAdmin, pagination: PageParams = Depends(), instance_id: str = Query(default="", max_length=32)) -> dict:
+    data = service.list_operations(center, instance_id=int(instance_id) if instance_id.isdigit() else None, page=pagination.page, page_size=pagination.page_size)
+    return paged(data["items"], data["total"], data["page"], data["page_size"])
+
+
+@router.post("/instances/{instance_id}/operations", summary="创建运维任务")
+def create_operation(center: CenterDb, admin: PlatformAdmin, instance_id: int, payload: OperationCreate) -> dict:
+    return success(service.create_operation(center, instance_id, payload, actor_user_id=admin.user_id))
+
+
+@router.get("/backups", summary="备份记录列表")
+def backups(center: CenterDb, _: PlatformAdmin, pagination: PageParams = Depends(), instance_id: str = Query(default="", max_length=32)) -> dict:
+    data = service.list_backups(center, instance_id=int(instance_id) if instance_id.isdigit() else None, page=pagination.page, page_size=pagination.page_size)
+    return paged(data["items"], data["total"], data["page"], data["page_size"])
 
 
 @router.get("/alerts", summary="告警列表")

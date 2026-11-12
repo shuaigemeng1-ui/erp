@@ -7,7 +7,7 @@ from fastapi import APIRouter, Header, Request
 from app.api.deps import CenterDb
 from app.core.http import success
 from app.modules.ops import service
-from app.modules.ops.schemas import NodeEnrollIn, TelemetryPayload
+from app.modules.ops.schemas import AgentJobEvent, NodeEnrollIn, TelemetryPayload
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -39,6 +39,26 @@ def telemetry(
 
         raise AppError(ErrorCode.AUTH_SESSION_REQUIRED, "节点令牌无效")
     return success(service.ingest_telemetry(center, node, payload))
+
+
+@router.post("/jobs/poll", summary="Agent 领取运维任务")
+def poll_job(center: CenterDb, authorization: str | None = Header(default=None)) -> dict:
+    token = _bearer_token(authorization)
+    if not token:
+        from app.core.errors import AppError, ErrorCode
+        raise AppError(ErrorCode.AUTH_SESSION_REQUIRED, "节点令牌无效")
+    node = service._node_from_token(center, token)
+    return success({"job": service.poll_agent_job(center, node)})
+
+
+@router.post("/jobs/{job_id}/events", summary="Agent 上报任务阶段/结果")
+def job_event(center: CenterDb, job_id: int, payload: AgentJobEvent, authorization: str | None = Header(default=None)) -> dict:
+    token = _bearer_token(authorization)
+    if not token:
+        from app.core.errors import AppError, ErrorCode
+        raise AppError(ErrorCode.AUTH_SESSION_REQUIRED, "节点令牌无效")
+    node = service._node_from_token(center, token)
+    return success(service.agent_job_event(center, node, job_id, payload))
 
 
 @router.get("/ping", summary="Agent 连通性检查")

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import httpx
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 
 from app.core.errors import AppError, ConflictError, ErrorCode
 from app.db.base import utcnow
@@ -881,3 +881,158 @@ def list_checks(center, node_id: int, *, limit: int = 20) -> dict[str, Any]:
             for row in rows
         ],
     }
+
+
+# --------------------------------------------------------------------- 阶段四：发布与运维任务
+def list_releases(center) -> list[dict[str, Any]]:
+    from app.modules.ops.models_center import ReleaseVersion
+
+    rows = center.execute(select(ReleaseVersion).order_by(ReleaseVersion.id.desc())).scalars().all()
+    return [
+        {
+            "id": str(row.id),
+            "version": row.version,
+            "image_tag": row.image_tag,
+            "image_digest": row.image_digest,
+            "status": row.status,
+            "notes": row.notes,
+            "created_at": _iso(row.created_at),
+        }
+        for row in rows
+    ]
+
+
+def create_release(center, payload, *, actor_user_id: int) -> dict[str, Any]:
+    from app.modules.ops.models_center import ReleaseVersion
+
+    if center.execute(select(ReleaseVersion).where(ReleaseVersion.version == payload.version)).scalar_one_or_none():
+        raise ConflictError("版本号已存在")
+    row = ReleaseVersion(
+        version=payload.version, image_tag=payload.image_tag,
+        image_digest=payload.image_digest, notes=payload.notes, created_by=actor_user_id,
+    )
+    center.add(row); center.commit()
+    return {"id": str(row.id), "version": row.version}
+
+
+def create_operation(center, instance_id: int, payload, *, actor_user_id: int) -> dict[str, Any]:
+    from app.modules.ops.models_center import OperationJob
+    from app.modules.platform.service import record_platform_audit
+
+    instance = get_instance(center, instance_id)
+    node = center.execute(
+        select(ServerNode).where(ServerNode.instance_id == instance.id).order_by(ServerNode.id.asc())
+    ).scalars().first()
+    if node is None:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "实例尚未接入服务器节点")
+    key = payload.idempotency_key or f"{instance.id}:{payload.job_type}:{_now().isoformat()}:{secrets.token_hex(4)}"
+    existing = center.execute(select(OperationJob).where(OperationJob.idempotency_key == key)).scalar_one_or_none()
+    if existing is not None:
+        return _operation_payload(existing)
+    running = center.execute(
+        select(OperationJob).where(
+            OperationJob.instance_id == instance.id,
+            OperationJob.status.in_(("pending", "leased", "running")),
+        )
+    ).scalars().first()
+    if running is not None:
+        raise ConflictError("该实例已有未完成运维任务，请等待完成")
+    row = OperationJob(
+        instance_id=instance.id, node_id=node.id, job_type=payload.job_type,
+        status="pending", idempotency_key=key, target_version=payload.target_version,
+        payload_json=payload.payload, requested_by=actor_user_id,
+    )
+    center.add(row); center.commit()
+    record_platform_audit(
+        center, actor_user_id=actor_user_id, action="operation.create",
+        resource_type="operation_job", resource_id=row.id, tenant_id=instance.tenant_id,
+        summary=f"创建运维任务：{payload.job_type}", payload={"instance_id": instance.id},
+    )
+    center.commit()
+    return _operation_payload(row, center=center)
+
+
+def _operation_payload(row, center=None) -> dict[str, Any]:
+    data = {
+        "id": str(row.id), "instance_id": str(row.instance_id), "node_id": str(row.node_id) if row.node_id else None,
+        "job_type": row.job_type, "status": row.status, "target_version": row.target_version,
+        "attempts": row.attempts, "error": row.error, "result": row.result_json,
+        "created_at": _iso(row.created_at), "started_at": _iso(row.started_at), "finished_at": _iso(row.finished_at),
+    }
+    if center is not None:
+        from app.modules.ops.models_center import OperationJobStep
+        steps = center.execute(select(OperationJobStep).where(OperationJobStep.job_id == row.id).order_by(OperationJobStep.step_no)).scalars().all()
+        data["steps"] = [{"step_no": s.step_no, "name": s.name, "status": s.status, "message": s.message} for s in steps]
+    return data
+
+
+def list_operations(center, *, instance_id: int | None = None, page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    from app.modules.ops.models_center import OperationJob
+    stmt = select(OperationJob)
+    if instance_id:
+        stmt = stmt.where(OperationJob.instance_id == instance_id)
+    total = int(center.execute(select(func.count()).select_from(stmt.subquery())).scalar_one())
+    rows = center.execute(stmt.order_by(OperationJob.id.desc()).offset((page-1)*page_size).limit(page_size)).scalars().all()
+    return {"items": [_operation_payload(r) for r in rows], "total": total, "page": page, "page_size": page_size}
+
+
+def list_backups(center, *, instance_id: int | None = None, page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    from app.modules.ops.models_center import BackupRecord
+    stmt = select(BackupRecord)
+    if instance_id:
+        stmt = stmt.where(BackupRecord.instance_id == instance_id)
+    total = int(center.execute(select(func.count()).select_from(stmt.subquery())).scalar_one())
+    rows = center.execute(stmt.order_by(BackupRecord.id.desc()).offset((page-1)*page_size).limit(page_size)).scalars().all()
+    return {"items": [{"id": str(r.id), "instance_id": str(r.instance_id), "status": r.status, "storage_key": r.storage_key,
+                       "size_bytes": int(r.size_bytes or 0), "started_at": _iso(r.started_at), "finished_at": _iso(r.finished_at),
+                       "error": r.error} for r in rows], "total": total, "page": page, "page_size": page_size}
+
+
+def poll_agent_job(center, node: ServerNode) -> dict[str, Any] | None:
+    from app.modules.ops.models_center import OperationJob
+    now = _now()
+    row = center.execute(
+        select(OperationJob).where(
+            OperationJob.node_id == node.id,
+            or_(OperationJob.status == "pending", and_(OperationJob.status == "leased", OperationJob.lease_expires_at < now)),
+        ).order_by(OperationJob.id.asc()).with_for_update()
+    ).scalars().first()
+    if row is None:
+        return None
+    row.status = "leased"; row.attempts = int(row.attempts or 0) + 1
+    row.lease_expires_at = now + timedelta(minutes=10); row.started_at = row.started_at or now
+    center.commit()
+    return {"id": str(row.id), "job_type": row.job_type, "target_version": row.target_version, "payload": row.payload_json or {}, "attempts": row.attempts}
+
+
+def agent_job_event(center, node: ServerNode, job_id: int, payload) -> dict[str, Any]:
+    from app.modules.ops.models_center import BackupRecord, OperationJob, OperationJobStep
+    row = center.execute(select(OperationJob).where(OperationJob.id == job_id, OperationJob.node_id == node.id)).scalar_one_or_none()
+    if row is None:
+        raise AppError(ErrorCode.NOT_FOUND, "任务不存在")
+    now = _now()
+    if payload.step_no and payload.step_name:
+        step = center.execute(select(OperationJobStep).where(OperationJobStep.job_id == row.id, OperationJobStep.step_no == payload.step_no)).scalar_one_or_none()
+        if step is None:
+            step = OperationJobStep(job_id=row.id, step_no=payload.step_no, name=payload.step_name, status=payload.step_status or "running", message=payload.message, started_at=now)
+            center.add(step)
+        else:
+            step.status = payload.step_status or step.status
+            step.message = payload.message or step.message
+            step.finished_at = now if step.status in {"succeeded", "failed", "skipped"} else None
+    if payload.status in {"succeeded", "failed", "unknown"}:
+        row.status = payload.status; row.finished_at = now; row.error = payload.error[:500]
+        if payload.result is not None:
+            row.result_json = payload.result
+        if row.job_type == "backup":
+            backup = BackupRecord(instance_id=row.instance_id, node_id=row.node_id, job_id=row.id,
+                                  status="succeeded" if payload.status == "succeeded" else "failed",
+                                  storage_key=str((payload.result or {}).get("storage_key", "")),
+                                  size_bytes=int((payload.result or {}).get("size_bytes", 0) or 0),
+                                  started_at=row.started_at or now, finished_at=now,
+                                  retention_until=now + timedelta(days=30), error=payload.error[:500])
+            center.add(backup)
+    else:
+        row.status = "running"
+    center.commit()
+    return {"ok": True}

@@ -170,3 +170,79 @@ class AlertEvent(IdMixin, TimestampMixin, CenterBase):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="恢复时间UTC")
     notify_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="通知次数")
     last_notified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="最后通知UTC")
+
+
+class ReleaseVersion(IdMixin, TimestampMixin, CenterBase):
+    __tablename__ = "release_versions"
+    __table_args__ = (
+        UniqueConstraint("version", name="uq_release_versions_version"),
+        table_options("发布版本表"),
+    )
+
+    version: Mapped[str] = mapped_column(String(64), nullable=False, comment="版本号")
+    image_tag: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="", comment="镜像标签")
+    image_digest: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="", comment="镜像摘要")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active", comment="draft/active/retired")
+    notes: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="", comment="发布说明")
+    created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="创建人用户ID")
+
+
+class OperationJob(IdMixin, TimestampMixin, CenterBase):
+    __tablename__ = "operation_jobs"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_operation_jobs_idempotency_key"),
+        Index("ix_operation_jobs_instance_status", "instance_id", "status"),
+        Index("ix_operation_jobs_node_status", "node_id", "status"),
+        table_options("运维任务表"),
+    )
+
+    instance_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="实例ID")
+    node_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="节点ID")
+    job_type: Mapped[str] = mapped_column(String(32), nullable=False, comment="deploy/upgrade/restart/backup/logs/config")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending", comment="pending/leased/running/succeeded/failed/unknown")
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, comment="幂等键")
+    target_version: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default="", comment="目标版本")
+    payload_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, comment="任务参数")
+    result_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, comment="执行结果")
+    error: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="", comment="失败原因")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0", comment="已领取次数")
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="执行租约到期UTC")
+    requested_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="发起人用户ID")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="开始执行UTC")
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="完成时间UTC")
+
+
+class OperationJobStep(IdMixin, CenterBase):
+    __tablename__ = "operation_job_steps"
+    __table_args__ = (
+        UniqueConstraint("job_id", "step_no", name="uq_operation_job_steps_job_step"),
+        Index("ix_operation_job_steps_job", "job_id"),
+        table_options("运维任务步骤表"),
+    )
+
+    job_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="任务ID")
+    step_no: Mapped[int] = mapped_column(Integer, nullable=False, comment="步骤序号")
+    name: Mapped[str] = mapped_column(String(64), nullable=False, comment="步骤名称")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending", comment="pending/running/succeeded/failed/skipped")
+    message: Mapped[str] = mapped_column(String(1000), nullable=False, default="", server_default="", comment="脱敏消息")
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="开始UTC")
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="完成UTC")
+
+
+class BackupRecord(IdMixin, CenterBase):
+    __tablename__ = "backup_records"
+    __table_args__ = (
+        Index("ix_backup_records_instance_started", "instance_id", "started_at"),
+        table_options("备份记录表"),
+    )
+
+    instance_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="实例ID")
+    node_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="节点ID")
+    job_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="运维任务ID")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running", server_default="running", comment="running/succeeded/failed")
+    storage_key: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="", comment="备份存储键")
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0", comment="备份大小字节")
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, comment="开始UTC")
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="完成UTC")
+    retention_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="保留到期UTC")
+    error: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="", comment="失败原因")

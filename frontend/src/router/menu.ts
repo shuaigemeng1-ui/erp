@@ -36,7 +36,7 @@ export const tenantMenuItems: MenuItem[] = [
   },
   { path: '/members', title: '成员', icon: User, permission: 'member.read' },
   { path: '/roles', title: '角色权限', icon: Key, permission: 'role.manage' },
-  { path: '/audit-logs', title: '审计日志', icon: Document, permission: 'audit.read' },
+  { path: '/audit-logs', title: '操作日志', icon: Document, permission: 'audit.read' },
 ]
 
 /** 平台管理菜单：仅平台管理员可见（后端独立校验）。 */

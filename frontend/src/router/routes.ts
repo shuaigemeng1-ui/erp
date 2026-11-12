@@ -121,7 +121,7 @@ export const routes: RouteRecordRaw[] = [
         path: 'audit-logs',
         name: 'audit-logs',
         component: () => import('@/views/tenant/AuditLogsView.vue'),
-        meta: { tenant: true, permission: 'audit.read', title: '审计日志' },
+        meta: { tenant: true, permission: 'audit.read', title: '操作日志' },
       },
       {
         path: 'platform/tenants',

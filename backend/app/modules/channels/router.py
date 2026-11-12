@@ -63,6 +63,8 @@ logger = logging.getLogger("ventasync.channels.router")
 router = APIRouter(tags=["channels"])
 integration_router = APIRouter(prefix="/integrations/shopee", tags=["shopee"])
 tiktok_integration_router = APIRouter(prefix="/integrations/tiktok", tags=["tiktok"])
+# 兼容参考项目 / TikTok 应用里常见的历史回调路径
+tiktok_legacy_router = APIRouter(prefix="/tiktok", tags=["tiktok"])
 
 _VALID_MAPPING_FILTERS = frozenset({LISTING_FILTER_UNMAPPED}) | LINK_STATUSES
 
@@ -581,6 +583,7 @@ def authorize_tiktok_store(
 
 
 @tiktok_integration_router.get("/oauth/callback")
+@tiktok_legacy_router.get("/auth/callback")
 def tiktok_oauth_callback(
     code: str | None = Query(default=None, description="TikTok 授权码"),
     state: str | None = Query(default=None, description="一次性授权会话 state"),

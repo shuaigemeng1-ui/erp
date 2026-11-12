@@ -22,6 +22,7 @@ from app.modules.channels.router import (
     integration_router,
     router as channels_router,
     tiktok_integration_router,
+    tiktok_legacy_router,
 )
 from app.modules.identity.router import router as identity_router
 from app.modules.identity.router import tenant_router as identity_tenant_router
@@ -41,6 +42,7 @@ api_router.include_router(sales_router)
 api_router.include_router(tasks_router)
 api_router.include_router(audit_router)
 api_router.include_router(integration_router)
+api_router.include_router(tiktok_legacy_router)
 api_router.include_router(tiktok_integration_router)
 
 __all__ = ["api_router"]

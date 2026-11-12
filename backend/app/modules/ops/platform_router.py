@@ -108,6 +108,11 @@ def create_operation(center: CenterDb, admin: PlatformAdmin, instance_id: int, p
     return success(service.create_operation(center, instance_id, payload, actor_user_id=admin.user_id))
 
 
+@router.get("/operations/{job_id}", summary="运维任务详情")
+def operation_detail(center: CenterDb, _: PlatformAdmin, job_id: int) -> dict:
+    return success(service.get_operation(center, job_id))
+
+
 @router.get("/backups", summary="备份记录列表")
 def backups(center: CenterDb, _: PlatformAdmin, pagination: PageParams = Depends(), instance_id: str = Query(default="", max_length=32)) -> dict:
     data = service.list_backups(center, instance_id=int(instance_id) if instance_id.isdigit() else None, page=pagination.page, page_size=pagination.page_size)

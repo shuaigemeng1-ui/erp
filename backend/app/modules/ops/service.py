@@ -966,6 +966,14 @@ def _operation_payload(row, center=None) -> dict[str, Any]:
     return data
 
 
+def get_operation(center, job_id: int) -> dict[str, Any]:
+    from app.modules.ops.models_center import OperationJob
+    row = center.get(OperationJob, int(job_id))
+    if row is None:
+        raise AppError(ErrorCode.NOT_FOUND, "运维任务不存在")
+    return _operation_payload(row, center=center)
+
+
 def list_operations(center, *, instance_id: int | None = None, page: int = 1, page_size: int = 20) -> dict[str, Any]:
     from app.modules.ops.models_center import OperationJob
     stmt = select(OperationJob)

@@ -141,6 +141,12 @@ export const routes: RouteRecordRaw[] = [
         meta: { platform: true, title: '服务器与实例' },
       },
       {
+        path: 'platform/operations',
+        name: 'platform-operations',
+        component: () => import('@/views/platform/PlatformOpsCenterView.vue'),
+        meta: { platform: true, title: '运维中心' },
+      },
+      {
         path: 'platform/system-config',
         name: 'platform-system-config',
         component: () => import('@/views/platform/PlatformSystemConfigView.vue'),

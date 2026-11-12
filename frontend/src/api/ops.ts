@@ -24,6 +24,85 @@ export interface OpsAlertQuery extends PageParams {
   node_id?: EntityId
 }
 
+/* ------------------------------ 运维中心 ------------------------------ */
+
+/** 发布版本状态（后端 draft/active/retired） */
+export type OpsReleaseStatus = 'draft' | 'active' | 'retired'
+
+/** 运维任务类型（后端白名单） */
+export type OpsJobType = 'deploy' | 'upgrade' | 'restart' | 'backup' | 'logs' | 'config'
+
+/** 运维任务状态 */
+export type OpsOperationStatus = 'pending' | 'leased' | 'running' | 'succeeded' | 'failed' | 'unknown'
+
+/** 发布版本：GET /platform/releases 直接返回数组 */
+export interface OpsRelease {
+  id: EntityId
+  version: string
+  image_tag: string
+  image_digest: string
+  status: OpsReleaseStatus | string
+  notes: string
+  created_at?: string | null
+}
+
+export interface OpsReleaseCreatePayload {
+  version: string
+  image_tag?: string
+  image_digest?: string
+  notes?: string
+}
+
+/** 登记发布版本返回：后端只回 id/version */
+export interface OpsReleaseCreateResult {
+  id: EntityId
+  version: string
+}
+
+/** 运维任务项：GET /platform/operations 分页数据 */
+export interface OpsOperation {
+  id: EntityId
+  instance_id: EntityId
+  node_id?: EntityId | null
+  job_type: OpsJobType | string
+  status: OpsOperationStatus | string
+  target_version: string
+  attempts: number
+  error: string
+  result: Record<string, unknown> | null
+  created_at?: string | null
+  started_at?: string | null
+  finished_at?: string | null
+}
+
+export interface OpsOperationCreatePayload {
+  job_type: OpsJobType
+  target_version?: string
+  payload?: Record<string, unknown>
+  /** 留空时不下发，由后端生成幂等键。 */
+  idempotency_key?: string
+}
+
+/** 备份记录项：GET /platform/backups 分页数据 */
+export interface OpsBackup {
+  id: EntityId
+  instance_id: EntityId
+  status: string
+  storage_key: string
+  size_bytes: number
+  started_at?: string | null
+  finished_at?: string | null
+  error: string
+}
+
+export interface OpsOperationQuery extends PageParams {
+  instance_id?: EntityId
+}
+
+export interface OpsBackupQuery extends PageParams {
+  instance_id?: EntityId
+}
+
 export const opsApi = {
   instances(query: OpsInstanceQuery = {}): Promise<PagedData<OpsInstance>> {
     return requestPage<OpsInstance>('/platform/instances', query as QueryParams)
@@ -81,5 +160,36 @@ export const opsApi = {
       name: item.name,
       code: item.code,
     }))
+  },
+
+  /* ------------------------------ 运维中心 ------------------------------ */
+
+  /** 发布版本列表：后端 data 直接是数组。 */
+  releases(): Promise<OpsRelease[]> {
+    return http.get<OpsRelease[]>('/platform/releases')
+  },
+
+  createRelease(payload: OpsReleaseCreatePayload): Promise<OpsReleaseCreateResult> {
+    return http.post<OpsReleaseCreateResult>('/platform/releases', payload)
+  },
+
+  operations(query: OpsOperationQuery = {}): Promise<PagedData<OpsOperation>> {
+    return requestPage<OpsOperation>('/platform/operations', query as QueryParams)
+  },
+
+  /** 创建运维任务：idempotency_key 留空时不传，后端自动生成。 */
+  createOperation(instanceId: EntityId, payload: OpsOperationCreatePayload): Promise<OpsOperation> {
+    const body: Record<string, unknown> = {
+      job_type: payload.job_type,
+      target_version: payload.target_version ?? '',
+      payload: payload.payload ?? {},
+    }
+    const idempotencyKey = payload.idempotency_key?.trim()
+    if (idempotencyKey) body.idempotency_key = idempotencyKey
+    return http.post<OpsOperation>(`/platform/instances/${segment(instanceId)}/operations`, body)
+  },
+
+  backups(query: OpsBackupQuery = {}): Promise<PagedData<OpsBackup>> {
+    return requestPage<OpsBackup>('/platform/backups', query as QueryParams)
   },
 }

@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, Boolean, Index, String, UniqueConstraint
+from datetime import datetime
+
+from sqlalchemy import BigInteger, Boolean, DateTime, Index, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import IdMixin, TenantBase, TenantIdMixin, TimestampMixin, table_options
@@ -120,3 +122,23 @@ class MemberRole(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
         nullable=True,
         comment="分配人用户ID（自动化 / 邀请激活时为空）",
     )
+
+
+class TenantLocalUser(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
+    """租户本机账号：独立实例模式下不依赖中心库登录。"""
+
+    __tablename__ = "tenant_local_users"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "source_user_id", name="uq_tenant_local_users_source"),
+        UniqueConstraint("tenant_id", "email", name="uq_tenant_local_users_email"),
+        table_options("租户本机账号表"),
+    )
+
+    source_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="来源中心用户ID")
+    email: Mapped[str] = mapped_column(String(255), nullable=False, comment="登录邮箱")
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False, comment="密码哈希")
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False, default="", comment="显示名称")
+    member_no: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="租户内成员编号")
+    is_owner: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, comment="是否负责人")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active", comment="账号状态")
+    synced_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, comment="最近同步UTC")

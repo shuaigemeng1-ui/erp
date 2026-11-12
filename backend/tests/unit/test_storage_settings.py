@@ -141,6 +141,33 @@ def test_invalid_endpoint_or_object_prefix_rejected(field,value):
         body(**{field:value})
 
 
+@pytest.mark.parametrize("changes,expected", [
+    ({"region": "华南-广州"}, "区域编码"),
+    ({"region": "cn_south_1"}, "区域编码"),
+    ({"region": "CN-SOUTH-1"}, "区域编码"),
+    ({"provider": "obs", "addressing_style": "path"}, "不支持路径寻址"),
+    ({"provider": "obs", "bucket": "erp.images"}, "不支持带点桶名"),
+])
+def test_region_codes_and_obs_addressing_validated_on_save(changes,expected):
+    with pytest.raises(ValueError,match=expected):
+        body(**changes)
+    assert body(provider="obs",region="",addressing_style="auto").region == ""
+
+
+def test_test_profile_returns_only_fixed_provider_error_and_code(center,monkeypatch):
+    from app.modules.storage import providers
+    saved = create(center)
+    def failed(config):
+        raise providers.StorageProviderError("SDK response includes example-secret-key", code="AccessDenied")
+    monkeypatch.setattr(providers,"create_client",failed)
+    with pytest.raises(AppError) as error:
+        service.test_profile(center,int(saved["id"]))
+    assert error.value.status_code == 503
+    assert error.value.details == {"provider_code":"AccessDenied"}
+    assert "HeadBucket" in str(error.value)
+    assert "example-secret-key" not in str(error.value)
+
+
 def test_http_routes_require_platform_admin_and_platform_scope(center):
     app=FastAPI()
     app.include_router(router,prefix="/api/v1")

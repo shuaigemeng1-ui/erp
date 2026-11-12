@@ -52,9 +52,13 @@
 
 所有系统配置接口都要求平台管理员及平台管理会话，租户会话不能调用。账号字段为 `name/provider/endpoint/bucket/region/public_base_url/key_prefix/addressing_style/enabled`；provider为 `oss/cos/obs/s3/s3_compatible`，addressing_style为 `auto/virtual/path`。Endpoint使用根HTTPS服务地址，不包含桶名、对象路径、查询参数或凭据；public_base_url允许CDN路径，但不能包含查询参数或临时签名。
 
+`region`只接受小写字母、数字及连字符组成的区域编码，如`cn-south-1`，留空按Endpoint识别；中文地域名称保存时返回422。OBS的`auto`使用虚拟主机寻址，显式`path`及当前HTTPS适配不支持的带点桶名会拒绝。OBS保持S3 V4签名及TLS证书校验。
+
 StorageProfile响应为上述非敏感字段，加 `id/version/has_access_key/has_secret_key`。访问密钥ID及Secret都不回显；保存只接收写入值，审计不记录凭据。版本冲突返回409，默认账号不能直接停用。切换默认不改写已有文件URL。
 
 平台管理员需要在云厂商配置图片公开读取或CDN长期访问地址。连接测试只检查桶访问能力，不等于已验证外部匿名读取。未设置默认账号返回422；云端上传或测试失败返回明确错误，不能返回成功URL，也不回落本地保存。实际云账号与权限仍需真实验收。
+
+已识别的云端错误返回固定中文提示及`error.details.provider_code`（如`InvalidRegion/AccessDenied/NoSuchBucket/NetworkError`）；未知异常使用通用提示，不返回SDK原始响应、密钥或签名。
 
 ## 租户内
 

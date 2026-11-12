@@ -42,6 +42,8 @@ const endpointPlaceholder = computed(() => ({
   s3: 'https://s3.us-east-1.amazonaws.com',
   s3_compatible: 'https://对象存储服务地址',
 })[storageForm.value.provider])
+const regionPlaceholder = computed(() => storageForm.value.provider === 'obs'
+  ? '如 cn-south-1，留空自动识别' : '填写区域编码，留空自动识别')
 
 function validateHttps(_rule: unknown, value: string, callback: (error?: Error) => void): void {
   try {
@@ -54,7 +56,12 @@ const rules: FormRules = {
   name: [{ required: true, message: '请输入配置名称', trigger: 'blur' }],
   provider: [{ required: true, message: '请选择存储厂商', trigger: 'change' }],
   endpoint: [{ required: true, message: '请输入 Endpoint', trigger: 'blur' }, { validator: validateHttps, trigger: 'blur' }],
-  bucket: [{ required: true, message: '请输入 Bucket', trigger: 'blur' }],
+  bucket: [{ required: true, message: '请输入 Bucket', trigger: 'blur' }, {
+    validator: (_rule, value: string, callback) => callback(storageForm.value.provider === 'obs' && value.includes('.')
+      ? new Error('当前 OBS HTTPS 适配不支持带点的桶名') : undefined), trigger: 'blur',
+  }],
+  region: [{ validator: (_rule, value: string, callback) => callback(!value.trim() || /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value.trim())
+    ? undefined : new Error('请填写区域编码（如 cn-south-1），不要填写中文地域名称')), trigger: 'blur' }],
   public_base_url: [{ required: true, message: '请输入图片访问域名', trigger: 'blur' }, { validator: validateHttps, trigger: 'blur' }],
 }
 
@@ -84,6 +91,7 @@ function openEditor(profile?: StorageProfile): void {
 function clearCredentials(): void {
   storageForm.value.access_key_id = ''
   storageForm.value.secret_access_key = ''
+  if (storageForm.value.provider === 'obs' && storageForm.value.addressing_style === 'path') storageForm.value.addressing_style = 'auto'
   formRef.value?.clearValidate()
 }
 
@@ -207,10 +215,10 @@ onMounted(load)
         <el-col :xs="24" :md="12"><el-form-item label="云厂商" prop="provider"><el-select v-model="storageForm.provider" @change="clearCredentials"><el-option v-for="item in providers" :key="item.code" :label="item.name" :value="item.code" /></el-select></el-form-item></el-col>
         <el-col :span="24"><el-form-item label="Endpoint" prop="endpoint"><el-input v-model="storageForm.endpoint" :placeholder="endpointPlaceholder" maxlength="500" /></el-form-item></el-col>
         <el-col :xs="24" :md="12"><el-form-item label="Bucket" prop="bucket"><el-input v-model="storageForm.bucket" maxlength="255" /></el-form-item></el-col>
-        <el-col :xs="24" :md="12"><el-form-item label="Region"><el-input v-model="storageForm.region" maxlength="100" placeholder="存储桶所在地域" /></el-form-item></el-col>
+        <el-col :xs="24" :md="12"><el-form-item label="区域编码" prop="region"><el-input v-model="storageForm.region" maxlength="100" :placeholder="regionPlaceholder" /></el-form-item></el-col>
         <el-col :span="24"><el-form-item label="访问域名" prop="public_base_url"><el-input v-model="storageForm.public_base_url" maxlength="1000" placeholder="https://images.example.com" /><div class="form-tip">填写可长期访问图片的桶域名或 CDN 地址，并在云厂商配置相应读权限。</div></el-form-item></el-col>
         <el-col :xs="24" :md="12"><el-form-item label="存储目录前缀"><el-input v-model="storageForm.key_prefix" maxlength="200" placeholder="如 erp（可留空）" /></el-form-item></el-col>
-        <el-col :xs="24" :md="12"><el-form-item label="寻址方式"><el-select v-model="storageForm.addressing_style"><el-option label="自动" value="auto" /><el-option label="虚拟主机（桶名在子域名）" value="virtual" /><el-option label="路径（桶名在路径）" value="path" /></el-select></el-form-item></el-col>
+        <el-col :xs="24" :md="12"><el-form-item label="寻址方式"><el-select v-model="storageForm.addressing_style"><el-option label="自动" value="auto" /><el-option label="虚拟主机（桶名在子域名）" value="virtual" /><el-option label="路径（桶名在路径）" value="path" :disabled="storageForm.provider === 'obs'" /></el-select></el-form-item></el-col>
         <el-col :xs="24" :md="12"><el-form-item :label="keyLabels[0]" :required="credentialsRequired"><el-input v-model="storageForm.access_key_id" type="password" show-password autocomplete="new-password" :placeholder="editing?.has_access_key && !providerChanged ? '已配置，留空保持原值' : '请输入访问密钥 ID'" /></el-form-item></el-col>
         <el-col :xs="24" :md="12"><el-form-item :label="keyLabels[1]" :required="credentialsRequired"><el-input v-model="storageForm.secret_access_key" type="password" show-password autocomplete="new-password" :placeholder="editing?.has_secret_key && !providerChanged ? '已配置，留空保持原值' : '请输入访问密钥'" /></el-form-item></el-col>
         <el-col :span="24"><el-form-item label="启用"><el-switch v-model="storageForm.enabled" :disabled="editingDefault" /><span v-if="editingDefault" class="form-tip switch-tip">先切换默认存储后才能停用。</span></el-form-item></el-col>

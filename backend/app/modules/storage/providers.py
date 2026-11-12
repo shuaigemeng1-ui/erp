@@ -6,12 +6,13 @@ OBS、AWS S3 及其他兼容服务使用 S3 V4。不改变桶或对象的公开�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any
 from urllib.parse import quote, urlsplit
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ConnectTimeoutError, EndpointConnectionError, InvalidRegionError, ReadTimeoutError, SSLError
 
 SUPPORTED_PROVIDERS = ("oss", "cos", "obs", "s3", "s3_compatible")
 PROVIDER_NAMES = {
@@ -23,6 +24,29 @@ _SAFE_ERROR_CODES = frozenset({
     "AuthorizationHeaderMalformed", "PermanentRedirect", "TemporaryRedirect",
     "InvalidBucketName", "RequestTimeout", "SlowDown", "ServiceUnavailable",
 })
+_PUBLIC_ERRORS = {
+    "StorageRequestFailed": "对象存储请求失败，请检查服务地址、密钥和存储桶权限",
+    "InvalidConfiguration": "对象存储配置无效，请检查服务地址、密钥和存储桶",
+    "InvalidRegion": "区域必须填写区域编码（如 cn-south-1），不能填写中文名称；也可留空自动识别",
+    "ObsPathStyleUnsupported": "华为云 OBS 不支持路径寻址，请选择自动或虚拟主机",
+    "ObsBucketNameUnsupported": "OBS 桶名须为3至63位小写字母、数字或连接符，当前 HTTPS 适配不支持带点桶名",
+    "InvalidObjectKey": "对象存储目录或文件键无效，请检查目录层级和长度",
+    "UnexpectedRedirect": "对象存储服务要求重定向，请核对存储桶区域和服务地址",
+    "UnexpectedEndpoint": "对象存储请求地址与配置不一致，请核对服务地址和桶名",
+    "AccessDenied": "对象存储拒绝访问，请检查访问密钥和存储桶操作权限；连接检查需要 HeadBucket 权限",
+    "InvalidAccessKeyId": "对象存储访问密钥 ID 无效，请检查配置",
+    "SignatureDoesNotMatch": "对象存储签名校验失败，请检查密钥、区域编码和服务器时间",
+    "NoSuchBucket": "存储桶不存在，请检查桶名、区域和服务地址",
+    "AuthorizationHeaderMalformed": "对象存储认证格式不匹配，请检查厂商、区域和服务地址",
+    "PermanentRedirect": "存储桶要求重定向，请核对区域和服务地址",
+    "TemporaryRedirect": "对象存储要求临时重定向，请稍后重试或核对服务地址",
+    "InvalidBucketName": "存储桶名称无效，请检查桶名",
+    "RequestTimeout": "对象存储请求超时，请检查服务器网络后重试",
+    "SlowDown": "对象存储请求受限，请稍后重试",
+    "ServiceUnavailable": "对象存储服务暂不可用，请稍后重试",
+    "NetworkError": "无法连接对象存储服务，请检查服务地址、DNS和服务器网络",
+    "TlsError": "对象存储 HTTPS 证书校验失败，请检查服务地址及证书",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +79,12 @@ class StorageProviderError(Exception):
         self.code = code
         self.error_code = code
         super().__init__(message)
+
+
+def public_error(exc: StorageProviderError) -> tuple[str, str]:
+    """仅从本地固定字典构造API错误，忽略异常携带的任意文本。"""
+    code = exc.code if isinstance(exc.code, str) and exc.code in _PUBLIC_ERRORS else "StorageRequestFailed"
+    return _PUBLIC_ERRORS[code], code
 
 
 def _checked_url(value: str, *, endpoint: bool):
@@ -92,9 +122,19 @@ def _safe_sdk_error(exc: Exception) -> StorageProviderError:
     code = "StorageRequestFailed"
     if isinstance(exc, ClientError):
         candidate = exc.response.get("Error", {}).get("Code")
+        if isinstance(candidate, str):
+            candidate = {"403": "AccessDenied", "404": "NoSuchBucket", "408": "RequestTimeout", "503": "ServiceUnavailable"}.get(candidate, candidate)
         if isinstance(candidate, str) and candidate in _SAFE_ERROR_CODES:
             code = candidate
-    return StorageProviderError(code=code)
+    elif isinstance(exc, InvalidRegionError):
+        code = "InvalidRegion"
+    elif isinstance(exc, (ConnectTimeoutError, ReadTimeoutError)):
+        code = "RequestTimeout"
+    elif isinstance(exc, SSLError):
+        code = "TlsError"
+    elif isinstance(exc, EndpointConnectionError):
+        code = "NetworkError"
+    return StorageProviderError(_PUBLIC_ERRORS[code], code=code)
 
 
 class S3StorageClient:
@@ -106,6 +146,13 @@ class S3StorageClient:
         if not config.access_key_id or not config.secret_access_key or not config.bucket:
             # Never allow boto3 to fall through to environment/instance credentials.
             raise StorageProviderError("对象存储账号、密钥和存储桶不能为空", code="InvalidConfiguration")
+        if config.region and not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", config.region):
+            raise StorageProviderError(_PUBLIC_ERRORS["InvalidRegion"], code="InvalidRegion")
+        if config.provider == "obs":
+            if config.addressing_style == "path":
+                raise StorageProviderError(_PUBLIC_ERRORS["ObsPathStyleUnsupported"], code="ObsPathStyleUnsupported")
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", config.bucket):
+                raise StorageProviderError(_PUBLIC_ERRORS["ObsBucketNameUnsupported"], code="ObsBucketNameUnsupported")
         endpoint = _checked_url(config.endpoint, endpoint=True)
         _checked_url(config.public_base_url, endpoint=False)
         prefix = config.key_prefix.strip("/")
@@ -130,7 +177,7 @@ class S3StorageClient:
     def _build_sdk_client(self):
         signature = "s3" if self.config.provider in {"oss", "cos"} else "s3v4"
         style = self.config.addressing_style
-        if style == "auto" and self.config.provider in {"oss", "cos"}:
+        if style == "auto" and self.config.provider in {"oss", "cos", "obs"}:
             style = "virtual"
         sdk_config = Config(
             signature_version=signature,

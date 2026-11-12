@@ -5,7 +5,7 @@ import re
 from typing import Literal
 from urllib.parse import unquote, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 Provider = Literal["oss", "cos", "obs", "s3", "s3_compatible"]
 
@@ -41,6 +41,22 @@ class StorageProfileInput(BaseModel):
     enabled: bool = True
     access_key_id: SecretStr | None = None
     secret_access_key: SecretStr | None = None
+
+    @field_validator("region")
+    @classmethod
+    def validate_region(cls, value):
+        if value and not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", value):
+            raise ValueError("区域必须填写区域编码（如 cn-south-1），不能填写中文名称；也可留空自动识别")
+        return value
+
+    @model_validator(mode="after")
+    def validate_obs_addressing(self):
+        if self.provider == "obs":
+            if self.addressing_style == "path":
+                raise ValueError("华为云 OBS 不支持路径寻址，请选择自动或虚拟主机")
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", self.bucket):
+                raise ValueError("OBS 桶名须为3至63位小写字母、数字或连接符，当前 HTTPS 适配不支持带点桶名")
+        return self
 
     @field_validator("endpoint")
     @classmethod

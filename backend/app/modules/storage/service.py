@@ -182,22 +182,28 @@ def get_default_config(center):
 def upload_default(center, tenant_id: int, *, object_key: str, data: bytes, content_type: str):
     if tenant_id <= 0 or not object_key.startswith(f"catalog/{tenant_id}/"):
         raise AppError(ErrorCode.VALIDATION_ERROR, "对象存储键与租户不一致")
-    from app.modules.storage.providers import create_client
+    from app.modules.storage.providers import create_client, StorageProviderError, public_error
     config = get_default_config(center)
     try:
         with create_client(config) as client:
             return client.put_object(object_key, data, content_type)
+    except StorageProviderError as exc:
+        message, code = public_error(exc)
+        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, message, details={"provider_code": code}) from None
     except Exception:
         raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "图片上传至对象存储失败，请检查存储账号、桶权限和网络后重试") from None
 
 
 def test_profile(center, profile_id: int):
-    from app.modules.storage.providers import create_client
+    from app.modules.storage.providers import create_client, StorageProviderError, public_error
     row = _profile(center, profile_id)
     config = _config(row)
     try:
         with create_client(config) as client:
             client.head_bucket()
+    except StorageProviderError as exc:
+        message, code = public_error(exc)
+        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, message, details={"provider_code": code}) from None
     except Exception:
         raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "对象存储连接失败，请检查服务地址、存储桶和访问密钥") from None
     return {"ok": True, "message": "存储桶连接检查通过"}

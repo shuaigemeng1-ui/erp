@@ -41,7 +41,7 @@ class FakeSDK:
 
 
 @pytest.mark.parametrize("provider,signature,style", [
-    ("oss", "s3", "virtual"), ("cos", "s3", "virtual"), ("obs", "s3v4", "auto"),
+    ("oss", "s3", "virtual"), ("cos", "s3", "virtual"), ("obs", "s3v4", "virtual"),
     ("s3", "s3v4", "auto"), ("s3_compatible", "s3v4", "auto"),
 ])
 def test_vendor_config_and_explicit_credentials(monkeypatch, provider, signature, style):
@@ -139,6 +139,52 @@ def test_endpoint_guard_blocks_other_host_before_sending():
     with pytest.raises(StorageProviderError) as caught:
         client._check_request_endpoint(SimpleNamespace(url="https://objects.example.test.evil.test/key"))
     assert caught.value.code == "UnexpectedEndpoint"
+
+
+def test_obs_auto_sends_virtual_host_request_with_v4_and_keeps_tls(monkeypatch):
+    client = create_client(config("obs", endpoint="https://obs.cn-south-1.myhuaweicloud.com", region="cn-south-1"))
+    sent = []
+    class EmptyBody:
+        def stream(self, *args, **kwargs):
+            return iter(())
+    def send(request):
+        sent.append(request)
+        return AWSResponse(request.url, 200, {}, EmptyBody())
+    monkeypatch.setattr(client._client._endpoint.http_session, "send", send)
+    try:
+        client.head_bucket()
+        assert len(sent) == 1
+        assert sent[0].url == "https://images.obs.cn-south-1.myhuaweicloud.com/"
+        assert sent[0].headers["Authorization"].startswith(b"AWS4-HMAC-SHA256 ")
+        assert client._client._endpoint.http_session._verify is True
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("changes,code", [
+    ({"region": "华南-广州"}, "InvalidRegion"),
+    ({"region": "cn_south_1"}, "InvalidRegion"),
+    ({"addressing_style": "path"}, "ObsPathStyleUnsupported"),
+    ({"bucket": "images.with-dot"}, "ObsBucketNameUnsupported"),
+])
+def test_invalid_saved_obs_configuration_rejected_before_sdk(monkeypatch, changes, code):
+    monkeypatch.setattr(providers.boto3.session, "Session", lambda: pytest.fail("Invalid saved configuration must not create a client"))
+    with pytest.raises(StorageProviderError) as caught:
+        create_client(config("obs", **changes))
+    assert caught.value.code == code
+
+
+@pytest.mark.parametrize("sdk_code,expected", [("403", "AccessDenied"), ("404", "NoSuchBucket"), ("unknown-private-error", "StorageRequestFailed")])
+def test_provider_status_errors_have_fixed_public_messages(sdk_code, expected):
+    cfg = config()
+    error = ClientError({"Error": {"Code": sdk_code, "Message": cfg.access_key_id + cfg.secret_access_key}}, "HeadBucket")
+    with create_client(cfg, sdk_client=FakeSDK(error)) as client:
+        with pytest.raises(StorageProviderError) as caught:
+            client.head_bucket()
+    message, code = providers.public_error(caught.value)
+    assert code == expected and cfg.access_key_id not in message and cfg.secret_access_key not in message
+    if expected == "AccessDenied":
+        assert "HeadBucket" in message
 
 
 @pytest.mark.parametrize("key", ["/catalog/a.png", "catalog/../a.png", "catalog\\a.png", "catalog//a.png"])

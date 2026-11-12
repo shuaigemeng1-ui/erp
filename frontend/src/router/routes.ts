@@ -120,8 +120,8 @@ export const routes: RouteRecordRaw[] = [
       {
         path: 'audit-logs',
         name: 'audit-logs',
-        component: () => import('@/views/tenant/AuditLogsView.vue'),
-        meta: { tenant: true, permission: 'audit.read', title: '操作日志' },
+        component: () => import('@/views/tenant/TenantLogsView.vue'),
+        meta: { tenant: true, permission: 'audit.read', title: '日志' },
       },
       {
         path: 'platform/tenants',

@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, Query
 
 from app.api.deps import (
     AccessSnapshotDep,
+    CenterDb,
     RequirePermission,
     TenantCtx,
     TenantDb,
@@ -29,6 +30,7 @@ def list_audit_logs(
     ctx: TenantCtx,
     snapshot: AccessSnapshotDep,
     db: TenantDb,
+    center: CenterDb,
     pagination: PageParams = Depends(),
     action: str = Query(default="", max_length=128, description="按操作编码过滤"),
     _: RequirePermission = Depends(require_permission(Permission.AUDIT_READ.value)),
@@ -41,6 +43,30 @@ def list_audit_logs(
         action=action,
         include_cost="all" in snapshot.effective.granted_scope_types("catalog.cost.read"),
     )
+    # 把操作人 ID 解析成姓名；历史快照优先，缺失时回退当前用户显示名。
+    from sqlalchemy import select
+    from app.modules.identity.models_center import User
+
+    actor_ids = {
+        int(item["actor_id"])
+        for item in data["items"]
+        if item.get("actor_id") and not item.get("actor_name")
+    }
+    names: dict[int, str] = {}
+    if actor_ids:
+        users = center.execute(
+            select(User.id, User.display_name, User.email).where(User.id.in_(actor_ids))
+        ).all()
+        names = {
+            int(user.id): (str(user.display_name or "").strip() or str(user.email or ""))
+            for user in users
+        }
+    for item in data["items"]:
+        if not item.get("actor_name"):
+            actor_id = item.get("actor_id")
+            item["actor_name"] = names.get(int(actor_id)) if actor_id else "系统"
+        if not item.get("actor_name"):
+            item["actor_name"] = "未知用户"
     return paged(data["items"], data["total"], data["page"], data["page_size"])
 
 

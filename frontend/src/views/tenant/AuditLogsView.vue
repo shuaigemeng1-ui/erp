@@ -65,11 +65,8 @@ function openPayload(row: AuditLog): void {
       <el-table-column label="对象" min-width="180" show-overflow-tooltip>
         <template #default="{ row }">{{ row.resource_type }} / {{ textOrDash(row.resource_id) }}</template>
       </el-table-column>
-      <el-table-column label="操作人" width="120">
-        <template #default="{ row }">
-          <span v-if="row.actor_name">{{ row.actor_name }}</span>
-          <IdCopy v-else :id="row.actor_id" />
-        </template>
+      <el-table-column label="操作人" width="150">
+        <template #default="{ row }">{{ row.actor_name || '未知用户' }}</template>
       </el-table-column>
       <el-table-column label="摘要" min-width="240" show-overflow-tooltip>
         <template #default="{ row }">{{ truncate(row.summary, 90) }}</template>

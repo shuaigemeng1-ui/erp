@@ -70,6 +70,7 @@ def audit_payload(row: AuditLog, *, include_cost: bool = False) -> dict[str, Any
         "id": str(row.id),
         "tenant_id": str(row.tenant_id),
         "actor_id": str(row.actor_id) if row.actor_id else None,
+        "actor_name": row.actor_name_snapshot or "",
         "action": row.action,
         "resource_type": row.resource_type,
         "resource_id": str(row.resource_id) if row.resource_id else None,

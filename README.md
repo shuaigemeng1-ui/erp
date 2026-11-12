@@ -29,6 +29,7 @@ FastAPI + Vue 3 + MySQL，中心库 + 每租户独立业务库。桌面 `ventasy
 
 - [架构与边界](docs/architecture.md)
 - [服务器与实例监控（阶段一）](docs/ops-monitoring.md)
+- [管理中心独立 watchdog](watchdog/README.md)
 - [数据模型及完整迁移链](docs/data-model.md)
 - [API 契约](docs/api-contract.md)
 - [原计划对照](docs/plan-mapping.md)

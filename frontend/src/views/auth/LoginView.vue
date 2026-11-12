@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { reactive, ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
+import { refreshCsrfToken } from '@/api/http'
 import { useAuthStore } from '@/stores/auth'
 import { useEnterSession } from '@/composables/useEnterSession'
 
@@ -24,6 +25,11 @@ const rules: FormRules = {
   ],
   password: [{ required: true, message: '请输入密码', trigger: 'blur' }],
 }
+
+onMounted(() => {
+  // 进入登录页强制获取新的匿名 CSRF，避免旧会话 Cookie 导致登录 403
+  void refreshCsrfToken()
+})
 
 async function submit(): Promise<void> {
   const formInstance = formRef.value

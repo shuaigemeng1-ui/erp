@@ -139,6 +139,14 @@ async function fetchCsrfToken(): Promise<string | null> {
   }
 }
 
+/** 强制重新签发匿名 CSRF：登录页进入 / CSRF 失效重试时使用。 */
+export async function refreshCsrfToken(): Promise<string | null> {
+  clearCsrfCache()
+  const token = await fetchCsrfToken()
+  if (token) csrfToken = token
+  return token
+}
+
 async function ensureCsrfToken(): Promise<string | null> {
   const fromCookie = readCookie(CSRF_COOKIE)
   if (fromCookie) {
@@ -197,9 +205,11 @@ export interface RequestOptions {
   /** 401 时不触发全局跳转（登录探测 / 登录页本身使用） */
   skipUnauthorizedHandler?: boolean
   headers?: Record<string, string>
+  /** 内部使用：CSRF 失效后已自动刷新并重试过一次 */
+  csrfRetried?: boolean
 }
 
-export type ExtraRequestOptions = Omit<RequestOptions, 'method' | 'body' | 'query'>
+export type ExtraRequestOptions = Omit<RequestOptions, 'method' | 'body' | 'query' | 'csrfRetried'>
 
 function defaultErrorMessage(status: number): string {
   switch (status) {
@@ -305,7 +315,23 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   }
 
   if (response.status === 204) return undefined as T
-  if (!response.ok) return handleErrorResponse(response, options)
+  if (!response.ok) {
+    // CSRF 失效（旧会话 Cookie、多标签页轮换、服务端清会话）时：
+    // 重新签发匿名 CSRF 并自动重试一次，避免用户登录/提交被卡死。
+    if (response.status === 403 && unsafe && !options.csrfRetried) {
+      const payload = (await response
+        .clone()
+        .json()
+        .catch(() => null)) as ApiErrorEnvelope | null
+      if (payload?.error?.code === 'AUTH_CSRF_INVALID') {
+        const token = await refreshCsrfToken()
+        if (token) {
+          return request<T>(path, { ...options, csrfRetried: true })
+        }
+      }
+    }
+    return handleErrorResponse(response, options)
+  }
 
   const payload = await parseJson(response)
   if (payload && typeof payload === 'object' && 'data' in payload) {

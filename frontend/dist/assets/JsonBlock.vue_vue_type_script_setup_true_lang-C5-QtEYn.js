@@ -1,1 +1,0 @@
-import{d as c}from"./format-DCLW5ONc.js";import{d as p,o,c as s,t as a,x as r}from"./index-CfOIf_R1.js";const l={key:0,class:"json-block"},m={key:1,class:"text-muted"},x=p({__name:"JsonBlock",props:{value:{},emptyText:{}},setup(e){const n=e,t=r(()=>c(n.value));return(u,_)=>t.value?(o(),s("pre",l,a(t.value),1)):(o(),s("span",m,a(e.emptyText??"无数据"),1))}});export{x as _};

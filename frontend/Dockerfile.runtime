@@ -14,7 +14,9 @@ FROM nginx:alpine
 # 静态产物（Vite 默认输出 dist/）
 COPY dist /usr/share/nginx/html
 
-# 删除默认站点；实际站点由挂载的 /etc/nginx/nginx.conf 提供
-RUN rm -f /etc/nginx/conf.d/default.conf
+# 统一公开静态文件的权限，避免宿主机 umask 导致 nginx worker 无法读取。
+# 删除默认站点；实际站点由挂载的 /etc/nginx/nginx.conf 提供。
+RUN chmod -R u=rwX,go=rX /usr/share/nginx/html \
+    && rm -f /etc/nginx/conf.d/default.conf
 
 EXPOSE 80

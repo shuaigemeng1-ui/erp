@@ -53,17 +53,12 @@ async function submit(): Promise<void> {
   }
 }
 
-function goTenantLogin(): void {
-  void router.push('/login')
-}
 </script>
 
 <template>
   <div class="auth-page">
     <div class="auth-card">
-      <div class="auth-badge">平台管理</div>
       <h1 class="auth-title">ERP 平台控制台</h1>
-      <p class="auth-subtitle">平台运营与租户管理（独立入口）</p>
       <el-form ref="formRef" :model="form" :rules="rules" label-position="top" @submit.prevent="submit">
         <el-form-item label="邮箱" prop="email">
           <el-input
@@ -88,22 +83,6 @@ function goTenantLogin(): void {
           登录平台控制台
         </el-button>
       </el-form>
-      <div class="auth-footer">
-        <el-button text type="primary" @click="goTenantLogin">返回租户登录</el-button>
-      </div>
     </div>
   </div>
 </template>
-
-<style scoped>
-.auth-badge {
-  display: inline-block;
-  padding: 2px 10px;
-  margin-bottom: 12px;
-  border-radius: 10px;
-  background: var(--el-color-primary-light-9);
-  color: var(--el-color-primary);
-  font-size: 12px;
-  letter-spacing: 1px;
-}
-</style>

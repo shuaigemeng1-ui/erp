@@ -15,7 +15,8 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import BigInteger, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import BigInteger, Boolean, Index, Integer, Numeric, String, Text, UniqueConstraint, text
+from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import (
@@ -69,6 +70,27 @@ class Product(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
         comment="基础售价",
     )
     description: Mapped[str | None] = mapped_column(Text, nullable=True, comment="商品描述")
+    name_en: Mapped[str | None] = mapped_column(String(200), nullable=True, comment="商品英文名称")
+    preferred_supplier_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="首选供应商ID")
+    purchaser_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="采购员租户成员ID")
+    developer_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="业务开发员租户成员ID")
+    inquiry_buyer_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="采购询价员租户成员ID")
+    hs_code: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="海关编码")
+    material_zh: Mapped[str | None] = mapped_column(String(500), nullable=True, comment="中文材质")
+    material_en: Mapped[str | None] = mapped_column(String(500), nullable=True, comment="英文材质")
+    usage: Mapped[str | None] = mapped_column(String(1000), nullable=True, comment="商品用途")
+    feature_tags: Mapped[list[str] | None] = mapped_column(Payload, nullable=True, comment="商品特性标签列表")
+    packaging_name: Mapped[str | None] = mapped_column(String(100), nullable=True, comment="包材名称")
+    length_cm: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True, comment="商品长度（厘米）")
+    width_cm: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True, comment="商品宽度（厘米）")
+    height_cm: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True, comment="商品高度（厘米）")
+    package_length_cm: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True, comment="包装后长度（厘米）")
+    package_width_cm: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True, comment="包装后宽度（厘米）")
+    package_height_cm: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True, comment="包装后高度（厘米）")
+    sales_type: Mapped[str] = mapped_column(String(16), nullable=False, default="normal", server_default="normal", comment="销售类型：普通、变参、捆绑、组装")
+    remark: Mapped[str | None] = mapped_column(Text, nullable=True, comment="商品备注")
+    features: Mapped[str | None] = mapped_column(Text, nullable=True, comment="产品特点")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"), comment="商品编辑版本号")
 
 
 class ProductSku(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
@@ -108,6 +130,12 @@ class ProductSku(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
         server_default="active",
         comment="SKU 状态：active 启用 / archived 已归档",
     )
+    image_url: Mapped[str | None] = mapped_column(String(500), nullable=True, comment="SKU 独立图片地址")
+    guidance_cost: Mapped[Decimal | None] = mapped_column(Money, nullable=True, comment="SKU 指导成本")
+    average_cost: Mapped[Decimal | None] = mapped_column(Money, nullable=True, comment="SKU 平均成本（本轮人工维护）")
+    weight_g: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True, comment="SKU 重量（克）")
+    sales_status: Mapped[str] = mapped_column(String(16), nullable=False, default="on_sale", server_default="on_sale", comment="SKU 销售状态：在售、停售、试卖、清仓")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"), comment="SKU 编辑版本号")
 
 
 class ProductImage(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
@@ -136,4 +164,50 @@ class ProductImage(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
     )
 
 
-__all__ = ["Product", "ProductSku", "ProductImage"]
+class SkuIdentifier(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
+    """SKU 主编号和别名共享的租户内唯一标识空间。"""
+
+    __tablename__ = "sku_identifiers"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "normalized_identifier", name="uq_sku_identifiers_tenant_normalized"),
+        Index("ix_sku_identifiers_tenant_sku", "tenant_id", "sku_id"),
+        table_options("SKU编号与别名表"),
+    )
+    sku_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="所属SKU ID")
+    identifier: Mapped[str] = mapped_column(String(128), nullable=False, comment="SKU编号或别名原文")
+    normalized_identifier: Mapped[str] = mapped_column(
+        String(384).with_variant(mysql.VARCHAR(384, collation="utf8mb4_bin"), "mysql"),
+        nullable=False, comment="去首尾空白并统一大小写后的标识",
+    )
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, comment="标识类型：主编号或别名")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("1"), comment="是否启用该标识")
+
+
+class Supplier(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
+    """供应商简档，仅用于商品首选供应商维护。"""
+
+    __tablename__ = "suppliers"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "code", name="uq_suppliers_tenant_code"),
+        table_options("供应商简档表"),
+    )
+    code: Mapped[str] = mapped_column(String(64), nullable=False, comment="供应商编码（租户内唯一）")
+    name: Mapped[str] = mapped_column(String(200), nullable=False, comment="供应商名称")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active", comment="供应商状态：启用或停用")
+
+
+class CatalogOption(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
+    """租户商品字典：品牌、分类、标签和包材。"""
+
+    __tablename__ = "catalog_options"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "kind", "name", name="uq_catalog_options_tenant_kind_name"),
+        table_options("商品基础字典表"),
+    )
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, comment="字典种类：品牌、分类、标签、包材")
+    name: Mapped[str] = mapped_column(String(100), nullable=False, comment="字典选项名称")
+    parent_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="父级分类选项ID")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active", comment="选项状态：启用或停用")
+
+
+__all__ = ["Product", "ProductSku", "ProductImage", "SkuIdentifier", "Supplier", "CatalogOption"]

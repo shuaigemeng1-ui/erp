@@ -27,7 +27,7 @@ from tests.unit.test_identity import _build_sqlite_sessions, _seed_tenant, _sqli
 @pytest.fixture
 def data(monkeypatch):
     cf, tf, ce, te = _build_sqlite_sessions()
-    _sqlite_metadata(TenantBase.metadata, ('products', 'product_skus', 'product_images', 'stores')).create_all(te)
+    _sqlite_metadata(TenantBase.metadata, ('products', 'product_skus', 'product_images', 'sku_identifiers', 'suppliers', 'catalog_options', 'stores')).create_all(te)
     center, db = cf(), tf()
     roles = _seed_tenant(center, db)
     tenant = repository.get_tenant(center, 1)

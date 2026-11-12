@@ -200,6 +200,8 @@ class ParsedOrderLine:
     unit_price: Decimal
     discount_amount: Decimal = Decimal("0")
     item_status: str = ""
+    seller_sku: str = ""
+    platform_sku_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,7 +232,7 @@ def _merge_lines(lines: list[ParsedOrderLine]) -> tuple[ParsedOrderLine, ...]:
     """同一平台商品 + 规格出现多行时合并数量，保证明细防重键唯一。"""
     merged: dict[tuple[str, str], ParsedOrderLine] = {}
     for line in lines:
-        key = (line.external_item_id, line.external_sku_id)
+        key = (line.external_item_id, line.platform_sku_id or line.external_sku_id)
         existing = merged.get(key)
         if existing is None:
             merged[key] = line
@@ -243,6 +245,8 @@ def _merge_lines(lines: list[ParsedOrderLine]) -> tuple[ParsedOrderLine, ...]:
             unit_price=line.unit_price if line.unit_price else existing.unit_price,
             discount_amount=existing.discount_amount + line.discount_amount,
             item_status=line.item_status or existing.item_status,
+            seller_sku=existing.seller_sku or line.seller_sku,
+            platform_sku_id=existing.platform_sku_id if existing.platform_sku_id == line.platform_sku_id else "",
         )
     return tuple(merged.values())
 
@@ -276,6 +280,8 @@ def _parse_shopee_lines(payload: dict) -> list[ParsedOrderLine]:
                 unit_price=unit_price,
                 discount_amount=unit_discount * quantity_value,
                 item_status=_text(item.get("item_status"), 32),
+                seller_sku=external_sku_id,
+                platform_sku_id=_text(item.get("model_id"), 64),
             )
         )
     return lines
@@ -318,7 +324,7 @@ def _parse_tiktok_lines(payload: dict) -> list[ParsedOrderLine]:
             item.get("product_id") or item.get("item_id") or item.get("sku_id"), 64
         )
         external_sku_id = _text(
-            item.get("seller_sku") or item.get("sku_id") or item.get("id"), 64
+            item.get("seller_sku") or item.get("sku_id") or item.get("id"), 128
         )
         quantity = item.get("quantity", 1)
         try:
@@ -338,6 +344,8 @@ def _parse_tiktok_lines(payload: dict) -> list[ParsedOrderLine]:
                 unit_price=unit_price,
                 discount_amount=unit_discount * quantity_value,
                 item_status=_text(item.get("display_status"), 32),
+                seller_sku=_text(item.get("seller_sku"), 128),
+                platform_sku_id=_text(item.get("sku_id"), 64),
             )
         )
     return lines

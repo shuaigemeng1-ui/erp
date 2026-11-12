@@ -442,3 +442,11 @@ bash deploy/scripts/git_update.sh --skip-migrate
 * 发布打 tag（如 `v1.0.0`），回滚用 `git checkout <tag>` + `git_update.sh`；
 * 仓库当前为 public，提交前确认没有真实密码/密钥。
 
+
+## 14. SPU 商品图片持久化
+
+本轮新增 API 图片卷 `catalog_media_data:/app/var/catalog-media`，具体卷名默认为 `ventasync_catalog_media_data`。API 以 UID/GID 10001 读写；本地可通过 `CATALOG_MEDIA_DIR` 指定目录，默认 `backend/var/catalog-media`（在 backend 目录启动时）。
+
+`backup.sh --all-tenants` 在 API 已挂载图片卷时同时生成 `catalog_media_*.tar.gz` 和 SHA-256；API 容器停止时仍可通过 Docker 复制卷内容。首次升级前没有图片卷时明确跳过。中心库仍须另行单库备份。图片归档须配合同一批数据库恢复到图片卷，并校正 UID/GID 10001。备份脚本改动仅完成语法检查，本轮未在生产执行恢复演练。
+
+商品中心新增 `tenant_0011`，应先备份、停止应用写入、运行在线迁移，再更新应用；不能直接启动新代码访问旧库。详情和本轮验收边界见 `docs/acceptance.md`。

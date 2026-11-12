@@ -199,7 +199,7 @@ class ChannelListing(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
         String(64), nullable=False, comment="平台商品ID（Shopee item_id）"
     )
     external_sku_id: Mapped[str] = mapped_column(
-        String(64),
+        String(128),
         nullable=False,
         default="",
         server_default=text("''"),

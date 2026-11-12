@@ -30,6 +30,9 @@ def record(
     payload: dict[str, Any] | None = None,
     request_id: str = "",
     ip: str = "",
+    product_id: int | None = None,
+    sku_id: int | None = None,
+    actor_name_snapshot: str | None = None,
 ) -> int:
     """写一条租户审计日志，返回日志 ID。
 
@@ -45,6 +48,7 @@ def record(
         payload=payload,
         ip=ip or "",
         request_id=request_id or _safe_request_id(),
+        product_id=product_id, sku_id=sku_id, actor_name_snapshot=actor_name_snapshot,
     )
     db.add(row)
     db.flush()
@@ -58,7 +62,7 @@ def _safe_request_id() -> str:
         return ""
 
 
-def audit_payload(row: AuditLog) -> dict[str, Any]:
+def audit_payload(row: AuditLog, *, include_cost: bool = False) -> dict[str, Any]:
     """审计日志响应结构（ID 一律字符串、时间 UTC ISO）。"""
     from app.modules.identity.service import iso_utc
 
@@ -70,7 +74,7 @@ def audit_payload(row: AuditLog) -> dict[str, Any]:
         "resource_type": row.resource_type,
         "resource_id": str(row.resource_id) if row.resource_id else None,
         "summary": row.summary,
-        "payload": row.payload,
+        "payload": visible_payload(row.payload, include_cost=include_cost),
         "ip": row.ip,
         "request_id": row.request_id,
         "created_at": iso_utc(row.created_at),
@@ -78,7 +82,7 @@ def audit_payload(row: AuditLog) -> dict[str, Any]:
 
 
 def list_logs(
-    db: Session, *, tenant_id: int, page: int, page_size: int, action: str = ""
+    db: Session, *, tenant_id: int, page: int, page_size: int, action: str = "", include_cost: bool = False,
 ) -> dict[str, Any]:
     """租户审计分页查询（列表与总数使用同一过滤条件）。"""
     stmt = select(AuditLog).where(AuditLog.tenant_id == tenant_id)
@@ -93,8 +97,18 @@ def list_logs(
         .all()
     )
     return {
-        "items": [audit_payload(row) for row in rows],
+        "items": [audit_payload(row, include_cost=include_cost) for row in rows],
         "total": total,
         "page": page,
         "page_size": page_size,
     }
+
+
+def visible_payload(payload: dict | None, *, include_cost: bool) -> dict | None:
+    """商品成本差异在所有审计出口应用同一权限过滤。"""
+    if not payload or include_cost:
+        return payload
+    result = dict(payload)
+    if "changes" in result:
+        result["changes"] = [change for change in result["changes"] if not change.get("sensitive")]
+    return result

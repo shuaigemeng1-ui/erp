@@ -31,6 +31,7 @@ class AuditLog(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
     __table_args__ = (
         Index("ix_audit_logs_tenant_created", "tenant_id", "created_at"),
         Index("ix_audit_logs_tenant_action", "tenant_id", "action"),
+        Index("ix_audit_logs_tenant_product_created", "tenant_id", "product_id", "created_at", "id"),
         table_options("租户审计日志表"),
     )
 
@@ -39,6 +40,9 @@ class AuditLog(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
         nullable=True,
         comment="操作人用户ID（自动化任务为空）",
     )
+    product_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="关联SPU商品ID")
+    sku_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="关联SKU ID")
+    actor_name_snapshot: Mapped[str | None] = mapped_column(String(200), nullable=True, comment="操作人姓名历史快照")
     action: Mapped[str] = mapped_column(
         String(128),
         nullable=False,

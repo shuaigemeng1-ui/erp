@@ -287,7 +287,8 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     Accept: 'application/json',
     ...options.headers,
   }
-  if (options.body !== undefined) headers['Content-Type'] = 'application/json'
+  const multipart = options.body instanceof FormData
+  if (options.body !== undefined && !multipart) headers['Content-Type'] = 'application/json'
   if (unsafe) {
     const token = await ensureCsrfToken()
     if (token) headers['X-CSRF-Token'] = token
@@ -303,7 +304,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       headers,
       // 同源 Cookie 会话认证
       credentials: 'same-origin',
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      body: options.body === undefined ? undefined : multipart ? options.body as FormData : JSON.stringify(options.body),
       signal,
       cache: 'no-store',
     })

@@ -225,12 +225,40 @@ def run_alembic_offline(ini: Path, extra_args: list[str] | None = None) -> tuple
     return proc.returncode, output
 
 
-CREATE_TABLE_RE = re.compile(
-    # 表体使用 tempered 模式，避免把 alembic_version（无 ENGINE）与下一条建表一起吞掉
-    r"CREATE TABLE (\w+) \(((?:(?!CREATE TABLE).)*?)\)\s*"
-    r"((?:ENGINE=|COMMENT=|CHARSET=|COLLATE\b|AUTO_INCREMENT\b)[^;]*);",
-    re.DOTALL,
-)
+CREATE_TABLE_RE = re.compile(r"CREATE TABLE `?(\w+)`?\s*\(", re.IGNORECASE)
+
+
+def _create_table_parts(sql: str):
+    """按括号与引号边界解析表体，不能将列级 COLLATE 当作表选项。"""
+    for match in CREATE_TABLE_RE.finditer(sql):
+        depth, quote, body_end, index = 1, None, None, match.end()
+        while index < len(sql):
+            char = sql[index]
+            if quote:
+                if char == "\\":
+                    index += 2
+                    continue
+                if char == quote:
+                    if index + 1 < len(sql) and sql[index + 1] == quote:
+                        index += 2
+                        continue
+                    quote = None
+            elif char in {"'", '"', "`"}:
+                quote = char
+            elif body_end is None:
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0:
+                        body_end = index
+            elif char == ";":
+                options = sql[body_end + 1:index].strip()
+                # Alembic 框架版本表没有业务表选项，不纳入中文注释基线。
+                if re.match(r"(?:ENGINE=|COMMENT=|CHARSET=|COLLATE\b|AUTO_INCREMENT\b)", options):
+                    yield match.group(1), sql[match.end():body_end], options
+                break
+            index += 1
 CONSTRAINT_PREFIXES = (
     "CONSTRAINT ",
     "PRIMARY KEY",
@@ -246,8 +274,7 @@ CONSTRAINT_PREFIXES = (
 def parse_sql_tables(sql: str) -> dict[str, dict[str, object]]:
     """解析 CREATE 以及后续 ADD/MODIFY/DROP，检查最终模式，防止 MODIFY 清除注释。"""
     tables: dict[str, dict[str, object]] = {}
-    for match in CREATE_TABLE_RE.finditer(sql):
-        name, body, options = match.group(1), match.group(2), match.group(3)
+    for name, body, options in _create_table_parts(sql):
         comment_match = re.search(r"COMMENT='([^']*)'", options)
         columns: dict[str, str] = {}
         for raw_line in body.splitlines():

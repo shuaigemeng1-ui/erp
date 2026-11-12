@@ -73,15 +73,36 @@
 
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
-| GET | `/tenants/{tenant_id}/products?page&q&status` | `catalog.product.read` | 列表；无 `catalog.cost.read` 时过滤成本字段 |
-| POST | `/tenants/{tenant_id}/products` | `catalog.product.create` | `{code, name, brand?, category?, cost_amount?, base_price, description?, skus: [{sku_code, name, price, cost_amount?, specs?}], images?: [url]}` |
-| GET | `/tenants/{tenant_id}/products/{product_id}` | `catalog.product.read` | 详情（含 SKU、图片、映射摘要） |
-| PATCH | `/tenants/{tenant_id}/products/{product_id}` | `catalog.product.update` | 局部更新；成本字段需 `catalog.cost.read` 才能读写 |
+| GET | `/tenants/{tenant_id}/products?page&q&status` | `catalog.product.read` + 全部范围 | SPU列表；支持编号/中英文名/SKU/别名搜索，以及销售状态/类型、品牌、分类、人员、供应商和标签筛选 |
+| POST | `/tenants/{tenant_id}/products` | `catalog.product.create` + 全部范围 | 创建SPU和至少一个SKU；必填code/name/skus，name为中文名；SKU name可由SPU名补齐，旧售价字段默认0 |
+| GET | `/tenants/{tenant_id}/products/{product_id}` | `catalog.product.read` + 全部范围 | SPU资料、SKU销售信息、别名、图片、成本/重量/状态汇总 |
+| PATCH | `/tenants/{tenant_id}/products/{product_id}` | `catalog.product.update` + 全部范围 | 局部更新；支持version与嵌套SKU更新；三类SKU成本需catalog.cost.read；SPU cost_amount直接修改返回422 |
 | POST | `/tenants/{tenant_id}/products/{product_id}/archive` | `catalog.product.update` | 归档（不物理删除） |
+| GET | `/tenants/{tenant_id}/products/options` | `catalog.product.read` + 全部范围 | 返回本租户供应商、人员、品牌/分类/标签/包材选项；人员ID为租户成员ID |
+| POST | `/tenants/{tenant_id}/products/options` | `catalog.product.update` + 全部范围 | `{kind, name, parent_id?}`；kind为brand/category/tag/packaging；父级仅分类可用 |
+| POST | `/tenants/{tenant_id}/products/suppliers` | `catalog.product.update` + 全部范围 | `{code,name}`，创建供应商简档 |
+| POST | `/tenants/{tenant_id}/products/media` | `catalog.product.create`或`catalog.product.update` + 全部范围 | multipart file上传商品图片，PNG/JPEG/WebP，最大10MB；返回{id,url} |
+| GET | `/tenants/{tenant_id}/products/media/{file_id}` | `catalog.product.read` + 全部范围 | 鉴权读取本租户图片；私有、不缓存 |
+| POST | `/tenants/{tenant_id}/products/{product_id}/skus` | `catalog.product.update` + 全部范围 | 创建SKU并受套餐额度限制；{sku_code,aliases?,specs?,cost_amount?,guidance_cost?,average_cost?,weight_g?,sales_status?,image_url?} |
+| PATCH | `/tenants/{tenant_id}/products/{product_id}/skus/{sku_id}` | `catalog.product.update` + 全部范围 | 修改SKU/规格/状态/成本和完整有效别名集合；可带SKU version，成本另需catalog.cost.read |
+| GET | `/tenants/{tenant_id}/products/{product_id}/logs` | `catalog.product.read` + 全部范围 | 分页返回{id,summary,actor_name,created_at,changes:[{entity,sku_id,field,label,old,new}]}，成本差异按权限过滤 |
 | GET | `/tenants/{tenant_id}/inventory?page&sku_id&stock_place_id&q` | `inventory.read` | 余额列表（含商品名、SKU 编码、可用/占用数量） |
 | POST | `/tenants/{tenant_id}/inventory/adjustments` | `inventory.adjust` | `{sku_id, stock_place_id, quantity_change, note}`；产生负库存返回 409 |
 | GET | `/tenants/{tenant_id}/inventory/movements?page&sku_id` | `inventory.read` | 库存流水 |
 | GET | `/tenants/{tenant_id}/inventory/stock-places` | `inventory.read` | 库存地点列表 |
+
+
+### SPU—SKU 商品中心字段与规则
+
+- SPU基本信息：`code/name/name_en`、`preferred_supplier_id`、`purchaser_id/developer_id/inquiry_buyer_id`、`hs_code/material_zh/material_en/usage`、`brand/category/feature_tags/packaging_name`、商品和包装后的`length_cm/width_cm/height_cm`、`sales_type/remark/features`、图片与系统时间。包装后尺寸分别为`package_length_cm/package_width_cm/package_height_cm`。
+- `sales_type`固定为`normal/variation/bundle/assembly`；捆绑/组装本轮为分类标记。人员必须是当前租户有效成员，供应商必须属于本租户且有效。
+- SKU的`specs`为字符串键值JSON，`aliases`写入为字符串数组；响应别名为`[{id,identifier,is_active}]`，含停用历史。别名与所有SKU主编号共用租户内唯一空间。编号变更会将旧编号保留为别名，别名停用不删除历史映射。
+- SKU支持`image_url/cost_amount/guidance_cost/average_cost/weight_g/sales_status/version`。销售状态为`on_sale/discontinued/trial/clearance`；旧`status=active/archived`只表示归档生命周期。
+- SPU的`sales_status`按未归档SKU汇总：一致则原状态；混合依次优先`partial_clearance`、`partial_discontinued`，在售+试卖为`on_sale`。正常SPU至少一个未归档SKU。
+- `weight_summary`及`cost_summary.{current,guidance,average}`返回`{state,value,has_missing}`；state为`uniform/multiple/missing/partial_missing`。只有uniform有统一value，部分缺失不能当作所有SKU相同。金额/重量JSON值为字符串。
+- 无成本权限时不返回`cost_summary`和SKU三类成本；商品日志与全局审计同样隐藏敏感成本差异。SPU成本汇总只读，SKU三类成本本轮人工维护。
+- `version`用于并发修改检查，不一致返回409；无实际字段变化不增加版本和操作日志。业务数据与字段旧值/新值日志同事务提交。
+- SKU别名匹配优先使用已确认平台映射，再按主编号/有效别名精确识别；不通过标题或跨商品规格猜测。平台SKU ID与seller_sku分别保留，订单明细保存platform_sku_id；原生ID后补全时先匹配既有明细，避免重复扣库存。
 
 ### 店铺与平台商品映射
 

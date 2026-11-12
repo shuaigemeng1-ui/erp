@@ -164,6 +164,7 @@ class OrderItem(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
             name="uq_order_items_tenant_order_external",
         ),
         Index("ix_order_items_tenant_order", "tenant_id", "order_id"),
+        Index("ix_order_items_tenant_order_platform_sku", "tenant_id", "order_id", "external_item_id", "platform_sku_id"),
         table_options("订单明细表"),
     )
 
@@ -173,6 +174,9 @@ class OrderItem(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
     )
     external_sku_id: Mapped[str] = mapped_column(
         String(128), nullable=False, default="", comment="平台规格/卖家SKU编码"
+    )
+    platform_sku_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="", comment="平台原生SKU ID（用于订单明细稳定识别）"
     )
     sku_id: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, comment="本地SKU ID（未映射时为空）"

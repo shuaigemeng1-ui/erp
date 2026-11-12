@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import select, text, update
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -183,6 +183,7 @@ class SkuCandidate:
     product_id: int
     sku_code: str
     specs: Mapping[str, str] = field(default_factory=dict)
+    aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1369,10 +1370,10 @@ def _push_tiktok_stock(
             raw = listing.raw if isinstance(listing.raw, Mapping) else {}
             raw_sku = raw.get("sku") if isinstance(raw.get("sku"), Mapping) else {}
             api_sku_id = normalize_external_id(
-                raw_sku.get("id") or raw_sku.get("sku_id") or listing.external_sku_id
+                raw_sku.get("id") or raw_sku.get("sku_id")
             )
             if not api_sku_id:
-                continue
+                raise AppError(ErrorCode.SKU_MAPPING_MISSING, "TikTok 商品缺少平台 SKU ID，请重新同步商品")
             client.update_inventory(
                 listing.external_item_id,
                 [{"id": api_sku_id, "inventory": [{"warehouse_id": warehouse_id, "quantity": clamp_stock_quantity(stock)}]}],
@@ -1476,49 +1477,27 @@ def match_listing_to_skus(
     listing_specs: Mapping[str, str] | None,
     candidates: Sequence[SkuCandidate],
 ) -> SkuMatch:
-    """SKU 自动匹配：只接受唯一、明确的结果。
+    """商家编码精确匹配主编号或别名；规格不用于全租户自动猜测。"""
+    from app.modules.catalog.identifiers import normalize_identifier
 
-    规则（见 plan.txt §4「SKU 自动匹配只接受唯一、明确结果」）：
-
-    1. 平台 SKU 编码与本地 ``sku_code`` 精确相等，命中 1 条 → mapped；多条 → ambiguous；
-    2. 无平台 SKU 编码时，规格键值完全相等且命中 1 条 → mapped；多条 → ambiguous；
-    3. 无命中 → pending（进入待处理列表，绝不猜测）。
-    """
-    code = normalize_sku_code(external_sku_id)
+    code = normalize_identifier(external_sku_id)
     if code:
-        code_matches = [item for item in candidates if item.sku_code == code]
+        code_matches = [item for item in candidates if code in {
+            normalize_identifier(value) for value in (item.sku_code, *item.aliases)
+        }]
         if len(code_matches) == 1:
             return SkuMatch(
                 status=LINK_STATUS_MAPPED,
                 sku_id=code_matches[0].sku_id,
                 product_id=code_matches[0].product_id,
-                reason="SKU 编码精确匹配",
+                reason="SKU 编号或别名精确匹配",
             )
         if len(code_matches) > 1:
             return SkuMatch(
                 status=LINK_STATUS_AMBIGUOUS,
                 reason=f"SKU 编码 {code} 命中 {len(code_matches)} 条本地 SKU",
             )
-    specs = normalize_specs(listing_specs)
-    if specs:
-        spec_matches = [
-            item
-            for item in candidates
-            if item.specs and normalize_specs(item.specs) == specs
-        ]
-        if len(spec_matches) == 1:
-            return SkuMatch(
-                status=LINK_STATUS_MAPPED,
-                sku_id=spec_matches[0].sku_id,
-                product_id=spec_matches[0].product_id,
-                reason="规格键值精确匹配",
-            )
-        if len(spec_matches) > 1:
-            return SkuMatch(
-                status=LINK_STATUS_AMBIGUOUS,
-                reason=f"规格键值命中 {len(spec_matches)} 条本地 SKU",
-            )
-    return SkuMatch(status=LINK_STATUS_PENDING, reason="未找到唯一匹配的本地 SKU")
+    return SkuMatch(status=LINK_STATUS_PENDING, reason="未找到唯一编号或别名，需人工映射")
 
 
 def listing_unique_key(
@@ -1733,9 +1712,30 @@ def fetch_remote_listings(
 def _upsert_listing_row(
     db: Session, tenant_id: int, store_id: int, remote: RemoteListing, now: datetime
 ) -> tuple[ChannelListing, bool]:
-    listing = repo.find_listing_by_external(
-        db, tenant_id, store_id, remote.external_item_id, remote.external_sku_id
-    )
+    listing = None
+    raw_sku = remote.raw.get("sku") if isinstance(remote.raw.get("sku"), Mapping) else {}
+    native_id = normalize_external_id(raw_sku.get("id") or raw_sku.get("sku_id"))
+    if remote.raw.get("channel") == CHANNEL_TIKTOK and native_id:
+        # 商家编码可改名；按平台原生 ID 找回旧行，保留原先已确认的本地 SKU 链接。
+        matches = db.execute(select(ChannelListing).where(
+            ChannelListing.tenant_id == tenant_id, ChannelListing.store_id == store_id,
+            ChannelListing.external_item_id == remote.external_item_id,
+            or_(ChannelListing.raw["sku"]["id"].as_string() == native_id,
+                ChannelListing.raw["sku"]["sku_id"].as_string() == native_id),
+        )).scalars().all()
+        if len(matches) > 1:
+            raise AppError(ErrorCode.SKU_MAPPING_NOT_UNIQUE, "平台 SKU 存在重复历史商品行，需人工核对")
+        listing = matches[0] if matches else None
+    if listing is None:
+        listing = repo.find_listing_by_external(
+            db, tenant_id, store_id, remote.external_item_id, remote.external_sku_id
+        )
+        if listing is not None and native_id and remote.raw.get("channel") == CHANNEL_TIKTOK:
+            old_raw = listing.raw if isinstance(listing.raw, Mapping) else {}
+            old_sku = old_raw.get("sku") if isinstance(old_raw.get("sku"), Mapping) else {}
+            previous_native = normalize_external_id(old_sku.get("id") or old_sku.get("sku_id"))
+            if previous_native and previous_native != native_id:
+                raise AppError(ErrorCode.SKU_MAPPING_NOT_UNIQUE, "多个平台 SKU 使用同一商家编码，需先核对平台商品")
     created = listing is None
     if listing is None:
         listing = ChannelListing(
@@ -1756,6 +1756,7 @@ def _upsert_listing_row(
         db.add(listing)
         db.flush()
     else:
+        listing.external_sku_id = remote.external_sku_id
         listing.title = remote.title or listing.title
         listing.price = remote.price if remote.price is not None else listing.price
         listing.currency = remote.currency or listing.currency
@@ -1777,12 +1778,15 @@ def _match_and_save_link(
 ) -> SkuMatch:
     """自动匹配并写映射；人工映射永不被自动覆盖。"""
     existing = repo.get_link_by_listing(db, tenant_id, listing.id)
-    if existing is not None and existing.mapping_source == MAPPING_SOURCE_MANUAL:
+    if existing is not None and (
+        existing.mapping_source == MAPPING_SOURCE_MANUAL
+        or (existing.link_status == LINK_STATUS_MAPPED and existing.sku_id is not None)
+    ):
         return SkuMatch(
             status=existing.link_status,
             sku_id=existing.sku_id,
             product_id=existing.product_id,
-            reason=existing.note or "人工映射，跳过自动匹配",
+            reason=existing.note or "保留已确认映射",
         )
     raw = listing.raw if isinstance(listing.raw, Mapping) else {}
     item_info = raw.get("item") if isinstance(raw.get("item"), Mapping) else None
@@ -1794,8 +1798,10 @@ def _match_and_save_link(
             for key, value in raw["specs"].items()
             if str(key).strip() and str(value).strip()
         }
+    raw_sku = raw.get("sku") if isinstance(raw.get("sku"), Mapping) else {}
+    seller_code = raw_sku.get("seller_sku") if raw.get("channel") == CHANNEL_TIKTOK else listing.external_sku_id
     match = match_listing_to_skus(
-        external_sku_id=listing.external_sku_id,
+        external_sku_id=seller_code,
         listing_specs=listing_specs,
         candidates=candidates,
     )
@@ -1943,7 +1949,9 @@ def _rows_from_text(
         return None
 
 
-def _candidates_from_rows(rows: Sequence[Mapping[str, Any]]) -> list[SkuCandidate]:
+def _candidates_from_rows(
+    rows: Sequence[Mapping[str, Any]], aliases: Mapping[int, tuple[str, ...]] | None = None,
+) -> list[SkuCandidate]:
     candidates: list[SkuCandidate] = []
     for row in rows:
         code = normalize_sku_code(row.get("sku_code"))
@@ -1955,27 +1963,35 @@ def _candidates_from_rows(rows: Sequence[Mapping[str, Any]]) -> list[SkuCandidat
                 product_id=int(row["product_id"]),
                 sku_code=code,
                 specs=normalize_specs(row.get("specs")),
+                aliases=(aliases or {}).get(int(row["id"]), ()),
             )
         )
     return candidates
 
 
 _SKU_CANDIDATES_SQL = (
-    "SELECT id, product_id, sku_code, specs FROM product_skus "
-    "WHERE tenant_id = :tenant_id AND status = 'active'"
+    "SELECT s.id, s.product_id, s.sku_code, s.specs FROM product_skus s "
+    "JOIN products p ON p.id=s.product_id AND p.tenant_id=s.tenant_id "
+    "WHERE s.tenant_id = :tenant_id AND s.status = 'active' AND p.status = 'active'"
 )
 
 
 def load_sku_candidates(db: Session, tenant_id: int) -> list[SkuCandidate]:
     """读取本租户启用 SKU 作为自动匹配候选（catalog 表未就绪时返回空列表）。"""
-    rows = _rows_from_text(db, _SKU_CANDIDATES_SQL, {"tenant_id": tenant_id})
-    return _candidates_from_rows(rows or [])
+    return load_sku_candidates_optional(db, tenant_id) or []
 
 
 def load_sku_candidates_optional(db: Session, tenant_id: int) -> list[SkuCandidate] | None:
     """读取匹配候选；``None`` 表示 catalog 表不可用（此时不得覆盖既有自动映射）。"""
     rows = _rows_from_text(db, _SKU_CANDIDATES_SQL, {"tenant_id": tenant_id})
-    return None if rows is None else _candidates_from_rows(rows)
+    if rows is None:
+        return None
+    from app.modules.catalog.identifiers import list_aliases
+    aliases = list_aliases(db, tenant_id, [int(row["id"]) for row in rows])
+    return _candidates_from_rows(rows, {
+        sku_id: tuple(row["identifier"] for row in values if row["is_active"])
+        for sku_id, values in aliases.items()
+    })
 
 
 def load_sku(db: Session, tenant_id: int, sku_id: int) -> Mapping[str, Any] | None:
@@ -2245,13 +2261,25 @@ def resolve_listings_sku(
     listings = repo.list_store_listings(db, tenant_id, store_id)
     links = repo.list_links_by_listing_ids(db, tenant_id, [row.id for row in listings])
     result: dict[tuple[str, str], tuple[int | None, int | None]] = {}
+    ambiguous: set[tuple[str, str]] = set()
     for listing in listings:
-        key = (listing.external_item_id, listing.external_sku_id)
-        if key not in normalized:
-            continue
         link = links.get(listing.id)
         if link is not None and link.link_status == LINK_STATUS_MAPPED and link.sku_id:
-            result[key] = (int(link.sku_id), int(link.product_id) if link.product_id else None)
+            raw = listing.raw if isinstance(listing.raw, Mapping) else {}
+            raw_sku = raw.get("sku") if isinstance(raw.get("sku"), Mapping) else {}
+            identifiers = {listing.external_sku_id}
+            if raw.get("channel") == CHANNEL_TIKTOK:
+                identifiers.update(str(raw_sku.get(name) or "") for name in ("id", "sku_id", "seller_sku"))
+            for identifier in identifiers:
+                key = (listing.external_item_id, identifier)
+                if key not in normalized or key in ambiguous:
+                    continue
+                value = (int(link.sku_id), int(link.product_id) if link.product_id else None)
+                if key in result and result[key] != value:
+                    result.pop(key)
+                    ambiguous.add(key)
+                else:
+                    result[key] = value
     return result
 
 

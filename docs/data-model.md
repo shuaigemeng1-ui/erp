@@ -1,4 +1,4 @@
-# 数据模型基线（首版）
+# 数据模型基线（含 SPU—SKU 商品中心）
 
 约定：
 
@@ -46,7 +46,7 @@
 
 | 表 | 关键字段 |
 | --- | --- |
-| `audit_logs` | tenant_id, actor_id, action, resource_type, resource_id, summary, payload(JSON), ip, request_id |
+| `audit_logs` | tenant_id, actor_id, actor_name_snapshot, product_id, sku_id, action, resource_type, resource_id, summary, payload(JSON字段旧值/新值), ip, request_id；索引(tenant_id,product_id,created_at,id) |
 | `files` | tenant_id, object_key, filename, content_type, size_bytes, uploaded_by |
 | `idempotency_records` | tenant_id, idempotency_key, endpoint, request_hash, status(processing/completed), response_code, response_body(JSON), expires_at；唯一(tenant_id,idempotency_key) |
 
@@ -54,8 +54,11 @@
 
 | 表 | 关键字段 |
 | --- | --- |
-| `products` | tenant_id, code, name, brand, category, status(active/archived), cost_amount, cost_currency, base_price, description；唯一(tenant_id,code) |
-| `product_skus` | tenant_id, product_id, sku_code, name, specs(JSON), price, cost_amount, status；唯一(tenant_id,sku_code)；索引(product_id) |
+| `products` | tenant_id, code(SPU编号), name(中文名), name_en, preferred_supplier_id, purchaser_id/developer_id/inquiry_buyer_id(租户成员ID), hs_code, material_zh/material_en, usage, brand, category, feature_tags(JSON), packaging_name, length_cm/width_cm/height_cm, package_length_cm/package_width_cm/package_height_cm, sales_type, remark, features, version, status(active/archived), cost_amount(历史保留), cost_currency, base_price, description；唯一(tenant_id,code) |
+| `product_skus` | tenant_id, product_id, sku_code, name, specs(JSON键值对), price, cost_amount(当前成本), guidance_cost, average_cost, weight_g, image_url, sales_status(on_sale/discontinued/trial/clearance), version, status(active/archived)；唯一(tenant_id,sku_code)；索引(product_id) |
+| `sku_identifiers` | tenant_id, sku_id, identifier(原文), normalized_identifier(strip+casefold，utf8mb4_bin), kind(primary/alias), is_active；唯一(tenant_id,normalized_identifier)，主编号和别名共用唯一空间，停用记录保留 |
+| `suppliers` | tenant_id, code, name, status；唯一(tenant_id,code)，商品首选供应商简档 |
+| `catalog_options` | tenant_id, kind(brand/category/tag/packaging), name, parent_id, status；唯一(tenant_id,kind,name)，分类父级同租户服务校验 |
 | `product_images` | tenant_id, product_id, sku_id(可空), url, sort_order |
 | `stock_places` | tenant_id, code, name, is_default, status；唯一(tenant_id,code) |
 | `inventory_balances` | tenant_id, sku_id, stock_place_id, available_quantity, reserved_quantity, version；唯一(tenant_id,sku_id,stock_place_id) |
@@ -67,7 +70,7 @@
 | --- | --- |
 | `stores` | tenant_id, channel, name, external_store_id, region, timezone, store_code, environment, warehouse_id, status(pending_authorization/connected/reauth_required/disconnected), authorized_at, last_synced_at；唯一(tenant_id,channel,external_store_id) |
 | `store_credentials` | tenant_id, store_id(唯一), access_token_cipher, refresh_token_cipher, shop_cipher_cipher, access_token_expires_at, refresh_token_expires_at, status |
-| `channel_listings` | tenant_id, store_id, external_item_id, external_sku_id, title, price, currency, remote_stock, raw(JSON), status(active/inactive/mapping_pending), synced_at；唯一(tenant_id,store_id,external_item_id,external_sku_id) |
+| `channel_listings` | tenant_id, store_id, external_item_id, external_sku_id(VARCHAR128), title, price, currency, remote_stock, raw(JSON), status(active/inactive/mapping_pending), synced_at；唯一(tenant_id,store_id,external_item_id,external_sku_id) |
 | `channel_listing_links` | tenant_id, listing_id(唯一), product_id, sku_id, link_status(mapped/pending/ambiguous/missing), mapping_source(auto/manual), created_by |
 
 ### 订单、库存影响与任务（sales / tasks）
@@ -75,7 +78,7 @@
 | 表 | 关键字段 |
 | --- | --- |
 | `orders` | tenant_id, store_id, channel, external_order_no, status(normalized), platform_status, currency, total_amount, buyer_name, placed_at, raw_id, abnormal_reason；唯一(tenant_id,store_id,external_order_no) |
-| `order_items` | tenant_id, order_id, external_item_id, external_sku_id, sku_id(可空), quantity, unit_price, discount_amount, item_status, mapping_status；索引(order_id) |
+| `order_items` | tenant_id, order_id, external_item_id, external_sku_id(历史卖家编码), platform_sku_id(原生平台SKU ID), sku_id(可空), quantity, unit_price, discount_amount, item_status, mapping_status；索引(order_id) |
 | `order_status_history` | tenant_id, order_id, from_status, to_status, platform_status, source, changed_at |
 | `platform_order_raw` | tenant_id, channel, store_id, external_order_no, payload(JSON), fetched_at；索引(tenant_id,store_id,external_order_no) |
 | `order_stock_effects` | tenant_id, order_id, order_item_id, sku_id, stock_place_id, applied_quantity, target_quantity, status(pending/applied/skipped/failed), last_task_id；唯一(tenant_id,order_item_id,stock_place_id) |
@@ -107,7 +110,19 @@
 | 租户库 | `alembic/tenant/versions/0008_tenant_task_schedule_permission.py` | tenant_0008 | 仅为系统所有者和管理员补齐定时任务管理权限。无外键、无新增业务表。 |
 | 租户库 | `alembic/tenant/versions/0009_tenant_order_sync_checkpoints.py` | tenant_0009 | 订单同步检查点按店铺、渠道、环境隔离；不使用外键。 |
 | 租户库 | `alembic/tenant/versions/0010_tenant_restore_store_code_comment.py` | tenant_0010 | 修复旧 MODIFY 丢失的店铺编码中文注释，不使用外键。 |
+| 租户库 | `alembic/tenant/versions/0011_tenant_spu_sku_catalog.py` | tenant_0011 | SPU资料、SKU成本重量与状态、统一编号别名、供应商、商品字典、字段操作日志及平台SKU编码扩容与订单原生SKU标识。 |
 
-模型业务表：中心库 15 张、租户库 29 张（均不计 Alembic 版本表）。当前末端为中心库 `center_0006`、租户库 `tenant_0010`。
+模型业务表：中心库 15 张、租户库 32 张（均不计 Alembic 版本表），完整版本图共 17 个迁移文件。当前末端为中心库 `center_0006`、租户库 `tenant_0011`。
 
 `tenant_0008` 仅补授系统 owner/admin 的 `task.schedule.manage`，不扩张普通角色。`tenant_0010` 修复旧 MODIFY 丢失的 store_code 中文注释，适用于现有数据库的增量升级。
+
+## SPU / SKU 事实来源与升级约束
+
+- 主商品 `code/name` 分别作为 SPU 编号/中文名；现有商品、SKU、库存与订单关联主键保持。
+- SPU 成本和重量由未归档 SKU 各字段独立汇总；停售 SKU 仍参与。所有值一致显示数值，不同值显示多个价格/重量；缺失与零分别处理，不计算 SKU 间平均值。
+- SKU 三类成本本轮人工维护，币种使用所属 SPU 的 `cost_currency`；SPU 历史 `cost_amount` 不再是新增业务事实来源。
+- SPU 销售状态全部一致时原样显示，否则优先 `partial_clearance`，再 `partial_discontinued`，在售+试卖归为 `on_sale`。归档生命周期状态与销售状态分开。
+- `tenant_0011` 在 DDL 前预检历史 SKU 编号标准化冲突；在线迁移按 Python `strip().casefold()` 登记唯一主编号，不能静默跳过冲突。离线 SQL 用于结构审阅；非 ASCII 历史编号回填应执行在线 Alembic 迁移。
+- 历史 SKU 当前成本为空且主商品有成本时才回填；指导成本、平均成本、重量没有可靠历史值时保持空。新增销售类型默认 normal，旧有效 SKU 为 on_sale，归档 SKU 为 discontinued 并保留归档状态。
+- 图片使用现有 `files` 元数据和持久化文件目录，商品图与 SKU 图分别归属；API 验证租户及图片读取权限。
+- 任何已支持的商品修改入口由同一服务写字段差异日志，业务数据、版本和日志同事务提交；旧日志没有旧值时不补造差异。

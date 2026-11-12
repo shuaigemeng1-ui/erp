@@ -219,6 +219,8 @@ services:
       - --forwarded-allow-ips
       - "*"
     environment: *app-env
+    volumes:
+      - catalog_media_data:/app/var/catalog-media
     networks:
       - edge
       - backend
@@ -334,6 +336,8 @@ services:
     restart: "no"
 
 volumes:
+  catalog_media_data:
+    name: ${COMPOSE_PROJECT_NAME:-ventasync}_catalog_media_data
   mysql_data:
     name: ${COMPOSE_PROJECT_NAME:-ventasync}_mysql_data
   redis_queue_data:

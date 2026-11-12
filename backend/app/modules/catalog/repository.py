@@ -8,11 +8,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import json
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, func, or_, select, case
 from sqlalchemy.orm import Session, load_only
 
-from app.modules.catalog.models_tenant import Product, ProductImage, ProductSku
+from app.modules.catalog.models_tenant import Product, ProductImage, ProductSku, SkuIdentifier
 
 # 无成本权限时只加载下列列；成本列既不查询也不进入 ORM 对象
 _PRODUCT_BASE_COLUMNS = (
@@ -50,7 +51,8 @@ _SEARCH_LIMIT = 500
 def _product_stmt(include_cost: bool) -> Select[tuple[Product]]:
     stmt = select(Product)
     if not include_cost:
-        stmt = stmt.options(load_only(*_PRODUCT_BASE_COLUMNS))
+        stmt = stmt.options(load_only(*(getattr(Product, c.name) for c in Product.__table__.columns
+                                      if c.name not in {"cost_amount", "cost_currency"})))
     return stmt
 
 
@@ -63,6 +65,7 @@ def list_products(
     q: str | None = None,
     status: str | None = None,
     include_cost: bool = True,
+    filters: dict | None = None,
 ) -> tuple[list[Product], int]:
     """分页查询商品列表，返回 ``(商品列表, 总条数)``。"""
     conditions = [Product.tenant_id == tenant_id]
@@ -71,9 +74,29 @@ def list_products(
     keyword = (q or "").strip()
     if keyword:
         like = f"%{keyword}%"
-        conditions.append(
-            or_(Product.code.like(like), Product.name.like(like), Product.brand.like(like))
+        matching_skus = select(ProductSku.product_id).where(
+            ProductSku.tenant_id == tenant_id,
+            or_(ProductSku.sku_code.like(like), ProductSku.id.in_(
+                select(SkuIdentifier.sku_id).where(SkuIdentifier.tenant_id == tenant_id,
+                    SkuIdentifier.is_active.is_(True), SkuIdentifier.identifier.like(like))))
         )
+        conditions.append(
+            or_(Product.code.like(like), Product.name.like(like), Product.name_en.like(like),
+                Product.brand.like(like), Product.id.in_(matching_skus))
+        )
+    for key, value in (filters or {}).items():
+        if value is None or value == "":
+            continue
+        if key == "sales_status":
+            conditions.append(sales_status_expression(tenant_id) == value)
+        elif key == "tag":
+            if db.get_bind().dialect.name == "sqlite":
+                tags = func.json_each(Product.feature_tags).table_valued("value")
+                conditions.append(select(tags.c.value).where(tags.c.value == value).exists())
+            else:
+                conditions.append(func.json_contains(Product.feature_tags, json.dumps(value, ensure_ascii=False)) == 1)
+        elif key in {"sales_type", "brand", "category", "preferred_supplier_id", "purchaser_id", "developer_id", "inquiry_buyer_id"}:
+            conditions.append(getattr(Product, key) == value)
     total = int(
         db.execute(select(func.count()).select_from(Product).where(*conditions)).scalar_one()
     )
@@ -108,7 +131,8 @@ def list_skus(
         ProductSku.tenant_id == tenant_id, ProductSku.product_id == product_id
     )
     if not include_cost:
-        stmt = stmt.options(load_only(*_SKU_BASE_COLUMNS))
+        stmt = stmt.options(load_only(*(getattr(ProductSku, c.name) for c in ProductSku.__table__.columns
+                                      if c.name not in {"cost_amount", "guidance_cost", "average_cost"})))
     stmt = stmt.order_by(ProductSku.id)
     return list(db.execute(stmt).scalars().all())
 
@@ -152,7 +176,32 @@ def list_images(db: Session, tenant_id: int, product_id: int) -> list[ProductIma
 def delete_images(db: Session, tenant_id: int, product_id: int) -> None:
     """删除商品全部图片（图片为附属资料，编辑时整体替换）。"""
     for image in list_images(db, tenant_id, product_id):
-        db.delete(image)
+        if image.sku_id is None:
+            db.delete(image)
+
+
+def sales_status_expression(tenant_id: int):
+    def has(value):
+        return select(ProductSku.id).where(ProductSku.tenant_id == tenant_id,
+            ProductSku.product_id == Product.id, ProductSku.status != "archived",
+            ProductSku.sales_status == value).exists()
+    on, stopped, trial, clearance = (has(v) for v in ("on_sale", "discontinued", "trial", "clearance"))
+    return case(
+        (clearance & ~on & ~stopped & ~trial, "clearance"),
+        (stopped & ~on & ~trial & ~clearance, "discontinued"),
+        (trial & ~on & ~stopped & ~clearance, "trial"),
+        (clearance, "partial_clearance"), (stopped, "partial_discontinued"),
+        (on, "on_sale"), else_="discontinued")
+
+
+def list_skus_for_products(db: Session, tenant_id: int, product_ids: Sequence[int], *, include_cost=True):
+    if not product_ids:
+        return []
+    stmt = select(ProductSku).where(ProductSku.tenant_id == tenant_id, ProductSku.product_id.in_(product_ids)).order_by(ProductSku.id)
+    if not include_cost:
+        stmt = stmt.options(load_only(*(getattr(ProductSku, c.name) for c in ProductSku.__table__.columns
+                                      if c.name not in {"cost_amount", "guidance_cost", "average_cost"})))
+    return list(db.execute(stmt).scalars())
 
 
 def list_sku_display(

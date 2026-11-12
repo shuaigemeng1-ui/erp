@@ -39,6 +39,7 @@ def list_audit_logs(
         page=pagination.page,
         page_size=pagination.page_size,
         action=action,
+        include_cost="all" in snapshot.effective.granted_scope_types("catalog.cost.read"),
     )
     return paged(data["items"], data["total"], data["page"], data["page_size"])
 

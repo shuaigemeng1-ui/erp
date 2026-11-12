@@ -46,7 +46,7 @@ ENV PYTHONUNBUFFERED=1 \
 # 非 root 运行账号。uid/gid 固定，便于挂载目录与日志权限管理。
 RUN groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --home-dir /home/app --create-home --shell /usr/sbin/nologin app \
-    && mkdir -p /app /wheels \
+    && mkdir -p /app/var/catalog-media /wheels \
     && chown -R app:app /app /wheels
 
 WORKDIR /app

@@ -288,7 +288,10 @@ def ingest_platform_orders(
             summary["errors"] += 1
             summary["messages"].append(f"订单归一化失败(raw_id={raw_id}): {exc}"[:300])
             logger.warning("订单归一化失败 tenant=%s raw=%s: %s", tenant_id, raw_id, exc)
-            _enqueue_normalize_retry(db, tenant_id=tenant_id, raw_id=raw_id, sync_run_id=sync_run_id)
+            if isinstance(exc, AppError) and exc.code == ErrorCode.SKU_MAPPING_NOT_UNIQUE:
+                _mark_order_mapping_conflict(db, tenant_id=tenant_id, raw_id=raw_id)
+            else:
+                _enqueue_normalize_retry(db, tenant_id=tenant_id, raw_id=raw_id, sync_run_id=sync_run_id)
             continue
         if result["created"]:
             summary["orders_created"] += 1
@@ -324,6 +327,18 @@ def normalize_order_from_raw(
         store_id=int(raw.store_id),
         keys=[(line.external_item_id, line.external_sku_id) for line in parsed.lines],
     )
+    # 店铺映射优先；只有显式商家编码才允许查主编号/别名，不能把平台数字 ID 当商家编码。
+    missing_codes = [line.seller_sku for line in parsed.lines if line.seller_sku
+                     and not mapping.get((line.external_item_id, line.external_sku_id), (None, ""))[0]]
+    if missing_codes and raw.channel == "tiktok":
+        from app.modules.catalog.identifiers import normalize_identifier, resolve_identifiers
+        identities = resolve_identifiers(db, tenant_id, missing_codes)
+        for line in parsed.lines:
+            key = (line.external_item_id, line.external_sku_id)
+            if not mapping.get(key, (None, ""))[0] and line.seller_sku:
+                resolved = identities.get(normalize_identifier(line.seller_sku))
+                if resolved:
+                    mapping[key] = (resolved[0], MAPPING_MAPPED)
     order, created, previous_status = _upsert_order(
         db,
         tenant_id=tenant_id,
@@ -775,6 +790,53 @@ def _upsert_order(
     return order, created, previous_status
 
 
+def _stable_order_items(db, *, tenant_id, order, lines):
+    """先核对全部明细身份，歧义时整笔拒绝，绝不插入另一条明细再次扣库存。"""
+    existing = list(db.execute(select(OrderItem).where(
+        OrderItem.tenant_id == tenant_id, OrderItem.order_id == order.id,
+    ).with_for_update().execution_options(populate_existing=True)).scalars())
+    chosen = []
+    used = set()
+    for line in lines:
+        product_rows = [row for row in existing if row.external_item_id == line.external_item_id]
+        native = line.platform_sku_id
+        candidates = [row for row in product_rows if native and row.platform_sku_id == native]
+        if not candidates:
+            keys = {line.external_sku_id}
+            if native:
+                keys.add(native)
+            if line.seller_sku:
+                keys.add(line.seller_sku)
+            candidates = [row for row in product_rows if row.external_sku_id in keys]
+            if any(row.platform_sku_id and native and row.platform_sku_id != native for row in candidates):
+                raise AppError(ErrorCode.SKU_MAPPING_NOT_UNIQUE, "订单商家编码对应不同平台SKU，需人工核对")
+        if len(candidates) > 1:
+            raise AppError(ErrorCode.SKU_MAPPING_NOT_UNIQUE, "订单存在多个可能对应同一平台SKU的历史明细，需人工核对")
+        item = candidates[0] if candidates else None
+        if item is None and product_rows and (not native or any(not row.platform_sku_id for row in product_rows)):
+            # 历史行还没有稳定ID且商家码已改变，无法证明是新增还是改名，禁止猜测。
+            raise AppError(ErrorCode.SKU_MAPPING_NOT_UNIQUE, "历史订单明细缺少平台SKU ID且编码无法对应，需人工核对")
+        if item is not None:
+            if item.id in used:
+                raise AppError(ErrorCode.SKU_MAPPING_NOT_UNIQUE, "多个订单明细命中同一历史SKU，需人工核对")
+            used.add(item.id)
+        chosen.append(item)
+    return chosen
+
+
+def _mark_order_mapping_conflict(db, *, tenant_id, raw_id):
+    """归一化已回滚后，只标记已有订单异常；保留原数量、状态和库存影响。"""
+    raw = repository.get_platform_raw(db, tenant_id, raw_id)
+    if raw is None:
+        return
+    order = repository.find_order(db, tenant_id, raw.store_id, raw.external_order_no)
+    if order is not None:
+        order = repository.lock_order(db, tenant_id, order.id)
+        if order is not None:
+            order.abnormal_reason = "订单SKU标识存在歧义，已阻止本次写入和库存扣减，请人工核对"
+            db.commit()
+
+
 def _upsert_order_items(
     db: Session,
     *,
@@ -785,23 +847,18 @@ def _upsert_order_items(
 ) -> list[OrderItem]:
     """创建或更新订单明细；SKU 映射状态按渠道映射结果写入。"""
     items: list[OrderItem] = []
-    for line in parsed.lines:
+    stable_items = _stable_order_items(db, tenant_id=tenant_id, order=order, lines=parsed.lines)
+    for line, item in zip(parsed.lines, stable_items):
         key = (line.external_item_id, line.external_sku_id)
         sku_id, link_status = mapping.get(key, (None, MAPPING_MISSING))
         mapping_status = mapping_status_for(sku_id) if sku_id else link_status
-        item = repository.find_order_item(
-            db,
-            tenant_id,
-            int(order.id),
-            line.external_item_id,
-            line.external_sku_id,
-        )
         if item is None:
             item = OrderItem(
                 tenant_id=tenant_id,
                 order_id=int(order.id),
                 external_item_id=line.external_item_id,
                 external_sku_id=line.external_sku_id,
+                platform_sku_id=line.platform_sku_id,
                 sku_id=sku_id,
                 item_name=line.item_name,
                 quantity=max(0, int(line.quantity)),
@@ -824,7 +881,13 @@ def _upsert_order_items(
                 )
                 if item is None:  # pragma: no cover
                     raise
+        # 已确认的历史订单映射不因别名停用、改名或后来改变店铺映射而清空/改绑。
+        if item.sku_id is not None:
+            sku_id = int(item.sku_id)
+            mapping_status = MAPPING_MAPPED
         item.sku_id = sku_id
+        if line.platform_sku_id:
+            item.platform_sku_id = line.platform_sku_id
         item.item_name = line.item_name or item.item_name
         item.quantity = max(0, int(line.quantity))
         item.unit_price = line.unit_price

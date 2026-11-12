@@ -1,571 +1,128 @@
-"""商品业务服务：业务规则、事务边界、成本字段权限过滤与审计写入。
-
-事务约定（见 docs/architecture.md「事务由 Service 管理」）：
-
-* 写操作的 ``session.commit()`` 在本层完成，Router 不提交事务；
-* 业务写入与审计写入处于同一租户库事务，审计失败则整体不提交；
-* ``audit.service.record`` 由 backend-identity 实现，函数内延迟导入，避免并行开发期的循环依赖。
-
-成本字段约定（见 plan.txt §3 / 验证项 3）：
-
-* 无 ``catalog.cost.read`` 权限时，列表 / 详情查询不读取成本列，响应使用不带成本的
-  ``*PublicOut`` 模型；
-* 无权限时请求体中的成本字段一律拒绝（403），不允许写入。
-"""
-
+"""SPU/SKU 服务：共享资料权限、版本校验、别名与字段审计同事务提交。"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Sequence
 
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from app.core.access import EffectivePermissions
-from app.core.errors import (
-    AppError,
-    ConflictError,
-    ErrorCode,
-    PermissionDeniedError,
-)
+from app.core.errors import AppError, ConflictError, ErrorCode, PermissionDeniedError
 from app.core.permissions import Permission
+from app.db.base import utcnow
 from app.modules.catalog import repository as catalog_repo
-from app.modules.catalog.models_tenant import Product, ProductImage, ProductSku
+from app.modules.catalog import history
+from app.modules.catalog.aggregates import aggregate_product
+from app.modules.catalog.identifiers import list_aliases, sync_identifiers
+from app.modules.catalog.models_tenant import Product, ProductImage, ProductSku, Supplier
 from app.modules.catalog.schemas import (
-    ProductCreate,
-    ProductDetail,
-    ProductDetailPublic,
-    ProductImageOut,
-    ProductListItem,
-    ProductListItemPublic,
-    ProductSkuOut,
-    ProductSkuPublicOut,
-    ProductSkuUpdate,
-    ProductUpdate,
+    ProductCreate, ProductDetail, ProductDetailPublic, ProductImageOut, ProductListItem,
+    ProductListItemPublic, ProductSkuOut, ProductSkuPublicOut, ProductSkuUpdate, ProductUpdate,
 )
 
-# 成本相关字段：无 catalog.cost.read 权限时不可读也不可写
-PRODUCT_COST_FIELDS: frozenset[str] = frozenset({"cost_amount", "cost_currency"})
-SKU_COST_FIELDS: frozenset[str] = frozenset({"cost_amount"})
-
-# 局部更新时不允许置空的必填字段
-_PRODUCT_NON_NULLABLE = frozenset({"code", "name", "base_price", "status", "cost_currency"})
-_SKU_NON_NULLABLE = frozenset({"sku_code", "name", "price", "status"})
-
-_PRODUCT_UPDATABLE_FIELDS = (
-    "code",
-    "name",
-    "brand",
-    "category",
-    "base_price",
-    "description",
-    "status",
+PRODUCT_COST_FIELDS = frozenset({"cost_amount", "cost_currency"})
+SKU_COST_FIELDS = frozenset({"cost_amount", "guidance_cost", "average_cost"})
+PRODUCT_FIELDS = (
+    "code", "name", "brand", "category", "base_price", "description", "status", "name_en",
+    "preferred_supplier_id", "purchaser_id", "developer_id", "inquiry_buyer_id", "hs_code",
+    "material_zh", "material_en", "usage", "feature_tags", "packaging_name", "length_cm",
+    "width_cm", "height_cm", "package_length_cm", "package_width_cm", "package_height_cm",
+    "sales_type", "remark", "features",
 )
+SKU_FIELDS = ("sku_code", "name", "price", "specs", "status", "image_url", "weight_g", "sales_status")
+PRODUCT_NON_NULLABLE = {"code", "name", "base_price", "status", "sales_type"}
+SKU_NON_NULLABLE = {"sku_code", "name", "price", "status", "sales_status"}
+REFERENCE_IDS = {"preferred_supplier_id", "purchaser_id", "developer_id", "inquiry_buyer_id"}
 
 
 @dataclass(frozen=True, slots=True)
 class AuditContext:
-    """审计上下文：由 Router 从请求中提取，避免 Service 依赖 FastAPI Request。"""
-
     actor_id: int | None = None
     request_id: str = ""
     ip: str = ""
+    actor_name: str = ""
+    member_names: dict[str, str] = field(default_factory=dict)
 
 
-# --------------------------------------------------------------------------- 成本过滤（纯函数）
 def _require_master_scope(effective: EffectivePermissions, permission: str) -> None:
-    # 主商品属于全租户共享资料；店铺权限只能修改店铺刊登，不得影响其他店铺。
     if "all" not in effective.granted_scope_types(permission):
         raise PermissionDeniedError("访问共享主商品需要该操作的全部数据范围授权")
 
 
 def can_read_cost(effective: EffectivePermissions) -> bool:
-    """当前授权是否包含 ``catalog.cost.read``。"""
     return "all" in effective.granted_scope_types(Permission.CATALOG_COST_READ)
 
 
 def redact_cost(value: Decimal | None, *, can_read: bool) -> Decimal | None:
-    """无读取权限时返回 ``None``，保证成本值不进入响应数据。"""
     return value if can_read else None
 
 
-# --------------------------------------------------------------------------- 查询
-def list_products(
-    db: Session,
-    *,
-    tenant_id: int,
-    effective: EffectivePermissions,
-    page: int,
-    page_size: int,
-    q: str | None = None,
-    status: str | None = None,
-) -> tuple[list[ProductListItem | ProductListItemPublic], int]:
-    """商品分页列表；无成本权限时使用不含成本字段的响应模型。"""
+def list_products(db: Session, *, tenant_id: int, effective: EffectivePermissions, page: int,
+                  page_size: int, q: str | None = None, status: str | None = None,
+                  filters: dict | None = None):
     _require_master_scope(effective, "catalog.product.read")
     include_cost = can_read_cost(effective)
-    products, total = catalog_repo.list_products(
-        db,
-        tenant_id=tenant_id,
-        page=page,
-        page_size=page_size,
-        q=q,
-        status=status,
-        include_cost=include_cost,
-    )
-    sku_counts = catalog_repo.count_skus_by_products(
-        db, tenant_id, [product.id for product in products]
-    )
-    items: list[ProductListItem | ProductListItemPublic] = [
-        _list_item(product, sku_counts.get(product.id, 0), include_cost=include_cost)
-        for product in products
-    ]
-    return items, total
+    products, total = catalog_repo.list_products(db, tenant_id=tenant_id, page=page,
+        page_size=page_size, q=q, status=status, include_cost=include_cost, filters=filters)
+    ids = [p.id for p in products]
+    grouped = defaultdict(list)
+    for sku in catalog_repo.list_skus_for_products(db, tenant_id, ids, include_cost=include_cost):
+        grouped[sku.product_id].append(sku)
+    images = {}
+    if ids:
+        for image in db.execute(select(ProductImage).where(ProductImage.tenant_id == tenant_id,
+            ProductImage.product_id.in_(ids), ProductImage.sku_id.is_(None))
+            .order_by(ProductImage.sort_order, ProductImage.id)).scalars():
+            images.setdefault(image.product_id, image.url)
+    suppliers = _suppliers(db, tenant_id, [p.preferred_supplier_id for p in products])
+    result = []
+    for product in products:
+        skus = grouped[product.id]
+        base = _product_base_kwargs(product)
+        base.update(aggregate_product(skus, include_cost=include_cost))
+        base["primary_image"] = images.get(product.id)
+        base["preferred_supplier_name"] = suppliers.get(product.preferred_supplier_id)
+        base["sku_count"] = sum(s.status != "archived" for s in skus)
+        if include_cost:
+            base.update(cost_amount=_uniform_current(base), cost_currency=product.cost_currency)
+        result.append((ProductListItem if include_cost else ProductListItemPublic)(**base))
+    return result, total
 
 
-def get_product_detail(
-    db: Session,
-    *,
-    tenant_id: int,
-    product_id: int,
-    effective: EffectivePermissions,
-) -> ProductDetail | ProductDetailPublic:
+def get_product_detail(db: Session, *, tenant_id: int, product_id: int,
+                       effective: EffectivePermissions):
     _require_master_scope(effective, "catalog.product.read")
-    include_cost = can_read_cost(effective)
-    product = catalog_repo.get_product(
-        db, tenant_id, product_id, include_cost=include_cost
-    )
-    if product is None:
-        raise AppError(ErrorCode.PRODUCT_NOT_FOUND)
-    return _load_detail(db, tenant_id, product, include_cost=include_cost)
-
-
-# --------------------------------------------------------------------------- 写入
-def create_product(
-    db: Session,
-    *,
-    tenant_id: int,
-    effective: EffectivePermissions,
-    payload: ProductCreate,
-    audit: AuditContext,
-) -> ProductDetail | ProductDetailPublic:
-    """新建商品 + SKU + 图片（同一事务）；编码重复返回 409。"""
-    _require_master_scope(effective, "catalog.product.create")
-    include_cost = can_read_cost(effective)
-    _ensure_cost_write_allowed(payload, include_cost=include_cost)
-
-    from app.modules.platform.quotas import ensure_tenant_capacity
-    ensure_tenant_capacity(db, tenant_id, {'max_products': 1, 'max_skus': len(payload.skus)})
-
-    if catalog_repo.get_product_by_code(db, tenant_id, payload.code) is not None:
-        raise ConflictError("商品编码已存在", details={"field": "code"})
-    for item in payload.skus:
-        if catalog_repo.get_sku_by_code(db, tenant_id, item.sku_code) is not None:
-            raise ConflictError(
-                "SKU 编码已存在",
-                details={"field": "sku_code", "sku_code": item.sku_code},
-            )
-
-    product = Product(
-        tenant_id=tenant_id,
-        code=payload.code,
-        name=payload.name,
-        brand=payload.brand,
-        category=payload.category,
-        status="active",
-        cost_amount=payload.cost_amount if include_cost else None,
-        cost_currency=payload.cost_currency,
-        base_price=payload.base_price,
-        description=payload.description,
-    )
-    db.add(product)
-    try:
-        db.flush()
-        for item in payload.skus:
-            db.add(
-                ProductSku(
-                    tenant_id=tenant_id,
-                    product_id=product.id,
-                    sku_code=item.sku_code,
-                    name=item.name,
-                    specs=item.specs,
-                    price=item.price,
-                    cost_amount=item.cost_amount if include_cost else None,
-                    status="active",
-                )
-            )
-        for index, url in enumerate(payload.images):
-            db.add(
-                ProductImage(
-                    tenant_id=tenant_id,
-                    product_id=product.id,
-                    sku_id=None,
-                    url=url,
-                    sort_order=index,
-                )
-            )
-        db.flush()
-    except IntegrityError as exc:
-        db.rollback()
-        raise ConflictError("商品编码或 SKU 编码已存在") from exc
-
-    _write_audit(
-        db,
-        tenant_id=tenant_id,
-        action="catalog.product.create",
-        resource_type="product",
-        resource_id=product.id,
-        audit=audit,
-        summary=f"创建商品 {product.code}",
-        payload={
-            "code": product.code,
-            "name": product.name,
-            "sku_count": len(payload.skus),
-            "image_count": len(payload.images),
-        },
-    )
-    _commit_or_conflict(db, "商品编码或 SKU 编码已存在")
-    return _load_detail(db, tenant_id, product, include_cost=include_cost)
-
-
-def update_product(
-    db: Session,
-    *,
-    tenant_id: int,
-    product_id: int,
-    effective: EffectivePermissions,
-    payload: ProductUpdate,
-    audit: AuditContext,
-) -> ProductDetail | ProductDetailPublic:
-    """局部更新商品 / SKU / 图片；成本字段需要 ``catalog.cost.read``。"""
-    _require_master_scope(effective, "catalog.product.update")
-    include_cost = can_read_cost(effective)
-    _ensure_cost_write_allowed(payload, include_cost=include_cost)
-
-    product = catalog_repo.get_product(db, tenant_id, product_id, include_cost=include_cost)
-    if product is None:
-        raise AppError(ErrorCode.PRODUCT_NOT_FOUND)
-
-    fields_set = payload.model_fields_set
-    if "skus" in fields_set and payload.skus is not None:
-        from app.modules.platform.quotas import ensure_tenant_capacity
-        ensure_tenant_capacity(db, tenant_id, {
-            'max_skus': sum(1 for item in payload.skus if not item.id),
-        })
-    _apply_product_fields(db, tenant_id, product, payload, fields_set, include_cost=include_cost)
-
-    if "skus" in fields_set and payload.skus is not None:
-        _apply_sku_updates(db, tenant_id=tenant_id, product=product, items=payload.skus, include_cost=include_cost)
-
-    if "images" in fields_set:
-        catalog_repo.delete_images(db, tenant_id, product.id)
-        for index, url in enumerate(payload.images or []):
-            db.add(
-                ProductImage(
-                    tenant_id=tenant_id,
-                    product_id=product.id,
-                    sku_id=None,
-                    url=url,
-                    sort_order=index,
-                )
-            )
-
-    try:
-        db.flush()
-    except IntegrityError as exc:
-        db.rollback()
-        raise ConflictError("商品编码或 SKU 编码已存在") from exc
-
-    _write_audit(
-        db,
-        tenant_id=tenant_id,
-        action="catalog.product.update",
-        resource_type="product",
-        resource_id=product.id,
-        audit=audit,
-        summary=f"更新商品 {product.code}",
-        payload={"fields": sorted(fields_set)},
-    )
-    _commit_or_conflict(db, "商品编码或 SKU 编码已存在")
-    return _load_detail(db, tenant_id, product, include_cost=include_cost)
-
-
-def archive_product(
-    db: Session,
-    *,
-    tenant_id: int,
-    product_id: int,
-    effective: EffectivePermissions,
-    audit: AuditContext,
-) -> ProductDetail | ProductDetailPublic:
-    """归档商品（状态字段，不物理删除）；重复归档幂等。"""
-    _require_master_scope(effective, "catalog.product.update")
     include_cost = can_read_cost(effective)
     product = catalog_repo.get_product(db, tenant_id, product_id, include_cost=include_cost)
     if product is None:
         raise AppError(ErrorCode.PRODUCT_NOT_FOUND)
-
-    if product.status != "archived":
-        product.status = "archived"
-        _write_audit(
-            db,
-            tenant_id=tenant_id,
-            action="catalog.product.archive",
-            resource_type="product",
-            resource_id=product.id,
-            audit=audit,
-            summary=f"归档商品 {product.code}",
-            payload={"code": product.code},
-        )
-        _commit_or_conflict(db, "商品归档失败，请重试")
     return _load_detail(db, tenant_id, product, include_cost=include_cost)
 
 
-# --------------------------------------------------------------------------- 内部实现
-def _list_item(
-    product: Product, sku_count: int, *, include_cost: bool
-) -> ProductListItem | ProductListItemPublic:
-    base = _product_base_kwargs(product)
-    if include_cost:
-        return ProductListItem(
-            **base,
-            sku_count=sku_count,
-            cost_amount=product.cost_amount,
-            cost_currency=product.cost_currency,
-        )
-    return ProductListItemPublic(**base, sku_count=sku_count)
+def _supplier_allowed(db, tenant_id, supplier_id):
+    if supplier_id is None:
+        return
+    supplier = db.execute(select(Supplier).where(Supplier.tenant_id == tenant_id,
+        Supplier.id == int(supplier_id), Supplier.status == "active")).scalar_one_or_none()
+    if supplier is None:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "首选供应商不存在、已停用或不属于当前租户")
 
 
-def _load_detail(
-    db: Session, tenant_id: int, product: Product, *, include_cost: bool
-) -> ProductDetail | ProductDetailPublic:
-    skus = catalog_repo.list_skus(db, tenant_id, product.id, include_cost=include_cost)
-    images = catalog_repo.list_images(db, tenant_id, product.id)
-    image_items = [
-        ProductImageOut(
-            id=str(image.id),
-            url=image.url,
-            sort_order=image.sort_order,
-            sku_id=str(image.sku_id) if image.sku_id is not None else None,
-        )
-        for image in images
-    ]
-    base = _product_base_kwargs(product)
-    if include_cost:
-        return ProductDetail(
-            **base,
-            cost_amount=product.cost_amount,
-            cost_currency=product.cost_currency,
-            skus=[ProductSkuOut(**_sku_kwargs(sku, include_cost=True)) for sku in skus],
-            images=image_items,
-        )
-    return ProductDetailPublic(
-        **base,
-        skus=[ProductSkuPublicOut(**_sku_kwargs(sku, include_cost=False)) for sku in skus],
-        images=image_items,
-    )
-
-
-def _product_base_kwargs(product: Product) -> dict[str, Any]:
-    return {
-        "id": str(product.id),
-        "code": product.code,
-        "name": product.name,
-        "brand": product.brand,
-        "category": product.category,
-        "status": product.status,
-        "base_price": product.base_price,
-        "description": product.description,
-        "created_at": product.created_at,
-        "updated_at": product.updated_at,
-    }
-
-
-def _sku_kwargs(sku: ProductSku, *, include_cost: bool) -> dict[str, Any]:
-    data: dict[str, Any] = {
-        "id": str(sku.id),
-        "sku_code": sku.sku_code,
-        "name": sku.name,
-        "specs": sku.specs,
-        "price": sku.price,
-        "status": sku.status,
-    }
-    if include_cost:
-        data["cost_amount"] = sku.cost_amount
-    return data
-
-
-def _apply_product_fields(
-    db: Session,
-    tenant_id: int,
-    product: Product,
-    payload: ProductUpdate,
-    fields_set: set[str],
-    *,
-    include_cost: bool,
-) -> None:
-    for field in _PRODUCT_UPDATABLE_FIELDS:
-        if field not in fields_set:
-            continue
-        value = getattr(payload, field)
-        if value is None and field in _PRODUCT_NON_NULLABLE:
-            raise AppError(ErrorCode.VALIDATION_ERROR, f"字段 {field} 不能为空")
-        if field == "code" and value != product.code:
-            existing = catalog_repo.get_product_by_code(db, tenant_id, value)
-            if existing is not None and existing.id != product.id:
-                raise ConflictError("商品编码已存在", details={"field": "code"})
-        setattr(product, field, value)
-
-    if include_cost:
-        if "cost_amount" in fields_set:
-            product.cost_amount = payload.cost_amount
-        if "cost_currency" in fields_set:
-            if payload.cost_currency is None:
-                raise AppError(ErrorCode.VALIDATION_ERROR, "字段 cost_currency 不能为空")
-            product.cost_currency = payload.cost_currency
-
-
-def _apply_sku_updates(
-    db: Session,
-    *,
-    tenant_id: int,
-    product: Product,
-    items: Sequence[ProductSkuUpdate],
-    include_cost: bool,
-) -> None:
-    existing = {
-        sku.id: sku
-        for sku in catalog_repo.list_skus(
-            db, tenant_id, product.id, include_cost=include_cost
-        )
-    }
-    for item in items:
-        if item.id:
-            try:
-                sku_id = int(item.id)
-            except (TypeError, ValueError) as exc:
-                raise AppError(ErrorCode.VALIDATION_ERROR, "SKU ID 不合法") from exc
-            sku = existing.get(sku_id)
-            if sku is None:
-                raise AppError(ErrorCode.SKU_NOT_FOUND)
-            _apply_sku_fields(db, tenant_id, sku, item, include_cost=include_cost)
-        else:
-            _create_sku_from_update(db, tenant_id, product, item, include_cost=include_cost)
-
-
-def _apply_sku_fields(
-    db: Session,
-    tenant_id: int,
-    sku: ProductSku,
-    item: ProductSkuUpdate,
-    *,
-    include_cost: bool,
-) -> None:
-    fields_set = item.model_fields_set
-    for field in ("sku_code", "name", "price", "specs", "status"):
-        if field not in fields_set:
-            continue
-        value = getattr(item, field)
-        if value is None and field in _SKU_NON_NULLABLE:
-            raise AppError(ErrorCode.VALIDATION_ERROR, f"字段 {field} 不能为空")
-        if field == "sku_code" and value != sku.sku_code:
-            other = catalog_repo.get_sku_by_code(db, tenant_id, value)
-            if other is not None and other.id != sku.id:
-                raise ConflictError(
-                    "SKU 编码已存在",
-                    details={"field": "sku_code", "sku_code": value},
-                )
-        setattr(sku, field, value)
-
-    if include_cost and "cost_amount" in fields_set:
-        sku.cost_amount = item.cost_amount
-
-
-def _create_sku_from_update(
-    db: Session,
-    tenant_id: int,
-    product: Product,
-    item: ProductSkuUpdate,
-    *,
-    include_cost: bool,
-) -> None:
-    missing = [
-        name
-        for name, value in (
-            ("sku_code", item.sku_code),
-            ("name", item.name),
-            ("price", item.price),
-        )
-        if value is None
-    ]
-    if missing:
-        raise AppError(
-            ErrorCode.VALIDATION_ERROR,
-            "新增 SKU 缺少必填字段: " + ", ".join(missing),
-        )
-    assert item.sku_code is not None and item.name is not None and item.price is not None
-    if catalog_repo.get_sku_by_code(db, tenant_id, item.sku_code) is not None:
-        raise ConflictError(
-            "SKU 编码已存在",
-            details={"field": "sku_code", "sku_code": item.sku_code},
-        )
-    db.add(
-        ProductSku(
-            tenant_id=tenant_id,
-            product_id=product.id,
-            sku_code=item.sku_code,
-            name=item.name,
-            specs=item.specs,
-            price=item.price,
-            cost_amount=item.cost_amount if include_cost else None,
-            status=item.status or "active",
-        )
-    )
-
-
-def _ensure_cost_write_allowed(
-    payload: ProductCreate | ProductUpdate, *, include_cost: bool
-) -> None:
-    """无成本读取权限时，拒绝任何成本字段写入（避免越权读写成本）。"""
+def _ensure_cost_write_allowed(payload, *, include_cost: bool):
     if include_cost:
         return
-    fields_set = payload.model_fields_set
-    if fields_set & PRODUCT_COST_FIELDS:
-        raise PermissionDeniedError("无成本读取权限，不能设置成本字段")
-    for item in getattr(payload, "skus", None) or []:
-        if item.model_fields_set & SKU_COST_FIELDS:
-            raise PermissionDeniedError("无成本读取权限，不能设置 SKU 成本")
+    if payload.model_fields_set & PRODUCT_COST_FIELDS:
+        raise PermissionDeniedError("无成本权限，不能设置成本字段")
+    for sku in payload.skus or []:
+        if sku.model_fields_set & SKU_COST_FIELDS:
+            raise PermissionDeniedError("无成本权限，不能设置SKU成本")
 
 
-def _write_audit(
-    db: Session,
-    *,
-    tenant_id: int,
-    action: str,
-    resource_type: str,
-    resource_id: int | None,
-    audit: AuditContext,
-    summary: str,
-    payload: dict[str, Any] | None = None,
-) -> None:
-    """写租户审计（与业务同事务）。延迟导入避免与 backend-identity 并行开发时循环依赖。"""
-    from app.modules.audit.service import record
-
-    record(
-        db,
-        tenant_id=tenant_id,
-        action=action,
-        resource_type=resource_type,
-        resource_id=resource_id,
-        actor_id=audit.actor_id,
-        summary=summary,
-        payload=payload,
-        request_id=audit.request_id,
-        ip=audit.ip,
-    )
-
-
-def _commit_or_conflict(db: Session, message: str) -> None:
+def _commit_or_conflict(db, message):
     try:
         db.commit()
     except IntegrityError as exc:
@@ -573,13 +130,264 @@ def _commit_or_conflict(db: Session, message: str) -> None:
         raise ConflictError(message) from exc
 
 
-__all__ = [
-    "AuditContext",
-    "can_read_cost",
-    "redact_cost",
-    "list_products",
-    "get_product_detail",
-    "create_product",
-    "update_product",
-    "archive_product",
-]
+def create_product(db: Session, *, tenant_id: int, effective: EffectivePermissions,
+                   payload: ProductCreate, audit: AuditContext):
+    _require_master_scope(effective, "catalog.product.create")
+    include_cost = can_read_cost(effective)
+    _ensure_cost_write_allowed(payload, include_cost=include_cost)
+    from app.modules.platform.quotas import ensure_tenant_capacity
+    try:
+        ensure_tenant_capacity(db, tenant_id, {"max_products": 1, "max_skus": len(payload.skus)})
+        _supplier_allowed(db, tenant_id, payload.preferred_supplier_id)
+        if catalog_repo.get_product_by_code(db, tenant_id, payload.code) is not None:
+            raise ConflictError("SPU编号已存在")
+        values = {key: getattr(payload, key) for key in PRODUCT_FIELDS
+                  if hasattr(payload, key) and key != "status"}
+        for key in REFERENCE_IDS:
+            if values.get(key) is not None:
+                values[key] = int(values[key])
+        product = Product(tenant_id=tenant_id, status="active", cost_amount=None,
+                          cost_currency=payload.cost_currency, **values)
+        db.add(product)
+        db.flush()
+        for item in payload.skus:
+            _create_sku(db, tenant_id, product, item, include_cost=include_cost,
+                        fallback_cost=payload.cost_amount if include_cost else None)
+        _replace_images(db, tenant_id, product, payload.images)
+        db.flush()
+        after = history.snapshot(db, tenant_id, product, include_cost=include_cost)
+        history.record_changes(db, tenant_id, product, {}, after, audit, action="catalog.product.create")
+        _commit_or_conflict(db, "SPU编号、SKU编号或别名已存在")
+        return _load_detail(db, tenant_id, product, include_cost=include_cost)
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictError("SPU编号、SKU编号或别名已存在") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _lock_product(db, tenant_id, product_id, *, include_cost):
+    stmt = select(Product).where(Product.tenant_id == tenant_id, Product.id == product_id)
+    if not include_cost:
+        stmt = stmt.options(load_only(*(getattr(Product, c.name) for c in Product.__table__.columns
+                                       if c.name not in PRODUCT_COST_FIELDS)))
+    product = db.execute(stmt.with_for_update().execution_options(populate_existing=True)).scalar_one_or_none()
+    if product is None:
+        raise AppError(ErrorCode.PRODUCT_NOT_FOUND)
+    return product
+
+
+def update_product(db: Session, *, tenant_id: int, product_id: int, effective: EffectivePermissions,
+                   payload: ProductUpdate, audit: AuditContext):
+    _require_master_scope(effective, "catalog.product.update")
+    include_cost = can_read_cost(effective)
+    _ensure_cost_write_allowed(payload, include_cost=include_cost)
+    if "cost_amount" in payload.model_fields_set:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "SPU成本由SKU汇总，请在销售信息中修改SKU成本")
+    from app.modules.platform.quotas import ensure_tenant_capacity
+    try:
+        additions = sum(not item.id for item in payload.skus or [])
+        if additions:
+            ensure_tenant_capacity(db, tenant_id, {"max_skus": additions})
+        product = _lock_product(db, tenant_id, product_id, include_cost=include_cost)
+        if payload.version is not None and payload.version != product.version:
+            raise ConflictError("SPU已被其他人修改，请刷新后再保存")
+        before = history.snapshot(db, tenant_id, product, include_cost=include_cost)
+        fields_set = payload.model_fields_set
+        if "preferred_supplier_id" in fields_set:
+            _supplier_allowed(db, tenant_id, payload.preferred_supplier_id)
+        for key in PRODUCT_FIELDS:
+            if key not in fields_set:
+                continue
+            value = getattr(payload, key)
+            if value is None and key in PRODUCT_NON_NULLABLE:
+                raise AppError(ErrorCode.VALIDATION_ERROR, f"字段{key}不能为空")
+            if key == "code" and value != product.code:
+                other = catalog_repo.get_product_by_code(db, tenant_id, value)
+                if other is not None and other.id != product.id:
+                    raise ConflictError("SPU编号已存在")
+            if key in REFERENCE_IDS and value is not None:
+                value = int(value)
+            setattr(product, key, value)
+        if include_cost and "cost_currency" in fields_set:
+            if not payload.cost_currency:
+                raise AppError(ErrorCode.VALIDATION_ERROR, "成本币种不能为空")
+            product.cost_currency = payload.cost_currency
+        if payload.skus is not None:
+            _apply_sku_updates(db, tenant_id=tenant_id, product=product, items=payload.skus,
+                               include_cost=include_cost)
+        if "images" in fields_set:
+            _replace_images(db, tenant_id, product, payload.images or [])
+        db.flush()
+        skus = catalog_repo.list_skus(db, tenant_id, product.id, include_cost=include_cost)
+        if product.status == "active" and not any(s.status != "archived" for s in skus):
+            raise AppError(ErrorCode.VALIDATION_ERROR, "正常SPU至少需要一个未归档SKU")
+        after = history.snapshot(db, tenant_id, product, include_cost=include_cost)
+        if history.differences(before, after):
+            product.version += 1
+            product.updated_at = utcnow()
+            previous = before.get("skus", {})
+            for sku in skus:
+                key = str(sku.id)
+                if key in previous and previous[key] != after["skus"].get(key):
+                    sku.version += 1
+                    sku.updated_at = utcnow()
+            history.record_changes(db, tenant_id, product, before, after, audit)
+        _commit_or_conflict(db, "SPU编号、SKU编号或别名已存在")
+        return _load_detail(db, tenant_id, product, include_cost=include_cost)
+    except IntegrityError as exc:
+        db.rollback()
+        raise ConflictError("SPU编号、SKU编号或别名已存在") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _create_sku(db, tenant_id, product, item, *, include_cost, fallback_cost=None):
+    if not item.sku_code:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "新增SKU必须填写SKU编号")
+    if catalog_repo.get_sku_by_code(db, tenant_id, item.sku_code) is not None:
+        raise ConflictError("SKU编号已存在")
+    sku = ProductSku(tenant_id=tenant_id, product_id=product.id, sku_code=item.sku_code,
+        name=item.name or product.name, price=item.price if item.price is not None else Decimal("0"),
+        specs=item.specs, status=getattr(item, "status", None) or "active",
+        image_url=item.image_url, weight_g=item.weight_g, sales_status=item.sales_status or "on_sale",
+        cost_amount=(item.cost_amount if item.cost_amount is not None else fallback_cost) if include_cost else None,
+        guidance_cost=item.guidance_cost if include_cost else None,
+        average_cost=item.average_cost if include_cost else None)
+    db.add(sku)
+    db.flush()
+    sync_identifiers(db, tenant_id, sku, item.aliases or [])
+    return sku
+
+
+def _apply_sku_updates(db, *, tenant_id, product, items: Sequence[ProductSkuUpdate], include_cost):
+    stmt = select(ProductSku).where(ProductSku.tenant_id == tenant_id,
+        ProductSku.product_id == product.id).order_by(ProductSku.id).with_for_update()
+    if not include_cost:
+        stmt = stmt.options(load_only(*(getattr(ProductSku, c.name) for c in ProductSku.__table__.columns
+                                       if c.name not in SKU_COST_FIELDS)))
+    existing = {sku.id: sku for sku in db.execute(stmt.execution_options(populate_existing=True)).scalars()}
+    seen = set()
+    for item in items:
+        if not item.id:
+            _create_sku(db, tenant_id, product, item, include_cost=include_cost)
+            continue
+        try:
+            sku_id = int(item.id)
+        except (ValueError, TypeError) as exc:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "SKU ID不合法") from exc
+        if sku_id in seen:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "同一SKU不能在一次请求中重复修改")
+        seen.add(sku_id)
+        sku = existing.get(sku_id)
+        if sku is None:
+            raise AppError(ErrorCode.SKU_NOT_FOUND)
+        if item.version is not None and item.version != sku.version:
+            raise ConflictError("SKU已被其他人修改，请刷新后再保存")
+        previous_code = sku.sku_code
+        for key in SKU_FIELDS:
+            if key not in item.model_fields_set:
+                continue
+            value = getattr(item, key)
+            if value is None and key in SKU_NON_NULLABLE:
+                raise AppError(ErrorCode.VALIDATION_ERROR, f"字段{key}不能为空")
+            setattr(sku, key, value)
+        if include_cost:
+            for key in SKU_COST_FIELDS:
+                if key in item.model_fields_set:
+                    setattr(sku, key, getattr(item, key))
+        aliases = item.aliases if "aliases" in item.model_fields_set else None
+        sync_identifiers(db, tenant_id, sku, aliases, previous_code=previous_code)
+
+
+def _replace_images(db, tenant_id, product, urls):
+    current = [image.url for image in catalog_repo.list_images(db, tenant_id, product.id)
+               if image.sku_id is None]
+    if current == list(urls):
+        return
+    catalog_repo.delete_images(db, tenant_id, product.id)
+    for index, url in enumerate(urls):
+        db.add(ProductImage(tenant_id=tenant_id, product_id=product.id, sku_id=None,
+                            url=url, sort_order=index))
+
+
+def archive_product(db: Session, *, tenant_id: int, product_id: int,
+                    effective: EffectivePermissions, audit: AuditContext):
+    return update_product(db, tenant_id=tenant_id, product_id=product_id, effective=effective,
+                          payload=ProductUpdate(status="archived"), audit=audit)
+
+
+def _product_base_kwargs(product):
+    result = {key: getattr(product, key) for key in PRODUCT_FIELDS}
+    result.update(id=str(product.id), created_at=product.created_at,
+                  updated_at=product.updated_at, version=product.version)
+    for key in REFERENCE_IDS:
+        result[key] = str(result[key]) if result[key] is not None else None
+    return result
+
+
+def _uniform_current(data):
+    current = data["cost_summary"]["current"]
+    return current["value"] if current["state"] == "uniform" else None
+
+
+def _suppliers(db, tenant_id, ids):
+    ids = {item for item in ids if item is not None}
+    if not ids:
+        return {}
+    return dict(db.execute(select(Supplier.id, Supplier.name).where(
+        Supplier.tenant_id == tenant_id, Supplier.id.in_(ids))).all())
+
+
+def _sku_kwargs(sku, *, include_cost):
+    result = {key: getattr(sku, key) for key in SKU_FIELDS}
+    result.update(id=str(sku.id), version=sku.version)
+    if include_cost:
+        result.update({key: getattr(sku, key) for key in SKU_COST_FIELDS})
+    return result
+
+
+def _load_detail(db, tenant_id, product, *, include_cost):
+    skus = catalog_repo.list_skus(db, tenant_id, product.id, include_cost=include_cost)
+    aliases = list_aliases(db, tenant_id, [s.id for s in skus])
+    images = catalog_repo.list_images(db, tenant_id, product.id)
+    base = _product_base_kwargs(product)
+    base.update(aggregate_product(skus, include_cost=include_cost))
+    main_images = [image for image in images if image.sku_id is None]
+    base["primary_image"] = main_images[0].url if main_images else None
+    base["preferred_supplier_name"] = _suppliers(db, tenant_id, [product.preferred_supplier_id]).get(product.preferred_supplier_id)
+    base["images"] = [ProductImageOut(id=str(i.id), url=i.url, sort_order=i.sort_order,
+        sku_id=str(i.sku_id) if i.sku_id is not None else None) for i in main_images]
+    sku_class = ProductSkuOut if include_cost else ProductSkuPublicOut
+    base["skus"] = [sku_class(**_sku_kwargs(s, include_cost=include_cost), aliases=aliases.get(s.id, [])) for s in skus]
+    if include_cost:
+        base.update(cost_amount=_uniform_current(base), cost_currency=product.cost_currency)
+    return (ProductDetail if include_cost else ProductDetailPublic)(**base)
+
+
+def product_logs(db: Session, *, tenant_id: int, product_id: int, effective: EffectivePermissions,
+                 page: int, page_size: int):
+    _require_master_scope(effective, "catalog.product.read")
+    if catalog_repo.get_product(db, tenant_id, product_id, include_cost=False) is None:
+        raise AppError(ErrorCode.PRODUCT_NOT_FOUND)
+    from app.modules.audit.models_tenant import AuditLog
+    from app.modules.audit.service import visible_payload
+    conditions = (AuditLog.tenant_id == tenant_id, or_(AuditLog.product_id == product_id,
+        (AuditLog.resource_type == "product") & (AuditLog.resource_id == product_id)))
+    total = int(db.execute(select(func.count()).select_from(AuditLog).where(*conditions)).scalar_one())
+    rows = db.execute(select(AuditLog).where(*conditions).order_by(AuditLog.id.desc())
+        .offset(max(page - 1, 0) * page_size).limit(page_size)).scalars()
+    items = []
+    for row in rows:
+        payload = visible_payload(row.payload, include_cost=can_read_cost(effective)) or {}
+        items.append({"id": str(row.id), "summary": row.summary,
+            "actor_name": row.actor_name_snapshot or ("系统" if not row.actor_id else str(row.actor_id)),
+            "created_at": row.created_at.isoformat(timespec="seconds") + "Z",
+            "changes": payload.get("changes", [])})
+    return items, total
+
+
+__all__ = ["AuditContext", "can_read_cost", "redact_cost", "list_products", "get_product_detail",
+           "create_product", "update_product", "archive_product", "product_logs"]

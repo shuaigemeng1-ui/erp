@@ -175,6 +175,29 @@ tenant_databases() {
 }
 
 # ---------------------------------------------------------------- 主流程
+dump_catalog_media() {
+    local api_id file tmp digest
+    api_id="$(compose ps -a -q api)"
+    if [[ -z "${api_id}" ]] || ! docker inspect --format '{{range .Mounts}}{{println .Destination}}{{end}}' "${api_id}" | grep -Fxq '/app/var/catalog-media'; then
+        log "商品图片卷尚未配置，跳过图片备份"
+        return
+    fi
+    file="${OUT_DIR}/catalog_media_$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+    tmp="${file}.tmp"
+    log "备份商品图片卷（支持 API 容器停止时执行）"
+    if ! docker cp "${api_id}:/app/var/catalog-media/." - | gzip > "${tmp}"; then
+        rm -f "${tmp}"
+        die "商品图片备份失败"
+    fi
+    gzip -t "${tmp}" || die "商品图片备份校验失败"
+    mv "${tmp}" "${file}"
+    digest="$(sha256_of "${file}")"
+    if [[ "${digest}" != "unavailable" ]]; then
+        printf '%s  %s\n' "${digest}" "$(basename "${file}")" > "${file}.sha256"
+    fi
+    log "商品图片备份完成：$(basename "${file}")"
+}
+
 if [[ "${ALL_TENANTS}" -eq 1 ]]; then
     log "从中心库 ${CENTER_DB_NAME}.tenant_databases 读取租户库列表"
     TENANT_DBS=()
@@ -186,6 +209,7 @@ if [[ "${ALL_TENANTS}" -eq 1 ]]; then
     for db in "${TENANT_DBS[@]}"; do
         dump_one "${db}"
     done
+    dump_catalog_media
 else
     dump_one "${DB_NAME}"
 fi
@@ -194,7 +218,7 @@ fi
 if [[ "${KEEP_DAYS}" -gt 0 ]]; then
     log "清理 ${OUT_DIR} 中超过 ${KEEP_DAYS} 天的备份"
     find "${OUT_DIR}" -maxdepth 1 -type f \
-        \( -name '*.sql.gz' -o -name '*.sql.gz.sha256' \) \
+        \( -name '*.sql.gz' -o -name '*.sql.gz.sha256' -o -name 'catalog_media_*.tar.gz' -o -name 'catalog_media_*.tar.gz.sha256' \) \
         -mtime "+${KEEP_DAYS}" -print -delete || true
 fi
 

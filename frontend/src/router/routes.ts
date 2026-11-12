@@ -53,6 +53,12 @@ export const routes: RouteRecordRaw[] = [
         meta: { tenant: true, permission: 'catalog.product.read', title: '商品' },
       },
       {
+        path: 'products/:productId',
+        name: 'product-detail',
+        component: () => import('@/views/tenant/ProductDetailView.vue'),
+        meta: { tenant: true, permission: 'catalog.product.read', title: 'SPU 详情' },
+      },
+      {
         path: 'inventory',
         name: 'inventory',
         component: () => import('@/views/tenant/InventoryView.vue'),

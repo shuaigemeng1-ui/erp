@@ -89,6 +89,7 @@ class Settings(BaseSettings):
     s3_secret_key: str = ""
     s3_force_path_style: bool = True
     file_public_base_url: str = ""
+    catalog_media_dir: str = "var/catalog-media"
 
     # ------------------------------------------------------------------ Shopee（平台级应用凭据存中心库，这里只放环境地址）
     shopee_api_base: str = "https://partner.shopeemobile.com"

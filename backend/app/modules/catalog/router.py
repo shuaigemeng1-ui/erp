@@ -15,19 +15,22 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Path, Query, Request
+from fastapi import APIRouter, Depends, Path, Query, Request, UploadFile, File
+from fastapi.responses import FileResponse
 
 from app.api.deps import (
     TenantCtx,
     TenantDb,
     require_permission,
+    CenterDb, AccessSnapshotDep,
 )
 from app.core.context import TenantContext, get_request_id
 from app.core.http import PageParams, paged, success
 from app.core.permissions import Permission
 from app.modules.access.service import AccessSnapshot
 from app.modules.catalog import service as catalog_service
-from app.modules.catalog.schemas import ProductCreate, ProductUpdate
+from app.modules.catalog.schemas import ProductCreate, ProductUpdate, ProductSkuCreate, ProductSkuUpdate
+from app.modules.catalog import resources
 
 router = APIRouter(prefix="/tenants/{tenant_id}/products", tags=["catalog"])
 
@@ -45,10 +48,12 @@ UpdateAccess = Annotated[
 ProductId = Annotated[int, Path(gt=0, description="商品ID")]
 
 
-def _audit_context(request: Request, ctx: TenantContext) -> catalog_service.AuditContext:
+def _audit_context(request: Request, ctx: TenantContext, member_names=None) -> catalog_service.AuditContext:
     client_ip = request.client.host if request.client is not None else ""
     return catalog_service.AuditContext(
-        actor_id=ctx.actor_id or ctx.user_id, request_id=get_request_id(), ip=client_ip
+        actor_id=ctx.actor_id or ctx.user_id, request_id=get_request_id(), ip=client_ip,
+        actor_name=getattr(getattr(request.state,"current_user",None),"display_name","") or str(ctx.user_id),
+        member_names=member_names or {},
     )
 
 
@@ -58,10 +63,19 @@ def list_products(
     db: TenantDb,
     snapshot: ReadAccess,
     page: Annotated[PageParams, Depends()],
-    q: str | None = Query(default=None, max_length=100, description="按编码 / 名称 / 品牌搜索"),
+    q: str | None = Query(default=None, max_length=200, description="按SPU/SKU/别名/中英文名称搜索"),
     status: str | None = Query(
         default=None, pattern="^(active|archived)$", description="商品状态筛选"
     ),
+    sales_status: str | None = Query(default=None, pattern="^(on_sale|discontinued|trial|clearance|partial_clearance|partial_discontinued)$"),
+    sales_type: str | None = Query(default=None, pattern="^(normal|variation|bundle|assembly)$"),
+    brand: str | None = Query(default=None,max_length=100),
+    category: str | None = Query(default=None,max_length=100),
+    preferred_supplier_id: int | None = Query(default=None,gt=0),
+    purchaser_id: int | None = Query(default=None,gt=0),
+    developer_id: int | None = Query(default=None,gt=0),
+    inquiry_buyer_id: int | None = Query(default=None,gt=0),
+    tag: str | None = Query(default=None,max_length=100),
 ) -> dict[str, Any]:
     items, total = catalog_service.list_products(
         db,
@@ -71,9 +85,12 @@ def list_products(
         page_size=page.page_size,
         q=q,
         status=status,
+        filters=dict(sales_status=sales_status,sales_type=sales_type,brand=brand,category=category,
+            preferred_supplier_id=preferred_supplier_id,purchaser_id=purchaser_id,developer_id=developer_id,
+            inquiry_buyer_id=inquiry_buyer_id,tag=tag),
     )
     return paged(
-        [item.model_dump() for item in items], total, page.page, page.page_size
+        [item.model_dump(mode="json") for item in items], total, page.page, page.page_size
     )
 
 
@@ -84,15 +101,56 @@ def create_product(
     snapshot: CreateAccess,
     payload: ProductCreate,
     request: Request,
+    center: CenterDb,
 ) -> dict[str, Any]:
+    catalog_service._require_master_scope(snapshot.effective,"catalog.product.create")
+    resources.validate_media_refs(db,ctx.tenant_id,payload)
     detail = catalog_service.create_product(
         db,
         tenant_id=ctx.tenant_id,
         effective=snapshot.effective,
         payload=payload,
-        audit=_audit_context(request, ctx),
+        audit=_audit_context(request, ctx,resources.validate_members(center,ctx.tenant_id,payload)),
     )
-    return success(detail.model_dump())
+    return success(detail.model_dump(mode="json"))
+
+
+@router.get("/options", summary="商品基础资料选项")
+def product_options(ctx: TenantCtx, db: TenantDb, center: CenterDb, snapshot: ReadAccess):
+    catalog_service._require_master_scope(snapshot.effective,"catalog.product.read")
+    data=resources.get_options(db,center,ctx.tenant_id)
+    data["can_read_cost"]=catalog_service.can_read_cost(snapshot.effective)
+    return success(data)
+
+
+@router.post("/options", summary="新增品牌分类标签包材")
+def create_option(body: resources.OptionIn, ctx: TenantCtx, db: TenantDb, snapshot: UpdateAccess):
+    catalog_service._require_master_scope(snapshot.effective,"catalog.product.update")
+    return success(resources.create_resource(db,ctx.tenant_id,body,ctx.user_id))
+
+
+@router.post("/suppliers", summary="新增供应商简档")
+def create_supplier(body: resources.SupplierIn, ctx: TenantCtx, db: TenantDb, snapshot: UpdateAccess):
+    catalog_service._require_master_scope(snapshot.effective,"catalog.product.update")
+    return success(resources.create_resource(db,ctx.tenant_id,body,ctx.user_id))
+
+
+@router.post("/media", summary="上传商品图片")
+async def upload_media(ctx: TenantCtx, db: TenantDb, snapshot: AccessSnapshotDep, file: UploadFile=File(...)):
+    from app.core.errors import PermissionDeniedError, AppError, ErrorCode
+    if not any("all" in snapshot.effective.granted_scope_types(p) for p in ("catalog.product.create","catalog.product.update")):
+        raise PermissionDeniedError("上传商品图片需要商品创建或编辑权限")
+    data=await file.read(10*1024*1024+1)
+    if len(data)>10*1024*1024:
+        raise AppError(ErrorCode.VALIDATION_ERROR,"图片不能超过10MB")
+    return success(resources.save_image(db,ctx.tenant_id,ctx.user_id,file.filename,data))
+
+
+@router.get("/media/{file_id}", summary="读取商品图片")
+def read_media(ctx: TenantCtx, db: TenantDb, snapshot: ReadAccess, file_id: int=Path(gt=0)):
+    catalog_service._require_master_scope(snapshot.effective,"catalog.product.read")
+    path,mime=resources.image_file(db,ctx.tenant_id,file_id)
+    return FileResponse(path,media_type=mime,headers={"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff"})
 
 
 @router.get("/{product_id}", summary="商品详情")
@@ -108,7 +166,7 @@ def get_product(
         product_id=product_id,
         effective=snapshot.effective,
     )
-    return success(detail.model_dump())
+    return success(detail.model_dump(mode="json"))
 
 
 @router.patch("/{product_id}", summary="局部更新商品")
@@ -119,16 +177,19 @@ def update_product(
     product_id: ProductId,
     payload: ProductUpdate,
     request: Request,
+    center: CenterDb,
 ) -> dict[str, Any]:
+    catalog_service._require_master_scope(snapshot.effective,"catalog.product.update")
+    resources.validate_media_refs(db,ctx.tenant_id,payload)
     detail = catalog_service.update_product(
         db,
         tenant_id=ctx.tenant_id,
         product_id=product_id,
         effective=snapshot.effective,
         payload=payload,
-        audit=_audit_context(request, ctx),
+        audit=_audit_context(request, ctx,resources.validate_members(center,ctx.tenant_id,payload)),
     )
-    return success(detail.model_dump())
+    return success(detail.model_dump(mode="json"))
 
 
 @router.post("/{product_id}/archive", summary="归档商品")
@@ -146,7 +207,33 @@ def archive_product(
         effective=snapshot.effective,
         audit=_audit_context(request, ctx),
     )
-    return success(detail.model_dump())
+    return success(detail.model_dump(mode="json"))
+
+
+@router.post("/{product_id}/skus", summary="新增SKU")
+def create_sku(ctx: TenantCtx, db: TenantDb, snapshot: UpdateAccess, product_id: ProductId, payload: ProductSkuCreate, request: Request):
+    catalog_service._require_master_scope(snapshot.effective,"catalog.product.update")
+    item=ProductSkuUpdate.model_validate(payload.model_dump(exclude_unset=True))
+    resources.validate_media_refs(db,ctx.tenant_id,ProductUpdate(skus=[item]))
+    detail=catalog_service.update_product(db,tenant_id=ctx.tenant_id,product_id=product_id,effective=snapshot.effective,
+        payload=ProductUpdate(skus=[item]),audit=_audit_context(request,ctx))
+    return success(detail.model_dump(mode="json"))
+
+
+@router.patch("/{product_id}/skus/{sku_id}", summary="修改SKU及别名")
+def update_sku(ctx: TenantCtx, db: TenantDb, snapshot: UpdateAccess, product_id: ProductId, payload: ProductSkuUpdate, request: Request, sku_id: int=Path(gt=0)):
+    catalog_service._require_master_scope(snapshot.effective,"catalog.product.update")
+    item=payload.model_copy(update={"id":str(sku_id)})
+    resources.validate_media_refs(db,ctx.tenant_id,ProductUpdate(skus=[item]))
+    detail=catalog_service.update_product(db,tenant_id=ctx.tenant_id,product_id=product_id,effective=snapshot.effective,
+        payload=ProductUpdate(skus=[item]),audit=_audit_context(request,ctx))
+    return success(detail.model_dump(mode="json"))
+
+
+@router.get("/{product_id}/logs", summary="SPU及SKU操作日志")
+def product_logs(ctx: TenantCtx, db: TenantDb, snapshot: ReadAccess, product_id: ProductId, page: Annotated[PageParams,Depends()]):
+    items,total=catalog_service.product_logs(db,tenant_id=ctx.tenant_id,product_id=product_id,effective=snapshot.effective,page=page.page,page_size=page.page_size)
+    return paged(items,total,page.page,page.page_size)
 
 
 __all__ = ["router"]

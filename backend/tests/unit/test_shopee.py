@@ -446,11 +446,11 @@ def test_match_duplicate_sku_code_is_ambiguous() -> None:
     assert match.sku_id is None
 
 
-def test_match_specs_only_when_sku_code_missing_or_unknown() -> None:
+def test_specs_alone_never_guess_a_sku_across_products() -> None:
     unique_but_two_candidates = service.match_listing_to_skus(
         external_sku_id="", listing_specs={"颜色": "红", "尺码": "M"}, candidates=_candidates()
     )
-    assert unique_but_two_candidates.status == LINK_STATUS_AMBIGUOUS
+    assert unique_but_two_candidates.status == LINK_STATUS_PENDING
     single = service.match_listing_to_skus(
         external_sku_id="",
         listing_specs={"颜色": "蓝", "尺码": "L"},
@@ -460,8 +460,8 @@ def test_match_specs_only_when_sku_code_missing_or_unknown() -> None:
             )
         ],
     )
-    assert single.status == LINK_STATUS_MAPPED
-    assert single.sku_id == 21
+    assert single.status == LINK_STATUS_PENDING
+    assert single.sku_id is None
 
 
 def test_match_without_any_hit_is_pending_not_guessed() -> None:

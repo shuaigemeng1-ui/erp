@@ -225,7 +225,16 @@ def exchange_code(app_key: str, app_secret: str, code: str) -> dict[str, Any]:
         if not shops:
             raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "TikTok 未返回可用的店铺")
         shop = shops[0]
-        return {"token": token, "shop": shop}
+        client.shop_cipher = str(shop.get("cipher") or token.get("shop_cipher") or "")
+        warehouse_id = ""
+        try:
+            warehouses = client.get_warehouses()
+            sales = [item for item in warehouses if str(item.get("type") or "") == "SALES_WAREHOUSE"]
+            chosen = (sales or warehouses or [{}])[0]
+            warehouse_id = str(chosen.get("id") or "")
+        except TikTokApiError:
+            logger.warning("读取 TikTok 仓库失败，库存推送将在首次使用时重试")
+        return {"token": token, "shop": shop, "warehouse_id": warehouse_id}
     except TikTokApiError as exc:
         raise AppError(
             ErrorCode.CHANNEL_CALLBACK_UNKNOWN,
@@ -242,6 +251,7 @@ def complete_authorization(
     session: Mapping[str, Any],
     token: Mapping[str, Any],
     shop: Mapping[str, Any],
+    warehouse_id: str = "",
 ) -> dict[str, Any]:
     """写店铺 + 加密凭据 + 中心库归属登记 + 审计。"""
     from app.modules.channels import service as channel_service
@@ -272,6 +282,7 @@ def complete_authorization(
             refresh_token_expires_at=refresh_expires,
             member_id=int(session.get("member_id") or 0) or None,
             shop_cipher=shop_cipher,
+            warehouse_id=warehouse_id or None,
         )
         channel_service.claim_store_registry(
             center,

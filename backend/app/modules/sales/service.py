@@ -250,7 +250,9 @@ def ingest_platform_orders(
             summary["errors"] += 1
             summary["messages"].append("平台订单数据不是 JSON 对象")
             continue
-        external_order_no = str(payload.get("order_sn") or "").strip()
+        external_order_no = str(
+            payload.get("order_sn") or payload.get("id") or payload.get("order_id") or ""
+        ).strip()
         if not external_order_no:
             summary["errors"] += 1
             summary["messages"].append("平台订单数据缺少 order_sn")

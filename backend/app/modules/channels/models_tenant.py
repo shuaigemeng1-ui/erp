@@ -102,6 +102,9 @@ class Store(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
     last_error: Mapped[str | None] = mapped_column(
         String(500), nullable=True, comment="最近一次错误摘要（不含凭据）"
     )
+    warehouse_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment="TikTok Shop 仓库ID（库存推送使用；Shopee 为空）"
+    )
 
 
 class StoreCredential(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):

@@ -73,6 +73,12 @@ from app.modules.channels.shopee.client import (
     is_auth_invalid_error_code,
     resolve_base_url,
 )
+from app.modules.channels.tiktok.client import (
+    TikTokApiError,
+    TikTokClient,
+    normalize_token_payload as normalize_tiktok_token,
+    token_expiry_times as tiktok_token_expiry_times,
+)
 from app.modules.channels.shopee.signature import (
     is_expired,
     safe_redirect_path,
@@ -603,6 +609,7 @@ def upsert_store_from_authorization(
     refresh_token_expires_at: datetime | None,
     member_id: int | None = None,
     shop_cipher: str | None = None,
+    warehouse_id: str | None = None,
 ) -> int:
     """授权成功后写入店铺与加密凭据；重新授权更新原店铺，不重复创建。"""
     now = utc_now()
@@ -635,6 +642,8 @@ def upsert_store_from_authorization(
         store.disconnected_at = None
         store.last_error = None
         store.updated_at = now
+    if warehouse_id:
+        store.warehouse_id = str(warehouse_id)[:64]
     credential = repo.get_credential(db, tenant_id, store.id)
     if credential is None:
         credential = StoreCredential(
@@ -947,6 +956,282 @@ def build_store_client(
     )
 
 
+# --------------------------------------------------------------------------- TikTok Shop
+def _decrypt_shop_cipher(credential: StoreCredential | None) -> str:
+    if credential is None or not credential.shop_cipher_cipher:
+        return ""
+    try:
+        return decrypt_secret(credential.shop_cipher_cipher)
+    except Exception:  # noqa: BLE001
+        logger.warning("店铺 shop_cipher 解密失败")
+        return ""
+
+
+def _tiktok_error(exc: TikTokApiError) -> AppError:
+    if exc.transient:
+        return AppError(ErrorCode.SERVICE_UNAVAILABLE, "TikTok 接口暂不可用，请稍后重试")
+    return AppError(ErrorCode.STORE_REAUTH_REQUIRED, "TikTok 授权已失效，请重新授权")
+
+
+def build_tiktok_client(
+    center: Session,
+    db: Session,
+    tenant_id: int,
+    store: Store,
+    *,
+    force_refresh: bool = False,
+) -> TikTokClient:
+    """构造 TikTok 客户端：凭据已解密，必要时自动刷新 access token。"""
+    credential = repo.get_credential(db, tenant_id, store.id)
+    access_token, refresh_token = _decrypt_tokens(credential)
+    config = require_channel_app(center, store.environment, channel=CHANNEL_TIKTOK)
+    shop_cipher = _decrypt_shop_cipher(credential)
+
+    def make_client(token: str) -> TikTokClient:
+        return TikTokClient(
+            app_key=config.app_key,
+            app_secret=config.app_secret,
+            access_token=token,
+            shop_cipher=shop_cipher,
+        )
+
+    if not force_refresh and credential is not None and _token_is_usable(credential, access_token):
+        return make_client(access_token)
+    if not refresh_token:
+        mark_store_reauth_required(db, tenant_id, store.id, "刷新令牌缺失")
+        db.commit()
+        raise AppError(ErrorCode.STORE_REAUTH_REQUIRED)
+    refresh_client = TikTokClient(
+        app_key=config.app_key,
+        app_secret=config.app_secret,
+        access_token=access_token,
+        shop_cipher=shop_cipher,
+    )
+    try:
+        raw = refresh_client.refresh_token(refresh_token)
+    except TikTokApiError as exc:
+        raise _tiktok_error(exc) from exc
+    finally:
+        refresh_client.close()
+    token = normalize_tiktok_token(raw)
+    if not token["access_token"]:
+        mark_store_reauth_required(db, tenant_id, store.id, "刷新令牌未返回访问令牌")
+        db.commit()
+        raise AppError(ErrorCode.STORE_REAUTH_REQUIRED)
+    credential = repo.get_credential(db, tenant_id, store.id)
+    if credential is None:  # pragma: no cover
+        raise AppError(ErrorCode.STORE_NOT_CONNECTED)
+    access_expires, refresh_expires = tiktok_token_expiry_times(token)
+    credential.access_token_cipher = encrypt_secret(token["access_token"])
+    if token["refresh_token"]:
+        credential.refresh_token_cipher = encrypt_secret(token["refresh_token"])
+    credential.access_token_expires_at = access_expires
+    credential.refresh_token_expires_at = refresh_expires
+    credential.status = CREDENTIAL_STATUS_ACTIVE
+    credential.refreshed_at = utc_now()
+    credential.last_error = None
+    db.commit()
+    return make_client(token["access_token"])
+
+
+def _tiktok_listing_status(product: Mapping[str, Any]) -> str:
+    status = str(product.get("status") or "").strip().upper()
+    return LISTING_STATUS_ACTIVE if status in {"ACTIVATE", "ACTIVE", "LIVE"} else LISTING_STATUS_INACTIVE
+
+
+def _tiktok_price(sku: Mapping[str, Any], product: Mapping[str, Any]) -> Decimal | None:
+    price = sku.get("price")
+    if isinstance(price, Mapping):
+        for key in ("sale_price", "original_price", "tax_exclusive_price"):
+            value = price.get(key)
+            if value is not None:
+                parsed = _decimal_price(value)
+                if parsed is not None:
+                    return parsed
+    return _decimal_price(sku.get("price") or product.get("price"))
+
+
+def _tiktok_stock(sku: Mapping[str, Any]) -> int | None:
+    inventory = sku.get("inventory")
+    if isinstance(inventory, Sequence):
+        total = 0
+        found = False
+        for item in inventory:
+            if isinstance(item, Mapping) and item.get("quantity") is not None:
+                total += int(item.get("quantity") or 0)
+                found = True
+        if found:
+            return total
+    quantity = sku.get("quantity")
+    if quantity is not None:
+        try:
+            return int(quantity)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _tiktok_specs(sku: Mapping[str, Any]) -> dict[str, str]:
+    specs: dict[str, str] = {}
+    attributes = sku.get("sales_attributes") or sku.get("attributes")
+    if isinstance(attributes, Sequence):
+        for item in attributes:
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("name") or item.get("attribute_name") or "").strip()
+            value = str(
+                item.get("value_name") or item.get("value") or item.get("attribute_value") or ""
+            ).strip()
+            if name and value:
+                specs[name] = value
+    return specs
+
+
+def parse_tiktok_listings(products: Sequence[Mapping[str, Any]]) -> list[RemoteListing]:
+    """把 TikTok 商品搜索响应解析为平台商品行（纯逻辑）。"""
+    rows: list[RemoteListing] = []
+    for product in products:
+        if not isinstance(product, Mapping):
+            continue
+        product_id = normalize_external_id(product.get("id") or product.get("product_id"))
+        if not product_id:
+            continue
+        title = str(product.get("title") or product.get("product_name") or "")[:255]
+        status = _tiktok_listing_status(product)
+        raw_currency = product.get("currency")
+        skus = product.get("skus") or product.get("skus_info") or []
+        if not isinstance(skus, Sequence) or not skus:
+            skus = [{}]
+        for sku in skus:
+            if not isinstance(sku, Mapping):
+                continue
+            sku_id = normalize_external_id(sku.get("id") or sku.get("sku_id") or sku.get("seller_sku"))
+            specs = _tiktok_specs(sku)
+            rows.append(
+                RemoteListing(
+                    external_item_id=product_id,
+                    external_sku_id=sku_id,
+                    title=title,
+                    price=_tiktok_price(sku, product),
+                    currency=str(raw_currency or "")[:8],
+                    remote_stock=_tiktok_stock(sku),
+                    status=status,
+                    specs=specs,
+                    raw={
+                        "channel": CHANNEL_TIKTOK,
+                        "product": dict(product),
+                        "sku": dict(sku),
+                        "specs": specs,
+                    },
+                )
+            )
+    return rows
+
+
+def _fetch_tiktok_listings(
+    center: Session, db: Session, tenant_id: int, store: Store
+) -> list[RemoteListing]:
+    client = build_tiktok_client(center, db, tenant_id, store)
+    try:
+        rows: list[RemoteListing] = []
+        page_token = ""
+        for _ in range(MAX_ITEM_PAGES):
+            payload = client.search_products(page_size=100, page_token=page_token)
+            data = payload.get("data") if isinstance(payload, Mapping) else None
+            products = data.get("products") if isinstance(data, Mapping) else None
+            if not isinstance(products, Sequence):
+                products = []
+            rows.extend(parse_tiktok_listings(products))
+            page_token = str((data or {}).get("next_page_token") or "") if isinstance(data, Mapping) else ""
+            if not page_token:
+                break
+        return rows
+    except TikTokApiError as exc:
+        raise _tiktok_error(exc) from exc
+    finally:
+        client.close()
+
+
+def _fetch_tiktok_orders(
+    center: Session,
+    db: Session,
+    *,
+    tenant_id: int,
+    store_id: int,
+    since: datetime | None,
+    cursor: str | None,
+    page_size: int,
+) -> dict[str, Any]:
+    store = get_store_or_raise(db, tenant_id, store_id)
+    client = build_tiktok_client(center, db, tenant_id, store)
+    try:
+        now = utc_now()
+        start = since or (now - timedelta(days=1))
+        if start.tzinfo is not None:
+            start = start.astimezone(timezone.utc).replace(tzinfo=None)
+        payload = client.search_orders(
+            create_time_ge=int(start.replace(tzinfo=timezone.utc).timestamp()),
+            create_time_lt=int(now.replace(tzinfo=timezone.utc).timestamp()),
+            page_size=max(1, min(int(page_size), 100)),
+            next_page_token=cursor or "",
+        )
+        data = payload.get("data") if isinstance(payload, Mapping) else None
+        orders = data.get("orders") if isinstance(data, Mapping) else None
+        if not isinstance(orders, list):
+            orders = []
+        next_cursor = str((data or {}).get("next_page_token") or "") if isinstance(data, Mapping) else ""
+        return {
+            "orders": [dict(order) for order in orders if isinstance(order, Mapping)],
+            "next_cursor": next_cursor or None,
+            "has_more": bool(next_cursor),
+        }
+    except TikTokApiError as exc:
+        raise _tiktok_error(exc) from exc
+    finally:
+        client.close()
+
+
+def _push_tiktok_stock(
+    center: Session,
+    db: Session,
+    tenant_id: int,
+    store: Store,
+    listings: Sequence[ChannelListing],
+    stock: int,
+) -> dict[str, Any]:
+    client = build_tiktok_client(center, db, tenant_id, store)
+    try:
+        warehouse_id = (store.warehouse_id or "").strip()
+        if not warehouse_id:
+            warehouses = client.get_warehouses()
+            sales = [item for item in warehouses if str(item.get("type") or "") == "SALES_WAREHOUSE"]
+            chosen = (sales or warehouses or [{}])[0]
+            warehouse_id = str(chosen.get("id") or "")
+            if warehouse_id:
+                store.warehouse_id = warehouse_id[:64]
+        if not warehouse_id:
+            raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "TikTok 店铺未返回可用仓库")
+        pushed = 0
+        for listing in listings:
+            sku_id = normalize_external_id(listing.external_sku_id)
+            if not sku_id:
+                continue
+            client.update_inventory(
+                listing.external_item_id,
+                [{"id": sku_id, "inventory": [{"warehouse_id": warehouse_id, "quantity": clamp_stock_quantity(stock)}]}],
+            )
+            listing.remote_stock = stock
+            listing.synced_at = utc_now()
+            listing.updated_at = utc_now()
+            pushed += 1
+        db.commit()
+        return {"stock": stock, "pushed": pushed, "skipped": False}
+    except TikTokApiError as exc:
+        raise _tiktok_error(exc) from exc
+    finally:
+        client.close()
+
+
 def list_refresh_targets(
     db: Session, tenant_id: int, *, within_seconds: int = TOKEN_REFRESH_SKEW_SECONDS
 ) -> list[int]:
@@ -1245,6 +1530,8 @@ def fetch_remote_listings(
     center: Session, db: Session, tenant_id: int, store: Store
 ) -> list[RemoteListing]:
     """读取店铺全部商品与规格（HTTP 请求在事务之外，不在循环里写库）。"""
+    if store.channel == CHANNEL_TIKTOK:
+        return _fetch_tiktok_listings(center, db, tenant_id, store)
     client = build_store_client(center, db, tenant_id, store)
     try:
         item_statuses: dict[str, str] = {}
@@ -1344,6 +1631,12 @@ def _match_and_save_link(
     item_info = raw.get("item") if isinstance(raw.get("item"), Mapping) else None
     model_info = raw.get("model") if isinstance(raw.get("model"), Mapping) else None
     listing_specs = build_listing_specs(item_info, model_info)
+    if not listing_specs and isinstance(raw.get("specs"), Mapping):
+        listing_specs = {
+            str(key): str(value)
+            for key, value in raw["specs"].items()
+            if str(key).strip() and str(value).strip()
+        }
     match = match_listing_to_skus(
         external_sku_id=listing.external_sku_id,
         listing_specs=listing_specs,
@@ -1835,6 +2128,9 @@ def push_stock_for_sku(
         stock = read_available_stock(db, tenant_id, sku_id)
         if stock is None:
             return {"sku_id": sku_id, "pushed": 0, "skipped": True, "reason": "库存数据不可用"}
+        if store.channel == CHANNEL_TIKTOK:
+            item = _push_tiktok_stock(center, db, tenant_id, store, listings, stock)
+            return {"sku_id": sku_id, **item}
         client = build_store_client(center, db, tenant_id, store)
         pushed = 0
         try:
@@ -1976,6 +2272,16 @@ def _fetch_orders(
         raise AppError(ErrorCode.STORE_REAUTH_REQUIRED)
     if store.status != STORE_STATUS_CONNECTED:
         raise AppError(ErrorCode.STORE_NOT_CONNECTED)
+    if store.channel == CHANNEL_TIKTOK:
+        return _fetch_tiktok_orders(
+            center,
+            db,
+            tenant_id=tenant_id,
+            store_id=store_id,
+            since=since,
+            cursor=cursor,
+            page_size=page_size,
+        )
     client = build_store_client(center, db, tenant_id, store)
     try:
         now = utc_now()

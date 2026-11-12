@@ -519,6 +519,7 @@ def tiktok_oauth_callback(
                 session=session,
                 token=exchanged["token"],
                 shop=exchanged["shop"],
+                warehouse_id=exchanged.get("warehouse_id") or "",
             )
         return RedirectResponse(
             tiktok_oauth.frontend_redirect_url(

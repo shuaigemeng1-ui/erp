@@ -252,6 +252,52 @@ class TikTokClient:
             return []
         return [dict(shop) for shop in shops if isinstance(shop, Mapping)]
 
+    def get_warehouses(self) -> list[dict[str, Any]]:
+        """读取店铺仓库（库存推送需要 warehouse_id）。"""
+        payload = self.get("/logistics/202309/warehouses")
+        data = payload.get("data") if isinstance(payload, Mapping) else None
+        warehouses = data.get("warehouses") if isinstance(data, Mapping) else None
+        if not isinstance(warehouses, list):
+            return []
+        return [dict(item) for item in warehouses if isinstance(item, Mapping)]
+
+    def search_products(
+        self, *, page_size: int = 100, page_token: str = ""
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"page_size": max(1, min(int(page_size), 100))}
+        if page_token:
+            body["page_token"] = page_token
+        return self.post("/product/202309/products/search", body=body)
+
+    def search_orders(
+        self,
+        *,
+        create_time_ge: int,
+        create_time_lt: int,
+        page_size: int = 50,
+        next_page_token: str = "",
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "create_time_ge": int(create_time_ge),
+            "create_time_lt": int(create_time_lt),
+        }
+        if next_page_token:
+            body["next_page_token"] = next_page_token
+        return self.post(
+            "/order/202309/orders/search",
+            params={"page_size": max(1, min(int(page_size), 100))},
+            body=body,
+        )
+
+    def update_inventory(
+        self, product_id: str, skus: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """整店库存推送：``skus=[{id, inventory:[{warehouse_id, quantity}]}]``。"""
+        return self.post(
+            f"/product/202309/products/{product_id}/inventory/update",
+            body={"skus": skus},
+        )
+
     # ------------------------------------------------------------------ HTTP
     def _parse_response(self, response: httpx.Response, path: str) -> dict[str, Any]:
         try:

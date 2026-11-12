@@ -74,9 +74,23 @@ SHOPEE_STATUS_MAP: dict[str, NormalizedOrderStatus] = {
     "CANCELLED": NormalizedOrderStatus.CANCELLED,
 }
 
+# TikTok Shop 订单状态（旧应用 ch_tiktok_order_status_map 的归一化映射）
+TIKTOK_STATUS_MAP: dict[str, NormalizedOrderStatus] = {
+    "UNPAID": NormalizedOrderStatus.PENDING,
+    "ON_HOLD": NormalizedOrderStatus.PENDING,
+    "AWAITING_SHIPMENT": NormalizedOrderStatus.PAID,
+    "AWAITING_COLLECTION": NormalizedOrderStatus.PAID,
+    "PARTIALLY_SHIPPING": NormalizedOrderStatus.SHIPPED,
+    "IN_TRANSIT": NormalizedOrderStatus.SHIPPED,
+    "DELIVERED": NormalizedOrderStatus.SHIPPED,
+    "COMPLETED": NormalizedOrderStatus.COMPLETED,
+    "CANCELLED": NormalizedOrderStatus.CANCELLED,
+}
+
 # 渠道 -> 平台状态映射表。未登记渠道一律返回 unknown。
 CHANNEL_STATUS_MAPS: dict[str, dict[str, NormalizedOrderStatus]] = {
     "shopee": SHOPEE_STATUS_MAP,
+    "tiktok": TIKTOK_STATUS_MAP,
 }
 
 # 明细映射状态
@@ -292,7 +306,76 @@ def parse_shopee_order(payload: dict) -> ParsedOrder:
     )
 
 
-PARSERS = {"shopee": parse_shopee_order}
+def _parse_tiktok_lines(payload: dict) -> list[ParsedOrderLine]:
+    raw_items = payload.get("line_items") or payload.get("items") or []
+    if not isinstance(raw_items, list):
+        return []
+    lines: list[ParsedOrderLine] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        external_item_id = _text(
+            item.get("product_id") or item.get("item_id") or item.get("sku_id"), 64
+        )
+        external_sku_id = _text(
+            item.get("sku_id") or item.get("seller_sku") or item.get("id"), 64
+        )
+        quantity = item.get("quantity", 1)
+        try:
+            quantity_value = max(1, int(quantity))
+        except (TypeError, ValueError):
+            quantity_value = 1
+        sale_price = to_decimal(item.get("sale_price"))
+        original_price = to_decimal(item.get("original_price"))
+        unit_price = sale_price if sale_price > 0 else original_price
+        unit_discount = max(Decimal("0"), original_price - unit_price)
+        lines.append(
+            ParsedOrderLine(
+                external_item_id=external_item_id,
+                external_sku_id=external_sku_id,
+                item_name=_text(item.get("product_name"), 255),
+                quantity=quantity_value,
+                unit_price=unit_price,
+                discount_amount=unit_discount * quantity_value,
+                item_status=_text(item.get("display_status"), 32),
+            )
+        )
+    return lines
+
+
+def parse_tiktok_order(payload: dict) -> ParsedOrder:
+    """把 TikTok Shop 订单 JSON 归一化为 ``ParsedOrder``。"""
+    if not isinstance(payload, dict):
+        raise ValueError("平台订单数据必须是 JSON 对象")
+    external_order_no = _text(payload.get("id") or payload.get("order_id") or payload.get("order_sn"), 64)
+    if not external_order_no:
+        raise ValueError("平台订单数据缺少订单号")
+    platform_status = _text(payload.get("status") or payload.get("order_status"), 64)
+    status = normalize_platform_status("tiktok", platform_status)
+    reason = (
+        "" if status != NormalizedOrderStatus.UNKNOWN
+        else f"未知平台订单状态: {platform_status or '(空)'}"
+    )
+    payment = payload.get("payment") if isinstance(payload.get("payment"), dict) else {}
+    recipient = payload.get("recipient_address") if isinstance(payload.get("recipient_address"), dict) else {}
+    lines = _merge_lines(_parse_tiktok_lines(payload))
+    total = to_decimal(payment.get("total_amount") or payload.get("total_amount"))
+    if total <= 0 and lines:
+        total = sum((line.unit_price * line.quantity for line in lines), Decimal("0"))
+    return ParsedOrder(
+        external_order_no=external_order_no,
+        platform_status=platform_status,
+        status=status,
+        currency=_text(payload.get("currency") or payment.get("currency"), 8).upper(),
+        total_amount=total,
+        buyer_name=_text(recipient.get("name") or payload.get("buyer_name"), 128),
+        placed_at=parse_epoch(payload.get("create_time")),
+        lines=lines,
+        abnormal_reason=reason,
+    )
+
+
+PARSERS = {"shopee": parse_shopee_order, "tiktok": parse_tiktok_order}
 
 
 def parse_order_payload(channel: str, payload: dict) -> ParsedOrder:

@@ -132,15 +132,24 @@ onMounted(load)
   </el-card>
 
   <el-dialog v-model="authorizeVisible" title="授权 Shopee 店铺" width="460px" destroy-on-close>
-    <el-alert
-      title="将跳转到 Shopee 授权页，授权完成后自动回到本页。授权会话一次性有效。"
-      type="info"
-      :closable="false"
-      show-icon
-    />
+    <el-alert type="info" :closable="false" show-icon>
+      <p>将跳转到 Shopee 授权页，授权完成后自动回到本页。授权会话一次性有效。</p>
+      <p class="authorize-hint">
+        若提示「平台 Shopee 应用未配置」，请先在 平台管理 → 渠道应用 填写 Partner ID / Partner Key / Secret。
+      </p>
+    </el-alert>
     <template #footer>
       <el-button @click="authorizeVisible = false">取消</el-button>
       <el-button type="primary" :loading="authorizing" @click="confirmAuthorize">前往授权</el-button>
     </template>
   </el-dialog>
 </template>
+
+<style scoped>
+.authorize-hint {
+  margin-top: 6px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+</style>

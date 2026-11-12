@@ -316,3 +316,32 @@ caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl re
 > 实际联调需要 TikTok Shop 应用凭据与已授权店铺；当前平台渠道应用为空，
 > 配置 App Key/Secret 并完成授权后，定时任务/手动同步即可走 TikTok 分支。
 
+## 12. 多租户安全修复与同步恢复发布（2026-11-12）
+
+业务代码提交 `5f6c729`，前端静态权限修复提交 `ecb2bd3`，均已推送到 `origin/main` 并部署至 `/opt/ventasync`。
+本次未修改现有数据库密码、应用密钥或数据卷，未重建 MySQL/Redis 容器。
+
+发布过程：本地 `npm run build` → 服务器构建 API/前端镜像 → 停止 scheduler/API/Worker →
+备份中心库与全部租户库 → 独立 migrate 容器升级 → 更新 API/Worker/scheduler/nginx。
+停写后记录迁移前关键表行数，发布后进行对比。前端曾因宿主机 umask 导致静态文件不可读，
+已修复 `frontend/Dockerfile.runtime`，在镜像构建时统一文件读取与目录访问权限，并重新构建发布。
+
+| 检查 | 实际结果 |
+| --- | --- |
+| 中心库 | `ventasync_center`：`center_0005` → `center_0006`，15 张业务表 |
+| 两个租户库 | `vs_tenant_demo`、`vs_tenant_demo2`：`tenant_0007` → `tenant_0010`，各 29 张业务表 |
+| 外键与注释 | 三个业务库外键均为 0；业务表和字段中文注释完整，修复了 `stores.store_code` 旧迁移丢失的注释 |
+| 关键业务行数 | 用户、租户、租户映射、成员及现有商品、SKU、店铺、订单、库存余额、库存流水的行数与停写基线一致 |
+| API / Worker | 容器内 `/readyz` 返回 200；Celery inspect ping 返回 1 node online |
+| 公网 | 首页、`/login`、`/healthz`、`/api/v1/auth/csrf` 均为 200，CSRF Cookie 含 Secure |
+| 前端产物 | 公网 index 与仓库 dist 一致，主 JS/CSS 的 SHA-256 与发布产物一致 |
+| 数据备份 | 中心库 + 两个租户库的 `.sql.gz` 和 `.sha256` 全部校验通过 |
+
+本次备份与校验记录位于服务器 `/opt/backups/releases/erp-5f6c729/`，数据库备份在其 `database/` 子目录。
+同目录保存迁移前后结构与行数记录、公开站点检查结果、发布前 `.env`（权限 600）及前后提交号；这些文件不进入 Git。
+旧后端/前端镜像保留为 `ventasync-backend:rollback-5f6c729` 和 `ventasync-frontend:rollback-5f6c729`。
+数据库回退应先评估迁移与数据恢复，不能仅凭旧镜像认定回退完成。
+
+升级后所有用户需重新登录；旧永久授权链接需在店铺页面重新生成，已保存的平台凭据保留。
+本次没有执行真实平台库存写入，也没有认定 TikTok/Shopee 真实业务闭环已通过；仍按 `acceptance.md` 的独立环境清单继续验收。
+

@@ -7,8 +7,7 @@
 * ``PUT  /tenants/{tenant_id}/sync-schedules/{id}``        启停 / 间隔
 * ``GET  /tenants/{tenant_id}/tasks/{task_id}``            异步任务状态
 
-``task_id`` 优先按 ``sync_runs`` 解析（本系统 202 接口返回值）；纯数字之外的 ID
-按 Celery 任务解析，兼容其它模块自行生成 uuid 的 202 接口。
+``task_id`` 只接受已持久化的 ``sync_runs.id``，禁止查询无归属登记的 Celery UUID。
 """
 
 from __future__ import annotations
@@ -18,23 +17,66 @@ from typing import Any
 from fastapi import APIRouter, Depends, Path, Query
 
 from app.api.deps import TenantCtx, TenantDb, require_permission
+from app.core.access import effective_from_context
 from app.core.errors import AppError, ErrorCode
 from app.core.http import PageParams, accepted, paged, success
 from app.core.permissions import Permission
 from app.modules.tasks import repository
 from app.modules.tasks import service as tasks_service
-from app.modules.tasks import tasks as tasks_runner
 from app.modules.tasks.schemas import (
     SyncRunDetailOut,
     SyncRunOut,
     SyncScheduleOut,
     SyncScheduleUpdate,
+    SyncSettingsUpdate,
     TaskStatusOut,
 )
 
 router = APIRouter(prefix="/tenants/{tenant_id}", tags=["tasks"])
 
 _TASK_READ = Depends(require_permission(Permission.TASK_READ))
+_SCHEDULE_MANAGE = Depends(require_permission(Permission.TASK_SCHEDULE_MANAGE))
+_SETTING_MANAGE = Depends(require_permission(Permission.TENANT_SETTING_MANAGE))
+
+
+def _require_visible(context: Any, target: Any) -> None:
+    effective = effective_from_context(context)
+    if target is None or not tasks_service.scope_covers_target(effective, Permission.TASK_READ, target.store_id):
+        raise AppError(ErrorCode.TASK_NOT_FOUND)
+
+
+def _require_settings_scope(context: Any) -> None:
+    if not tasks_service.scope_covers_target(
+        effective_from_context(context), Permission.TENANT_SETTING_MANAGE, None,
+    ):
+        raise AppError(ErrorCode.PERMISSION_DENIED)
+
+
+@router.get("/sync-settings", summary="租户同步总开关")
+def get_sync_settings(
+    tenant_ctx: TenantCtx, db: TenantDb, _permission: Any = _SETTING_MANAGE,
+) -> dict[str, Any]:
+    _require_settings_scope(tenant_ctx)
+    return success(tasks_service.sync_settings_payload(db, tenant_ctx.tenant_id))
+
+
+@router.put("/sync-settings", summary="修改租户同步总开关")
+def put_sync_settings(
+    tenant_ctx: TenantCtx, db: TenantDb, payload: SyncSettingsUpdate,
+    _permission: Any = _SETTING_MANAGE,
+) -> dict[str, Any]:
+    _require_settings_scope(tenant_ctx)
+    values = payload.model_dump(exclude_none=True)
+    effective = effective_from_context(tenant_ctx)
+    for key, job_type in (("order_sync_enabled", "order_sync"), ("stock_push_enabled", "stock_push")):
+        if values.get(key):
+            tasks_service.ensure_job_access(effective, job_type, None)
+    result = tasks_service.update_sync_settings(
+        db, tenant_ctx.tenant_id, values, actor_id=tenant_ctx.user_id,
+    )
+    db.commit()
+    return success(result)
+
 
 
 @router.get("/sync-runs", summary="任务记录列表")
@@ -55,6 +97,7 @@ def list_sync_runs(
         store_id=store_id,
         page=pagination.page,
         page_size=pagination.page_size,
+        allowed_store_ids=effective_from_context(tenant_ctx).allowed_ids(Permission.TASK_READ, "stores"),
     )
     return paged(
         [SyncRunOut.model_validate(row) for row in rows],
@@ -72,8 +115,7 @@ def get_sync_run(
     _permission: Any = _TASK_READ,
 ) -> dict[str, Any]:
     run = repository.get_sync_run(db, tenant_ctx.tenant_id, run_id)
-    if run is None:
-        raise AppError(ErrorCode.TASK_NOT_FOUND)
+    _require_visible(tenant_ctx, run)
     return success(SyncRunDetailOut.model_validate(run))
 
 
@@ -84,6 +126,9 @@ def retry_sync_run(
     run_id: int = Path(ge=1, description="任务ID"),
     _permission: Any = _TASK_READ,
 ) -> Any:
+    run = repository.get_sync_run(db, tenant_ctx.tenant_id, run_id)
+    _require_visible(tenant_ctx, run)
+    tasks_service.ensure_job_access(effective_from_context(tenant_ctx), run.job_type, run.store_id)
     new_run_id = tasks_service.retry_sync_run(
         db,
         tenant_id=tenant_ctx.tenant_id,
@@ -101,7 +146,8 @@ def list_sync_schedules(
     job_type: str | None = Query(default=None, max_length=32),
     _permission: Any = _TASK_READ,
 ) -> dict[str, Any]:
-    rows = repository.list_schedules(db, tenant_ctx.tenant_id, job_type=job_type)
+    rows = repository.list_schedules(db, tenant_ctx.tenant_id, job_type=job_type,
+        allowed_store_ids=effective_from_context(tenant_ctx).allowed_ids(Permission.TASK_READ, "stores"))
     return success([SyncScheduleOut.model_validate(row) for row in rows])
 
 
@@ -111,8 +157,15 @@ def update_sync_schedule(
     db: TenantDb,
     payload: SyncScheduleUpdate,
     schedule_id: int = Path(ge=1, description="配置ID"),
-    _permission: Any = _TASK_READ,
+    _permission: Any = _SCHEDULE_MANAGE,
 ) -> dict[str, Any]:
+    current = repository.get_schedule(db, tenant_ctx.tenant_id, schedule_id)
+    effective = effective_from_context(tenant_ctx)
+    if current is None or not tasks_service.scope_covers_target(effective, Permission.TASK_SCHEDULE_MANAGE, current.store_id):
+        raise AppError(ErrorCode.TASK_NOT_FOUND)
+    tasks_service.ensure_job_access(effective, current.job_type, current.store_id)
+    if payload.enabled:
+        tasks_service.ensure_job_enabled(db, tenant_ctx.tenant_id, current.job_type)
     schedule = tasks_service.update_sync_schedule(
         db,
         tenant_id=tenant_ctx.tenant_id,
@@ -130,35 +183,16 @@ def get_task_status(
     tenant_ctx: TenantCtx,
     db: TenantDb,
     task_id: str = Path(min_length=1, max_length=64, description="任务ID"),
+    _permission: Any = _TASK_READ,
 ) -> dict[str, Any]:
-    """成员可查询的任务状态：同步任务读数据库，Celery 任务读结果后端。"""
-    tenant_id = tenant_ctx.tenant_id
-    if task_id.isdigit():
-        run = repository.get_sync_run(db, tenant_id, int(task_id))
-        if run is None:
-            raise AppError(ErrorCode.TASK_NOT_FOUND)
-        status = run.status
-        result: Any | None = None
-        if run.status == tasks_service.RUN_SUCCEEDED or run.status == tasks_service.RUN_PARTIAL:
-            result = {"total_processed": int(run.total_processed or 0)}
-        return success(
-            TaskStatusOut(
-                task_id=str(run.id),
-                type=str(run.job_type),
-                status=status,
-                result=result,
-                error=str(run.error_message or "") or None,
-            )
-        )
-
-    payload = tasks_runner.read_celery_task_status(task_id)
-    # 跨租户防护：Celery 结果若带 tenant_id，必须与路径租户一致，否则按不可见处理
-    result_value = payload.get("result")
-    if isinstance(result_value, dict) and result_value.get("tenant_id") is not None:
-        try:
-            result_tenant = int(result_value["tenant_id"])
-        except (TypeError, ValueError):
-            result_tenant = -1
-        if result_tenant != tenant_id:
-            raise AppError(ErrorCode.TASK_NOT_FOUND)
-    return success(TaskStatusOut(**payload))
+    """仅查询租户库中已登记、且位于成员可见范围内的任务。"""
+    if not task_id.isdigit():
+        raise AppError(ErrorCode.TASK_NOT_FOUND)
+    run = repository.get_sync_run(db, tenant_ctx.tenant_id, int(task_id))
+    _require_visible(tenant_ctx, run)
+    result = ({"total_processed": int(run.total_processed or 0)}
+              if run.status in {tasks_service.RUN_SUCCEEDED, tasks_service.RUN_PARTIAL} else None)
+    return success(TaskStatusOut(
+        task_id=str(run.id), type=str(run.job_type), status=run.status,
+        result=result, error=str(run.error_message or "") or None,
+    ))

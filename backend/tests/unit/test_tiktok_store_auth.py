@@ -58,11 +58,11 @@ def test_signed_state_binds_multiple_pending_stores() -> None:
     assert first != second
     assert parse_signed_state(first)["store_id"] == 11
     assert parse_signed_state(second)["store_id"] == 12
-    callback_first = consume_authorization_session(first)
-    callback_second = consume_authorization_session(second)
-    assert callback_first["store_id"] == 11
-    assert callback_second["store_id"] == 12
-    assert callback_first["store_code"] == "TKAAAAAAAA"
+    # 旧的自包含签名只证明完整性，不再能直接作为回调会话。
+    with pytest.raises(AppError):
+        consume_authorization_session(first)
+    with pytest.raises(AppError):
+        consume_authorization_session(second)
 
 
 def test_signed_state_rejects_tampered_payload() -> None:
@@ -73,10 +73,9 @@ def test_signed_state_rejects_tampered_payload() -> None:
         parse_signed_state(f"{tampered}.{signature}")
 
 
-def test_signed_state_without_expiry_is_permanently_valid() -> None:
+def test_legacy_signed_state_without_expiry_is_rejected() -> None:
     payload = _state_payload(store_id=13, store_code="TKCCCCCCCC")
     payload.pop("expires_at", None)
     state = build_signed_state(payload)
-    parsed = consume_authorization_session(state)
-    assert parsed["store_id"] == 13
-    assert parsed["store_code"] == "TKCCCCCCCC"
+    with pytest.raises(AppError):
+        consume_authorization_session(state)

@@ -169,8 +169,11 @@ def sync_store_listings(
     store_id: int,
     requested_by: int | None = None,
     sync_run_id: int | None = None,
+    triggered_by: str = "manual",
 ) -> dict[str, Any]:
     """同步店铺平台商品 / 规格并自动匹配本地 SKU。"""
+    if triggered_by == "manual" and requested_by is None:
+        raise AppError(ErrorCode.PERMISSION_DENIED, "手动任务缺少操作者")
     try:
         with job_tenant_context(
             tenant_id,
@@ -179,6 +182,10 @@ def sync_store_listings(
                 Permission.CHANNEL_LISTING_MAP.value if requested_by else None
             ),
         ) as (context, db):
+            from app.modules.tasks.service import ensure_job_access
+            from app.core.access import effective_from_context
+            if requested_by:
+                ensure_job_access(effective_from_context(context), "listing_sync", store_id)
             with center_session() as center:
                 result = service.sync_store_listings(
                     center, db, context.tenant_id, store_id, actor_id=requested_by
@@ -231,84 +238,13 @@ def _enqueue_sales_ingest(
 
 
 @celery_app.task(bind=True, name="app.modules.channels.tasks.run_order_sync", max_retries=MAX_RETRIES)
-def run_order_sync(
-    self: Task,
-    tenant_id: int,
-    sync_run_id: int,
-    store_id: int | None = None,
-    requested_by: int | None = None,
-    triggered_by: str = "manual",
-) -> dict[str, Any]:
-    """拉取店铺订单：读取平台原始订单 → 交给 sales 归一化（幂等）。"""
-    try:
-        with job_tenant_context(
-            tenant_id,
-            actor_user_id=requested_by,
-            required_permission=Permission.ORDER_SYNC.value if requested_by else None,
-        ) as (context, db):
-            store_ids = (
-                [int(store_id)]
-                if store_id is not None
-                else [
-                    store.id
-                    for store in repo.list_stores_all(
-                        db, tenant_id, status=STORE_STATUS_CONNECTED
-                    )
-                ]
-            )
-            summary: dict[str, Any] = {
-                "tenant_id": tenant_id,
-                "sync_run_id": sync_run_id,
-                "triggered_by": triggered_by,
-                "stores": {},
-            }
-            for current_store_id in store_ids:
-                try:
-                    fetched = service.fetch_orders(
-                        db, tenant_id=tenant_id, store_id=current_store_id
-                    )
-                    ingested = _enqueue_sales_ingest(
-                        db,
-                        tenant_id=tenant_id,
-                        store_id=current_store_id,
-                        payloads=fetched.get("orders") or [],
-                        sync_run_id=sync_run_id,
-                    )
-                    if ingested is not None:
-                        # sales 服务负责写入原始订单 / 归一化订单，统一在任务内提交
-                        db.commit()
-                    summary["stores"][str(current_store_id)] = {
-                        "fetched": len(fetched.get("orders") or []),
-                        "ingested": ingested,
-                    }
-                except AppError as exc:
-                    logger.warning(
-                        "拉单失败：tenant=%s store=%s code=%s message=%s",
-                        tenant_id,
-                        current_store_id,
-                        exc.code.value,
-                        exc.message,
-                    )
-                    summary["stores"][str(current_store_id)] = {
-                        "error": exc.code.value,
-                        "message": exc.message,
-                    }
-                except ShopeeApiError as exc:
-                    logger.warning(
-                        "拉单平台错误：tenant=%s store=%s code=%s message=%s",
-                        tenant_id,
-                        current_store_id,
-                        exc.error_code,
-                        exc.message,
-                    )
-                    summary["stores"][str(current_store_id)] = {
-                        "error": exc.error_code or "shopee_api_error",
-                        "message": exc.message,
-                    }
-            return summary
-    except Exception as exc:  # noqa: BLE001
-        _retry(self, exc)
-        raise
+def run_order_sync(self: Task, tenant_id: int, store_id: int | None = None,
+                   sync_run_id: int | None = None, requested_by: int | None = None,
+                   triggered_by: str = "webhook") -> dict[str, Any]:
+    """兼容旧任务名，统一进入带断点和权限门禁的销售同步器。"""
+    from app.modules.sales.tasks import run_order_sync as synchronize
+    return synchronize(tenant_id=tenant_id, store_id=store_id, sync_run_id=sync_run_id,
+                       requested_by=requested_by, triggered_by=triggered_by)
 
 
 # --------------------------------------------------------------------------- 令牌刷新
@@ -330,11 +266,18 @@ def refresh_store_token(self: Task, tenant_id: int, store_id: int) -> dict[str, 
 
 
 @celery_app.task(bind=True, name="app.modules.channels.tasks.refresh_expiring_tokens")
-def refresh_expiring_tokens(self: Task, tenant_id: int) -> dict[str, Any]:
+def refresh_expiring_tokens(self: Task, tenant_id: int, requested_by: int | None = None, triggered_by: str = "schedule") -> dict[str, Any]:
     """扫描租户内即将过期的店铺凭据并逐个刷新。"""
+    if triggered_by == "manual" and requested_by is None:
+        raise AppError(ErrorCode.PERMISSION_DENIED)
     result: dict[str, Any] = {"tenant_id": tenant_id, "refreshed": 0, "failed": 0, "errors": []}
-    with job_tenant_context(tenant_id) as (context, db):
+    with job_tenant_context(tenant_id, actor_user_id=requested_by, required_permission="store.connect") as (context, db):
         targets = service.list_refresh_targets(db, context.tenant_id)
+        if requested_by:
+            from app.core.access import effective_from_context
+            allowed = effective_from_context(context).allowed_ids("store.connect", "stores")
+            if allowed is not None:
+                targets = [item for item in targets if item in allowed]
     for store_id in targets:
         try:
             _refresh_store_token_impl(tenant_id, store_id)
@@ -356,11 +299,21 @@ def _run_stock_push_impl(
     *,
     sync_run_id: int | None = None,
     sku_ids: list[int] | None = None,
+    requested_by: int | None = None,
+    triggered_by: str = "schedule",
 ) -> dict[str, Any]:
-    with job_tenant_context(tenant_id) as (context, db):
+    if triggered_by == "manual" and requested_by is None:
+        raise AppError(ErrorCode.PERMISSION_DENIED, "手动任务缺少操作者")
+    with job_tenant_context(tenant_id, actor_user_id=requested_by if triggered_by == "manual" else None,
+                            required_permission="stock.push") as (context, db):
+        from app.modules.tasks.service import ensure_job_enabled, ensure_job_access
+        from app.core.access import effective_from_context
+        ensure_job_enabled(db, tenant_id, "stock_push")
+        if triggered_by == "manual":
+            ensure_job_access(effective_from_context(context), "stock_push", store_id)
         with center_session() as center:
             result = service.run_stock_push(
-                center, db, context.tenant_id, store_id, sku_ids=sku_ids
+                center, db, context.tenant_id, store_id, sku_ids=sku_ids, actor_id=requested_by
             )
     return {
         "tenant_id": tenant_id,
@@ -377,11 +330,14 @@ def run_stock_push(
     store_id: int,
     sync_run_id: int | None = None,
     sku_ids: list[int] | None = None,
+    requested_by: int | None = None,
+    triggered_by: str = "schedule",
 ) -> dict[str, Any]:
     """批量库存推送（按 store+sku 串行，执行时读取最新库存）。"""
     try:
         return _run_stock_push_impl(
-            tenant_id, store_id, sync_run_id=sync_run_id, sku_ids=sku_ids
+            tenant_id, store_id, sync_run_id=sync_run_id, sku_ids=sku_ids,
+            requested_by=requested_by, triggered_by=triggered_by
         )
     except Exception as exc:  # noqa: BLE001
         _retry(self, exc)

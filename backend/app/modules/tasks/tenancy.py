@@ -108,6 +108,8 @@ def resolve_job_identity(
         # 校验租户库路由存在（凭据只从中心库映射读取）
         load_tenant_route(center, tenant_id)
         actor_user_id = user_id
+        if actor_user_id is None and not automation:
+            raise AppError(ErrorCode.PERMISSION_DENIED, "手动任务缺少原始发起人")
         if actor_user_id is None:
             actor_user_id = load_tenant_owner_user_id(center, tenant_id)
         if not actor_user_id:

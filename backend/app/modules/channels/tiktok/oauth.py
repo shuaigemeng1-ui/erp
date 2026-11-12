@@ -1,7 +1,7 @@
 """TikTok Shop 店铺授权（OAuth）流程。
 
 * 发起授权：平台统一配置 TikTok App Key/Secret，租户只做店铺授权；
-* 授权 state 使用 HMAC 签名，绑定租户 / 成员 / 店铺 / 环境，链接长期有效；
+* 长期链接可撤销；网关签发绑定租户 / 店铺 / 渠道的 600 秒一次性 state；
 * 回调不依赖用户会话：校验 state 后换取 token，再读取授权店铺（含 shop_cipher）；
 * 店铺和加密凭据写入租户库，中心库登记店铺归属，写租户审计；
 * 外部 HTTP 请求在数据库事务之外执行，避免长时间持有事务。
@@ -74,7 +74,7 @@ def authorization_session_key(tenant_id: int, nonce: str) -> str:
 def build_authorization_url(
     *, service_id: str, state: str, market: str = "ROW"
 ) -> str:
-    """TikTok Shop 卖家授权链接：Service ID + 签名 state（长期有效）。"""
+    """TikTok Shop 卖家授权链接：Service ID + 短期一次性 state。"""
     normalized_service_id = (service_id or "").strip()
     normalized_market = (market or "ROW").strip().upper()
     if not normalized_service_id:
@@ -109,6 +109,7 @@ def create_authorization_session(
         "service_id": (service_id or "").strip(),
         "market": (market or "ROW").strip().upper(),
         "created_at": utc_now().isoformat(),
+        "expires_at": utc_after(ttl_seconds).isoformat(),
         "nonce": secrets.token_urlsafe(18),
     }
     state = build_signed_state(payload)
@@ -119,7 +120,7 @@ def create_authorization_session(
     )
     return {
         "auth_url": auth_url,
-        "expires_at": None,
+        "expires_at": payload["expires_at"],
         "environment": env,
         "state": state,
         "store_id": payload["store_id"],
@@ -192,16 +193,8 @@ def _consume_legacy_session(state: str | None) -> dict[str, Any]:
 
 
 def consume_authorization_session(state: str | None) -> dict[str, Any]:
-    """解析回调 state：优先自包含签名 state，兼容旧 Redis 一次性会话。"""
-    token = (state or "").strip()
-    try:
-        payload = parse_signed_state(token)
-    except AppError as signed_error:
-        try:
-            return _consume_legacy_session(token)
-        except AppError:
-            raise signed_error from None
-    return validate_authorization_session(payload)
+    from app.modules.channels.authorization import consume_state
+    return validate_authorization_session(consume_state(state, "tiktok")) | {"authorization_link_id": parse_signed_state(state)["authorization_link_id"]}
 
 
 # --------------------------------------------------------------------------- 发起授权
@@ -218,7 +211,7 @@ def start_authorization(
     request_id: str = "",
     ip: str = "",
 ) -> dict[str, Any]:
-    """发起 TikTok Shop 授权，返回长期有效的签名授权链接。
+    """发起 TikTok Shop 授权，返回可撤销、可轮换的长期授权邀请链接。
 
     ``store_id`` 存在时表示「先建店铺后授权」：链接只绑定该店铺，回调更新
     该店铺并置为已连接；不传则兼容旧流程，由回调按平台店铺 ID 创建。
@@ -255,6 +248,8 @@ def start_authorization(
         store_id=store.id if store is not None else None,
         store_code=store.store_code if store is not None else "",
     )
+    from app.modules.channels.authorization import issue_link
+    session = issue_link(center, channel=CHANNEL_TIKTOK, payload=parse_signed_state(session["state"]))
     channel_service.record_audit(
         db,
         tenant_id=tenant_id,
@@ -296,6 +291,8 @@ def exchange_code(app_key: str, app_secret: str, code: str) -> dict[str, Any]:
             ) from exc
         if not shops:
             raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "TikTok 未返回可用的店铺")
+        if len(shops) > 1:
+            return {"token": token, "shops": shops}
         shop = shops[0]
         client.shop_cipher = str(shop.get("cipher") or token.get("shop_cipher") or "")
         warehouse_id = ""

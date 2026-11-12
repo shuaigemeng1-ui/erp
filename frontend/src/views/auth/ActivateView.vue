@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { authApi } from '@/api/auth'
@@ -25,14 +25,19 @@ const form = reactive({
   password: '',
   confirm_password: '',
 })
-const rules: FormRules = {
+const requiresLogin = computed(() => invitation.value?.requires_login === true)
+const signedInAsInvitee = computed(() => requiresLogin.value && auth.isAuthenticated
+  && !auth.isPlatformMode && auth.user?.email.toLowerCase() === invitation.value?.email.toLowerCase())
+const rules = computed<FormRules>(() => requiresLogin.value ? {
+  password: signedInAsInvitee.value ? [] : [{ required: true, message: '请输入该账号的登录密码', trigger: 'blur' }],
+} : {
   display_name: [{ required: true, message: '请输入姓名', trigger: 'blur' }],
   password: [
     { required: true, message: '请设置密码', trigger: 'blur' },
-    { min: 8, message: '密码至少 8 位', trigger: 'blur' },
+    { min: 10, message: '密码至少 10 位', trigger: 'blur' },
   ],
   confirm_password: [{ required: true, message: '请再次输入密码', trigger: 'blur' }],
-}
+})
 
 const pending = ref(false)
 
@@ -41,6 +46,7 @@ onMounted(async () => {
     const info = await authApi.getInvitation(token)
     invitation.value = info
     pending.value = info.status === 'pending'
+    await auth.loadMe()
   } catch (cause) {
     loadError.value = cause instanceof Error ? cause.message : '邀请信息加载失败'
   } finally {
@@ -53,16 +59,17 @@ async function submit(): Promise<void> {
   if (!formInstance) return
   const valid = await formInstance.validate().catch(() => false)
   if (!valid) return
-  if (form.password !== form.confirm_password) {
+  if (!requiresLogin.value && form.password !== form.confirm_password) {
     ElMessage.warning('两次输入的密码不一致')
     return
   }
   submitting.value = true
   try {
-    await auth.acceptInvitation({
-      token,
-      password: form.password,
-      display_name: form.display_name.trim(),
+    if (requiresLogin.value && !signedInAsInvitee.value) {
+      await auth.login({ email: invitation.value!.email, password: form.password }, 'tenant')
+    }
+    await auth.acceptInvitation(requiresLogin.value ? { token } : {
+      token, password: form.password, display_name: form.display_name.trim(),
     })
     await enterApp()
   } catch {
@@ -76,8 +83,8 @@ async function submit(): Promise<void> {
 <template>
   <div class="auth-page">
     <div class="auth-card">
-      <h1 class="auth-title">激活账号</h1>
-      <p class="auth-subtitle">设置登录密码后加入租户</p>
+      <h1 class="auth-title">{{ requiresLogin ? '接受邀请' : '激活账号' }}</h1>
+      <p class="auth-subtitle">{{ requiresLogin ? (signedInAsInvitee ? '确认加入该租户' : '使用受邀账号的登录密码确认身份') : '设置登录密码后加入租户' }}</p>
 
       <el-skeleton v-if="loading" :rows="4" animated />
 
@@ -101,16 +108,20 @@ async function submit(): Promise<void> {
         />
 
         <el-form v-else ref="formRef" :model="form" :rules="rules" label-position="top" @submit.prevent="submit">
-          <el-form-item label="姓名" prop="display_name">
+          <el-alert v-if="!requiresLogin && auth.isAuthenticated" type="warning" :closable="false" style="margin-bottom: 12px">
+            <span>请先退出当前账号，再激活受邀账号。</span>
+            <el-button text type="primary" @click="auth.logout()">退出当前账号</el-button>
+          </el-alert>
+          <el-form-item v-if="!requiresLogin" label="姓名" prop="display_name">
             <el-input v-model="form.display_name" placeholder="请输入姓名" />
           </el-form-item>
-          <el-form-item label="密码" prop="password">
-            <el-input v-model="form.password" type="password" show-password autocomplete="new-password" />
+          <el-form-item v-if="!signedInAsInvitee" :label="requiresLogin ? '登录密码' : '设置密码'" prop="password">
+            <el-input v-model="form.password" type="password" show-password :autocomplete="requiresLogin ? 'current-password' : 'new-password'" />
           </el-form-item>
-          <el-form-item label="确认密码" prop="confirm_password">
+          <el-form-item v-if="!requiresLogin" label="确认密码" prop="confirm_password">
             <el-input v-model="form.confirm_password" type="password" show-password autocomplete="new-password" />
           </el-form-item>
-          <el-button type="primary" :loading="submitting" style="width: 100%" @click="submit">激活并登录</el-button>
+          <el-button type="primary" :disabled="!requiresLogin && auth.isAuthenticated" :loading="submitting" style="width: 100%" @click="submit">{{ requiresLogin ? '确认加入租户' : '激活并登录' }}</el-button>
         </el-form>
       </template>
 

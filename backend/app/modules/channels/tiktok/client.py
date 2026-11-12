@@ -272,15 +272,20 @@ class TikTokClient:
     def search_orders(
         self,
         *,
-        create_time_ge: int,
-        create_time_lt: int,
+        create_time_ge: int | None = None,
+        create_time_lt: int | None = None,
+        update_time_ge: int | None = None,
+        update_time_lt: int | None = None,
         page_size: int = 50,
         next_page_token: str = "",
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {
-            "create_time_ge": int(create_time_ge),
-            "create_time_lt": int(create_time_lt),
-        }
+        # 增量拉取按更新时间，才能读到很早创建、最近才取消的订单。
+        if update_time_ge is not None and update_time_lt is not None:
+            body: dict[str, Any] = {"update_time_ge": int(update_time_ge), "update_time_lt": int(update_time_lt)}
+        elif create_time_ge is not None and create_time_lt is not None:
+            body = {"create_time_ge": int(create_time_ge), "create_time_lt": int(create_time_lt)}
+        else:
+            raise ValueError("订单查询必须指定完整的创建或更新时间窗口")
         if next_page_token:
             body["next_page_token"] = next_page_token
         return self.post(

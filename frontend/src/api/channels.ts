@@ -59,6 +59,10 @@ export const channelsApi = {
     )
   },
 
+  revokeAuthorizationLink(tenantId: EntityId, storeId: EntityId): Promise<void> {
+    return http.delete<void>(tenantPath(tenantId, `/stores/${segment(storeId)}/authorization-link`))
+  },
+
   disconnectStore(tenantId: EntityId, storeId: EntityId): Promise<void> {
     return http.post<void>(tenantPath(tenantId, `/stores/${segment(storeId)}/disconnect`))
   },

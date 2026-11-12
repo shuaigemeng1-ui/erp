@@ -20,6 +20,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -41,6 +42,74 @@ JOB_TYPES: tuple[str, ...] = (
     JOB_LISTING_SYNC,
     JOB_TOKEN_REFRESH,
 )
+
+JOB_PERMISSIONS: dict[str, str] = {
+    JOB_ORDER_SYNC: "order.sync",
+    JOB_STOCK_PUSH: "stock.push",
+    JOB_LISTING_SYNC: "channel.listing.map",
+    JOB_TOKEN_REFRESH: "store.connect",
+}
+
+
+def job_enabled(db: Session, tenant_id: int, job_type: str) -> bool:
+    """读取当前执行开关，不使用登录时的缓存快照。缺失设置时禁止外部同步。"""
+    if job_type not in {JOB_ORDER_SYNC, JOB_STOCK_PUSH}:
+        return True
+    from app.modules.access.models_tenant import TenantSettings
+
+    column = (TenantSettings.order_sync_enabled if job_type == JOB_ORDER_SYNC
+              else TenantSettings.stock_push_enabled)
+    return bool(db.execute(select(column).where(TenantSettings.tenant_id == tenant_id)).scalar_one_or_none())
+
+
+def ensure_job_enabled(db: Session, tenant_id: int, job_type: str) -> None:
+    if not job_enabled(db, tenant_id, job_type):
+        raise AppError(ErrorCode.FEATURE_DISABLED, "租户已关闭该同步功能")
+
+
+def scope_covers_target(effective: Any, permission: str, store_id: int | None) -> bool:
+    """全租户任务仅对显式拥有全部范围的人可见或可操作。"""
+    if store_id is None:
+        return "all" in effective.granted_scope_types(permission)
+    return effective.covers(permission, store_id=int(store_id))
+
+
+def ensure_job_access(effective: Any, job_type: str, store_id: int | None) -> None:
+    permission = JOB_PERMISSIONS.get(job_type)
+    if not permission or not scope_covers_target(effective, permission, store_id):
+        raise AppError(ErrorCode.PERMISSION_DENIED)
+
+
+def sync_settings_payload(db: Session, tenant_id: int) -> dict[str, bool]:
+    from app.modules.access.models_tenant import TenantSettings
+
+    row = db.execute(select(TenantSettings).where(TenantSettings.tenant_id == tenant_id)).scalar_one_or_none()
+    return {
+        "order_sync_enabled": bool(row and row.order_sync_enabled),
+        "stock_push_enabled": bool(row and row.stock_push_enabled),
+    }
+
+
+def update_sync_settings(
+    db: Session, tenant_id: int, values: dict[str, bool], *, actor_id: int,
+) -> dict[str, bool]:
+    from app.modules.access.models_tenant import TenantSettings
+    from app.modules.access.service import bump_permission_version
+
+    row = db.execute(select(TenantSettings).where(TenantSettings.tenant_id == tenant_id).with_for_update()).scalar_one_or_none()
+    if row is None:
+        raise AppError(ErrorCode.NOT_FOUND, "租户设置不存在")
+    for key, value in values.items():
+        if key not in {"order_sync_enabled", "stock_push_enabled"}:
+            raise AppError(ErrorCode.VALIDATION_ERROR)
+        setattr(row, key, value)
+    if values:
+        bump_permission_version(db, tenant_id)
+        record_audit(db, tenant_id=tenant_id, action="task.settings.update",
+                     resource_type="tenant_settings", actor_id=actor_id,
+                     summary="更新租户同步总开关", payload=dict(values))
+    db.flush()
+    return sync_settings_payload(db, tenant_id)
 
 # 触发来源（webhook_retry：回调事件补偿扫描后的重投，仍视为平台回调类自动化任务）
 TRIGGERED_BY: tuple[str, ...] = (
@@ -182,7 +251,13 @@ def request_sync_run(
     造成同一批工作重复排队（真正防重仍由业务唯一约束保证）。
     """
     job_type_value = _validate_job_type(job_type)
-    existing = repository.find_pending_sync_run(db, tenant_id, job_type_value, store_id)
+    ensure_job_enabled(db, tenant_id, job_type_value)
+    if triggered_by == "manual" and requested_by is None:
+        raise AppError(ErrorCode.PERMISSION_DENIED, "手动任务缺少原始发起人")
+    existing = repository.find_pending_sync_run(
+        db, tenant_id, job_type_value, store_id,
+        triggered_by=triggered_by, requested_by=requested_by,
+    )
     if existing is not None:
         return int(existing.id)
     run_id = create_sync_run(

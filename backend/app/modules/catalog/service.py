@@ -74,9 +74,15 @@ class AuditContext:
 
 
 # --------------------------------------------------------------------------- 成本过滤（纯函数）
+def _require_master_scope(effective: EffectivePermissions, permission: str) -> None:
+    # 主商品属于全租户共享资料；店铺权限只能修改店铺刊登，不得影响其他店铺。
+    if "all" not in effective.granted_scope_types(permission):
+        raise PermissionDeniedError("访问共享主商品需要该操作的全部数据范围授权")
+
+
 def can_read_cost(effective: EffectivePermissions) -> bool:
     """当前授权是否包含 ``catalog.cost.read``。"""
-    return effective.has(Permission.CATALOG_COST_READ)
+    return "all" in effective.granted_scope_types(Permission.CATALOG_COST_READ)
 
 
 def redact_cost(value: Decimal | None, *, can_read: bool) -> Decimal | None:
@@ -96,6 +102,7 @@ def list_products(
     status: str | None = None,
 ) -> tuple[list[ProductListItem | ProductListItemPublic], int]:
     """商品分页列表；无成本权限时使用不含成本字段的响应模型。"""
+    _require_master_scope(effective, "catalog.product.read")
     include_cost = can_read_cost(effective)
     products, total = catalog_repo.list_products(
         db,
@@ -123,6 +130,7 @@ def get_product_detail(
     product_id: int,
     effective: EffectivePermissions,
 ) -> ProductDetail | ProductDetailPublic:
+    _require_master_scope(effective, "catalog.product.read")
     include_cost = can_read_cost(effective)
     product = catalog_repo.get_product(
         db, tenant_id, product_id, include_cost=include_cost
@@ -142,8 +150,12 @@ def create_product(
     audit: AuditContext,
 ) -> ProductDetail | ProductDetailPublic:
     """新建商品 + SKU + 图片（同一事务）；编码重复返回 409。"""
+    _require_master_scope(effective, "catalog.product.create")
     include_cost = can_read_cost(effective)
     _ensure_cost_write_allowed(payload, include_cost=include_cost)
+
+    from app.modules.platform.quotas import ensure_tenant_capacity
+    ensure_tenant_capacity(db, tenant_id, {'max_products': 1, 'max_skus': len(payload.skus)})
 
     if catalog_repo.get_product_by_code(db, tenant_id, payload.code) is not None:
         raise ConflictError("商品编码已存在", details={"field": "code"})
@@ -226,6 +238,7 @@ def update_product(
     audit: AuditContext,
 ) -> ProductDetail | ProductDetailPublic:
     """局部更新商品 / SKU / 图片；成本字段需要 ``catalog.cost.read``。"""
+    _require_master_scope(effective, "catalog.product.update")
     include_cost = can_read_cost(effective)
     _ensure_cost_write_allowed(payload, include_cost=include_cost)
 
@@ -234,6 +247,11 @@ def update_product(
         raise AppError(ErrorCode.PRODUCT_NOT_FOUND)
 
     fields_set = payload.model_fields_set
+    if "skus" in fields_set and payload.skus is not None:
+        from app.modules.platform.quotas import ensure_tenant_capacity
+        ensure_tenant_capacity(db, tenant_id, {
+            'max_skus': sum(1 for item in payload.skus if not item.id),
+        })
     _apply_product_fields(db, tenant_id, product, payload, fields_set, include_cost=include_cost)
 
     if "skus" in fields_set and payload.skus is not None:
@@ -281,6 +299,7 @@ def archive_product(
     audit: AuditContext,
 ) -> ProductDetail | ProductDetailPublic:
     """归档商品（状态字段，不物理删除）；重复归档幂等。"""
+    _require_master_scope(effective, "catalog.product.update")
     include_cost = can_read_cost(effective)
     product = catalog_repo.get_product(db, tenant_id, product_id, include_cost=include_cost)
     if product is None:

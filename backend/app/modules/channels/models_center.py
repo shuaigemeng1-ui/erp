@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Index, String, UniqueConstraint, text
+from sqlalchemy import JSON, BigInteger, DateTime, Index, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import CenterBase, IdMixin, TimestampMixin, table_options
@@ -119,3 +119,22 @@ class ChannelAccountRegistry(IdMixin, TimestampMixin, CenterBase):
     released_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True, comment="释放时间（UTC）"
     )
+
+
+class AuthorizationLink(IdMixin, TimestampMixin, CenterBase):
+    """可撤销的长期授权邀请；平台 OAuth state 另外生成且只能消费一次。"""
+
+    __tablename__ = "channel_authorization_links"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_authorization_link_token"),
+        Index("ix_authorization_link_target", "tenant_id", "channel", "store_id"),
+        table_options("渠道长期授权邀请表"),
+    )
+    tenant_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="授权租户ID")
+    member_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="发起成员ID")
+    store_id: Mapped[int | None] = mapped_column(BigInteger, comment="目标店铺ID")
+    channel: Mapped[str] = mapped_column(String(32), nullable=False, comment="授权渠道编码")
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, comment="链接随机凭据摘要")
+    status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, comment="状态：active/revoked/pending_save")
+    context: Mapped[dict] = mapped_column(JSON, nullable=False, comment="授权上下文，不含平台密钥")
+    result_cipher: Mapped[str | None] = mapped_column(Text, comment="待恢复的授权结果密文")

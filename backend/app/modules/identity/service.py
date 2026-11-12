@@ -47,6 +47,7 @@ from app.modules.access.service import (
     AccessSnapshot,
     assert_can_grant,
     assert_can_manage_permissions,
+    build_grants,
     bump_permission_version,
     feature_flag_map,
     validate_scope_choice,
@@ -298,20 +299,44 @@ def preview_invitation(center: Session, token: str) -> dict[str, Any]:
     tenant = repo.get_tenant(center, int(invitation.tenant_id))
     if tenant is None:
         raise AppError(ErrorCode.AUTH_TOKEN_INVALID)
+    user = repo.get_user_by_email(center, normalize_email(invitation.email))
     return {
         "tenant_id": str(tenant.id),
         "tenant_name": tenant.name,
         "email": invitation.email,
         "status": invitation.status,
         "expires_at": iso_utc(invitation.expires_at),
+        "requires_login": bool(user is not None and user.password_hash),
     }
 
 
 def accept_invitation(
-    center: Session, *, token: str, password: str, display_name: str = ""
+    center: Session, *, token: str, password: str = "", display_name: str = "",
+    authenticated_user_id: int | None = None,
 ) -> tuple[User, list[dict[str, Any]]]:
-    """接受邀请并设置密码：一次有效，重复使用返回 ``AUTH_TOKEN_USED``。"""
-    invitation = _load_invitation_by_token(center, token)
+    """已有账号必须以本人身份接受邀请；租户授权成功后才消费中心库令牌。"""
+    try:
+        return _accept_invitation_locked(
+            center, token=token, password=password, display_name=display_name,
+            authenticated_user_id=authenticated_user_id,
+        )
+    except Exception:
+        center.rollback()
+        raise
+
+
+def _accept_invitation_locked(
+    center: Session, *, token: str, password: str, display_name: str,
+    authenticated_user_id: int | None,
+) -> tuple[User, list[dict[str, Any]]]:
+    invitation = center.execute(
+        select(TenantInvitation)
+        .where(TenantInvitation.token_hash == _token_hash(token))
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if invitation is None:
+        raise AppError(ErrorCode.AUTH_TOKEN_INVALID)
     if invitation.status == InvitationStatus.ACCEPTED.value:
         raise AppError(ErrorCode.AUTH_TOKEN_USED)
     if invitation.status == InvitationStatus.REVOKED.value:
@@ -329,10 +354,27 @@ def accept_invitation(
         # 租户尚未开通完成时不允许激活，避免半开通状态产生可用账号
         raise AppError(ErrorCode.TENANT_NOT_ACTIVE)
 
-    validate_password_strength(password)
     email = normalize_email(invitation.email)
-    user = repo.get_user_by_email(center, email)
+    user = center.execute(
+        select(User).where(User.email == email).with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if user is not None and user.status != UserStatus.ACTIVE.value:
+        raise AppError(ErrorCode.AUTH_ACCOUNT_DISABLED)
+    if user is not None and user.password_hash:
+        if authenticated_user_id is None:
+            raise AppError(ErrorCode.AUTH_SESSION_REQUIRED, "请先登录受邀账号后接受邀请")
+        if authenticated_user_id != int(user.id):
+            raise AppError(ErrorCode.PERMISSION_DENIED, "请使用受邀邮箱对应的账号接受邀请")
+    else:
+        validate_password_strength(password)
+        if authenticated_user_id is not None:
+            raise AppError(ErrorCode.CONFLICT, "请退出当前账号后激活新账号")
     bindings = _bindings_from_json(invitation.role_ids)
+    route = load_tenant_db_route(center, int(tenant.id))
+    if route is None:
+        raise AppError(ErrorCode.TENANT_DATABASE_UNAVAILABLE)
+    # 中心库成员保持未激活，直到租户库授权提交成功。失败时令牌仍可重试。
     with run_in_transaction(center):
         if user is None:
             user = User(
@@ -350,36 +392,26 @@ def accept_invitation(
                 user.password_hash = hash_password(password)
             if display_name and not user.display_name:
                 user.display_name = display_name[:100]
-            user.status = UserStatus.ACTIVE.value
             center.add(user)
 
         membership = repo.get_membership(center, int(tenant.id), int(user.id))
         if membership is None:
+            from app.modules.platform.quotas import ensure_member_capacity
+            ensure_member_capacity(center, int(tenant.id), int(user.id))
             membership = TenantMembership(
                 tenant_id=int(tenant.id),
                 user_id=int(user.id),
-                status=MembershipStatus.ACTIVE.value,
+                status=MembershipStatus.INVITED.value,
                 is_owner=False,
                 joined_at=utc_now(),
             )
             center.add(membership)
             center.flush()
-        else:
-            membership.status = MembershipStatus.ACTIVE.value
-            membership.joined_at = membership.joined_at or utc_now()
-            center.add(membership)
-
-        invitation.status = InvitationStatus.ACCEPTED.value
-        invitation.accepted_at = utc_now()
-        invitation.accepted_user_id = int(user.id)
-        center.add(invitation)
-
-    route = load_tenant_db_route(center, int(tenant.id))
-    if route is None:
-        logger.warning("租户 %s 缺少数据库路由，邀请已接受但未写入角色绑定", tenant.id)
-    else:
+        elif membership.status == MembershipStatus.ACTIVE.value:
+            raise AppError(ErrorCode.CONFLICT, "该账号已经是租户成员")
         with tenant_session(route) as db, run_in_transaction(db):
             if bindings:
+                bindings = _validate_bindings(db, int(tenant.id), bindings)
                 _write_bindings(
                     db,
                     tenant_id=int(tenant.id),
@@ -401,6 +433,13 @@ def accept_invitation(
                 summary=f"接受邀请加入租户：{user.email}",
                 payload={"roles": [binding.role_id for binding in bindings]},
             )
+        membership.status = MembershipStatus.ACTIVE.value
+        membership.joined_at = membership.joined_at or utc_now()
+        center.add(membership)
+        invitation.status = InvitationStatus.ACCEPTED.value
+        invitation.accepted_at = utc_now()
+        invitation.accepted_user_id = int(user.id)
+        center.add(invitation)
     return user, list_user_tenants(center, int(user.id))
 
 
@@ -439,6 +478,8 @@ def create_member_invitation(
             center.add(user)
             center.flush()
         membership = repo.get_membership(center, tenant_id, int(user.id))
+        from app.modules.platform.quotas import ensure_member_capacity
+        ensure_member_capacity(center, tenant_id, int(user.id))
         if membership is None:
             membership = TenantMembership(
                 tenant_id=tenant_id,
@@ -706,7 +747,11 @@ def _validate_bindings(
     """校验角色存在、范围合法；返回规范化后的绑定（去重、排序）。"""
     if not bindings:
         raise AppError(ErrorCode.VALIDATION_ERROR, "至少需要分配一个角色")
-    roles = {int(role.id): role for role in repo.list_roles(db, tenant_id, include_disabled=True)}
+    roles = {int(role.id): role for role in db.execute(
+        select(Role).where(Role.tenant_id == tenant_id,
+                           Role.id.in_(sorted({int(item.role_id) for item in bindings})))
+        .order_by(Role.id).with_for_update().execution_options(populate_existing=True)
+    ).scalars()}
     normalized: list[RoleBindingChoice] = []
     seen: set[int] = set()
     for binding in bindings:
@@ -736,7 +781,7 @@ def _effective_for_bindings(
 ) -> EffectivePermissions:
     """按待授予的角色与范围计算「将被授予的授权」，用于防提权比较。"""
     role_ids = sorted({binding.role_id for binding in bindings})
-    permissions_map = repo.role_permission_map(db, tenant_id, role_ids)
+    permissions_map = repo.role_permission_map(db, tenant_id, role_ids, lock=True)
     grants: list[ScopeGrant] = []
     for binding in bindings:
         permissions = frozenset(permissions_map.get(binding.role_id) or ())
@@ -1278,14 +1323,39 @@ def update_role(
     actor_effective: EffectivePermissions,
 ) -> dict[str, Any]:
     """修改角色名称 / 说明 / 权限；权限变更后递增版本。"""
-    role = repo.get_role(db, tenant_id, role_id)
+    role = db.execute(select(Role).where(Role.tenant_id == tenant_id, Role.id == role_id)
+                      .with_for_update().execution_options(populate_existing=True)).scalar_one_or_none()
     if role is None:
         raise AppError(ErrorCode.NOT_FOUND, "角色不存在")
     codes: list[str] | None = None
     if permissions is not None:
         codes = _validate_permission_codes(permissions)
-        current = repo.role_permission_map(db, tenant_id, [role_id]).get(role_id, [])
-        assert_can_manage_permissions(actor_effective, set(codes) - set(current))
+        current = repo.role_permission_map(db, tenant_id, [role_id], lock=True).get(role_id, [])
+        if role.code == "owner" and set(codes) != set(current):
+            raise AppError(ErrorCode.CONFLICT, "所有者角色权限不能修改")
+        added = set(codes) - set(current)
+        assert_can_manage_permissions(actor_effective, added)
+        if added:
+            # 修改角色会立即影响全部既有绑定；校验每条绑定，而非只比较权限编码。
+            from app.modules.access.models_tenant import RoleBindingScope
+
+            bindings = list(db.execute(
+                select(MemberRole.id, MemberRole.role_id).where(
+                    MemberRole.tenant_id == tenant_id, MemberRole.role_id == role_id,
+                ).with_for_update()
+            ).all())
+            scopes: dict[int, list[tuple[str, int]]] = {}
+            if bindings:
+                for binding_id, scope_type, scope_id in db.execute(
+                    select(RoleBindingScope.member_role_id, RoleBindingScope.scope_type,
+                           RoleBindingScope.scope_id).where(
+                        RoleBindingScope.tenant_id == tenant_id,
+                        RoleBindingScope.member_role_id.in_([row[0] for row in bindings]),
+                    )
+                ).all():
+                    scopes.setdefault(int(binding_id), []).append((str(scope_type), int(scope_id)))
+            grants = build_grants(bindings, {role_id: added}, scopes)
+            assert_can_grant(actor_effective, EffectivePermissions(grants=grants))
     with run_in_transaction(db):
         if name is not None:
             if not name.strip():

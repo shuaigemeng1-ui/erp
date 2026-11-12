@@ -304,6 +304,9 @@ def _load_feature_flags(db: Session, tenant_id: int, settings_row: TenantSetting
         )
     ).scalars():
         flags.add(str(feature_code))
+    # 总开关具有最终否决权；FeatureSetting 不得把已关闭的同步重新显示为开启。
+    flags.discard(FEATURE_ORDER_SYNC)
+    flags.discard(FEATURE_STOCK_PUSH)
     if settings_row is not None:
         if settings_row.order_sync_enabled:
             flags.add(FEATURE_ORDER_SYNC)

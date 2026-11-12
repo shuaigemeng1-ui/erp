@@ -31,6 +31,8 @@ from app.modules.platform.router import router as platform_router
 from app.modules.sales.router import router as sales_router
 from app.modules.tasks.router import router as tasks_router
 
+from app.modules.channels.authorization import router as authorization_router
+
 api_router = APIRouter()
 api_router.include_router(identity_router)
 api_router.include_router(identity_tenant_router)
@@ -42,6 +44,7 @@ api_router.include_router(sales_router)
 api_router.include_router(tasks_router)
 api_router.include_router(audit_router)
 api_router.include_router(integration_router)
+api_router.include_router(authorization_router)
 api_router.include_router(tiktok_legacy_router)
 api_router.include_router(tiktok_integration_router)
 

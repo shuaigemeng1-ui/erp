@@ -54,3 +54,8 @@ export interface AsyncTask {
 }
 
 export type TaskStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'partial' | string
+
+export interface SyncSettings {
+  order_sync_enabled: boolean
+  stock_push_enabled: boolean
+}

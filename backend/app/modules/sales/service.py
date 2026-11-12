@@ -42,6 +42,7 @@ from app.modules.sales.models_tenant import (
     OrderStatusHistory,
     OrderStockEffect,
     PlatformOrderRaw,
+    OrderSyncCheckpoint,
 )
 from app.modules.sales.order_mapping import (
     MAPPING_AMBIGUOUS,
@@ -55,6 +56,7 @@ from app.modules.sales.order_mapping import (
     push_quantity,
     compute_stock_delta,
     target_stock_quantity,
+    parse_epoch,
 )
 from app.modules.tasks import service as tasks_service
 from app.modules.tasks.models_tenant import OutboxEvent, SyncRun
@@ -650,6 +652,8 @@ def _persist_platform_raw(
     """写 / 更新平台原始订单（同店铺同订单号只保留最新一份），返回原始数据 ID。"""
     existing = repository.find_platform_raw(db, tenant_id, store_id, external_order_no)
     if existing is not None:
+        if _older_platform_snapshot(payload, existing.payload):
+            return int(existing.id)
         existing.channel = channel
         existing.payload = payload
         existing.fetched_at = utcnow()
@@ -673,11 +677,20 @@ def _persist_platform_raw(
         )
         if existing is None:  # pragma: no cover - 唯一约束冲突后必然能查到
             raise
+        if _older_platform_snapshot(payload, existing.payload):
+            return int(existing.id)
         existing.payload = payload
         existing.fetched_at = utcnow()
         db.flush()
         return int(existing.id)
     return int(raw.id)
+
+
+def _older_platform_snapshot(incoming: dict[str, Any], current: dict[str, Any]) -> bool:
+    """有平台更新时间时拒绝旧快照覆盖新状态；不推测未知时间的顺序。"""
+    old = parse_epoch(current.get("update_time") or current.get("update_timestamp"))
+    new = parse_epoch(incoming.get("update_time") or incoming.get("update_timestamp"))
+    return old is not None and new is not None and new < old
 
 
 def _enqueue_normalize_retry(
@@ -1131,21 +1144,25 @@ def _available_quantity_map(
     return {int(row["sku_id"]): int(row["available"] or 0) for row in rows}
 
 
-def sync_since_default(db: Session, *, tenant_id: int, lookback_days: int = DEFAULT_SYNC_LOOKBACK_DAYS) -> datetime:
-    """拉单起始时间：上次成功同步前 2 小时（重叠窗口保证不漏单），否则回看默认天数。"""
-    last_finished = db.execute(
-        select(func.max(SyncRun.finished_at)).where(
-            SyncRun.tenant_id == tenant_id,
-            SyncRun.job_type == tasks_service.JOB_ORDER_SYNC,
-            SyncRun.status.in_(["succeeded", "partial"]),
-        )
-    ).scalar_one_or_none()
-    now = utcnow()
-    if isinstance(last_finished, datetime):
-        since = last_finished - timedelta(hours=2)
-        floor = now - timedelta(days=lookback_days)
-        return since if since > floor else floor
-    return now - timedelta(days=lookback_days)
+def sync_since_default(
+    db: Session, *, tenant_id: int, store_id: int | None = None,
+    channel: str | None = None, environment: str | None = None,
+    lookback_days: int = DEFAULT_SYNC_LOOKBACK_DAYS,
+) -> datetime:
+    """只使用指定店铺渠道环境的成功水位；缺少完整作用域时回看初始窗口。"""
+    if store_id is not None and channel and environment:
+        checkpoint = db.execute(select(OrderSyncCheckpoint).where(
+            OrderSyncCheckpoint.tenant_id == tenant_id,
+            OrderSyncCheckpoint.store_id == store_id,
+            OrderSyncCheckpoint.channel == channel,
+            OrderSyncCheckpoint.environment == environment,
+        )).scalar_one_or_none()
+        if checkpoint is not None:
+            if checkpoint.window_start is not None:
+                return checkpoint.window_start
+            if checkpoint.watermark is not None:
+                return checkpoint.watermark - timedelta(hours=2)
+    return utcnow() - timedelta(days=lookback_days)
 
 
 def summarize_ingest(summary: dict[str, Any]) -> tuple[str, int, str]:

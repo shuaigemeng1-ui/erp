@@ -244,34 +244,36 @@ CONSTRAINT_PREFIXES = (
 
 
 def parse_sql_tables(sql: str) -> dict[str, dict[str, object]]:
-    """解析离线 SQL 中的建表语句：表注释与缺注释字段。"""
+    """解析 CREATE 以及后续 ADD/MODIFY/DROP，检查最终模式，防止 MODIFY 清除注释。"""
     tables: dict[str, dict[str, object]] = {}
     for match in CREATE_TABLE_RE.finditer(sql):
         name, body, options = match.group(1), match.group(2), match.group(3)
-        # alembic_version 建表语句没有 ENGINE，正则会跨到下一条建表；跳过这类跨界匹配
-        if "CREATE TABLE" in body:
-            continue
         comment_match = re.search(r"COMMENT='([^']*)'", options)
-        missing_columns: list[str] = []
-        non_chinese_columns: list[str] = []
+        columns: dict[str, str] = {}
         for raw_line in body.splitlines():
             line = raw_line.strip().rstrip(",")
             if not line or line.upper().startswith(CONSTRAINT_PREFIXES):
                 continue
-            column = re.match(r"^([a-z_][a-z0-9_]*)\s", line)
-            if not column:
-                continue
-            if " COMMENT '" not in line:
-                missing_columns.append(column.group(1))
-                continue
-            column_comment = re.search(r" COMMENT '([^']*)'", line)
-            if not column_comment or not has_chinese(column_comment.group(1)):
-                non_chinese_columns.append(column.group(1))
-        tables[name] = {
-            "comment": comment_match.group(1) if comment_match else "",
-            "missing_columns": missing_columns,
-            "non_chinese_columns": non_chinese_columns,
-        }
+            column = re.match(r"^`?([a-z_][a-z0-9_]*)`?\s", line)
+            if column:
+                comment = re.search(r" COMMENT '([^']*)'", line)
+                columns[column.group(1)] = comment.group(1) if comment else ""
+        tables[name] = {"comment": comment_match.group(1) if comment_match else "", "columns": columns}
+    alterations = re.compile(r"ALTER TABLE `?(\w+)`? (ADD COLUMN|MODIFY(?: COLUMN)?|DROP COLUMN) `?(\w+)`?([^;]*);", re.DOTALL | re.IGNORECASE)
+    for alteration in alterations.finditer(sql):
+        name, action, column, definition = alteration.groups()
+        if name not in tables:
+            continue
+        columns = tables[name]["columns"]
+        if action.upper() == "DROP COLUMN":
+            columns.pop(column, None)
+        else:
+            comment = re.search(r" COMMENT '([^']*)'", definition)
+            columns[column] = comment.group(1) if comment else ""
+    for info in tables.values():
+        columns = info["columns"]
+        info["missing_columns"] = [name for name, comment in columns.items() if not comment]
+        info["non_chinese_columns"] = [name for name, comment in columns.items() if comment and not has_chinese(comment)]
     return tables
 
 
@@ -297,6 +299,25 @@ def check_migration_sql(checker: Checker, label: str, sql: str, expected_tables:
         f"共 {len(sql_tables)} 张"
         + (f"；缺少 {missing_tables}" if missing_tables else "")
         + (f"；多出 {extra_tables}" if extra_tables else ""),
+    )
+
+    # 比较最终列集合，避免新增模型字段没有迁移、或 ADD/MODIFY 未纳入基线检查。
+    from app.db.registry import center_metadata, tenant_metadata
+
+    metadata = center_metadata if label == "中心库" else tenant_metadata
+    column_differences: list[str] = []
+    for name in sorted(expected_tables & set(sql_tables) & set(metadata.tables)):
+        expected_columns = set(metadata.tables[name].columns.keys())
+        actual_columns = set(sql_tables[name]["columns"])
+        if expected_columns != actual_columns:
+            column_differences.append(
+                f"{name}: 缺少={sorted(expected_columns - actual_columns)}, "
+                f"多出={sorted(actual_columns - expected_columns)}"
+            )
+    checker.check(
+        not column_differences,
+        f"{label}最终迁移列与模型一致",
+        "；".join(column_differences),
     )
 
     table_comment_problems = [
@@ -412,58 +433,48 @@ def check_metadata(
 
 # --------------------------------------------------------------------------- 迁移文件 / revision
 def check_migration_files(checker: Checker, entries: list[tuple[str, str, str]]) -> None:
-    if not entries:
-        checker.fail("迁移基线解析", "docs/data-model.md「迁移基线」未解析到迁移文件")
-        return
-    checker.ok("迁移基线解析", f"{len(entries)} 个迁移文件")
+    """从 Alembic 实际版本图发现全部迁移；文档只作为对照，不能决定校验范围。"""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
 
-    last_revision: dict[str, str] = {}
-    problems: list[str] = []
-    for database, relative_path, expected_revision in entries:
-        # 文档中的迁移路径相对 backend/（如 alembic/tenant/versions/...）
-        path = BACKEND_ROOT / relative_path
-        if not path.is_file():
-            problems.append(f"缺少迁移文件 {relative_path}")
-            continue
-        content = path.read_text(encoding="utf-8")
-        revision_match = re.search(r'^revision\s*=\s*"([^"]+)"', content, re.MULTILINE)
-        down_match = re.search(
-            r"^down_revision\s*=\s*(?:None|\"([^\"]+)\")", content, re.MULTILINE
-        )
-        actual_revision = revision_match.group(1) if revision_match else ""
-        actual_down = (down_match.group(1) if down_match and down_match.group(1) else None)
-        if actual_revision != expected_revision:
-            problems.append(
-                f"{relative_path} 的 revision={actual_revision!r} 与文档 {expected_revision!r} 不一致"
-            )
-        previous = last_revision.get(database)
-        if previous is None:
-            if actual_down is not None:
-                problems.append(f"{relative_path} 是首个迁移但 down_revision={actual_down!r}")
-        elif actual_down != previous:
-            problems.append(
-                f"{relative_path} 的 down_revision={actual_down!r} 应为 {previous!r}"
-            )
-        last_revision[database] = actual_revision or expected_revision
-
-    checker.check(not problems, "迁移文件存在且 revision 链路连续", "；".join(problems))
-    if last_revision:
-        checker.ok(
-            "迁移链末端",
-            "，".join(f"{key}: {value}" for key, value in sorted(last_revision.items())),
-        )
-
+    actual: list[tuple[str, str, str]] = []
+    heads: dict[str, str] = {}
+    for database, ini in (("center", CENTER_INI), ("tenant", TENANT_INI)):
+        try:
+            script = ScriptDirectory.from_config(Config(str(ini)))
+            discovered_heads = script.get_heads()
+            if len(discovered_heads) != 1:
+                checker.fail(f"{database} 单一迁移末端", str(discovered_heads))
+                continue
+            revisions = list(reversed(list(script.walk_revisions(base="base", head="heads"))))
+            previous = None
+            for item in revisions:
+                if item.down_revision != previous:
+                    raise ValueError(f"{item.revision}: down_revision={item.down_revision!r}, expected={previous!r}")
+                relative = Path(item.path).resolve().relative_to(BACKEND_ROOT).as_posix()
+                actual.append((database, relative, item.revision))
+                previous = item.revision
+            heads[database] = discovered_heads[0]
+        except Exception as exc:
+            checker.fail(f"{database} 实际迁移图可读取", str(exc))
+    checker.check(bool(actual), "实际迁移发现", f"{len(actual)} 个迁移文件")
+    documented = set(entries)
+    discovered = set(actual)
+    checker.check(
+        len(entries) == len(documented) and documented == discovered,
+        "迁移文档覆盖实际版本图",
+        f"遗漏={sorted(discovered - documented)}；过时={sorted(documented - discovered)}"
+        if documented != discovered else f"共 {len(actual)} 个迁移文件",
+    )
+    if heads:
+        checker.ok("实际迁移链末端", "，".join(f"{key}: {value}" for key, value in sorted(heads.items())))
     source_problems: list[str] = []
     for versions_dir in (CENTER_VERSIONS, TENANT_VERSIONS):
         for path in sorted(versions_dir.glob("*.py")):
             content = path.read_text(encoding="utf-8")
-            if re.search(r"\bForeignKey\b|\bcreate_foreign_key\b", content):
+            if re.search(r"\bForeignKey(?:Constraint)?\b|\bcreate_foreign_key\b", content):
                 source_problems.append(path.name)
-    checker.check(
-        not source_problems,
-        "迁移源码零外键",
-        f"检测到外键定义：{source_problems}" if source_problems else "",
-    )
+    checker.check(not source_problems, "全部迁移源码零外键", str(source_problems) if source_problems else "")
 
 
 # --------------------------------------------------------------------------- 权限

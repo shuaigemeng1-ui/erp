@@ -19,9 +19,16 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from sqlalchemy import select
+
 from app.core.access import effective_from_context
 from app.core.context import require_tenant_context
-from app.core.errors import AppError
+from app.core.errors import AppError, ErrorCode
+from app.core.redis import acquire_lock, release_lock
+from app.db.base import utcnow
+from app.modules.sales import checkpoints
+from app.modules.channels.models_tenant import Store
+from app.modules.tasks import service as tasks_service
 from app.db.session import tenant_session
 from app.modules.sales import service as sales_service
 from app.modules.tasks import repository as tasks_repository
@@ -99,17 +106,14 @@ def run_order_sync(
         "stores": 0,
     }
     automation = triggered_by != "manual"
+    if not automation and not requested_by:
+        raise AppError(ErrorCode.PERMISSION_DENIED, "手动同步缺少执行成员")
     with job_tenant_session(tenant_id, user_id=requested_by, automation=automation) as (
         context,
         _context_db,
     ):
         if not automation:
             guard_manual_permission(context, "order.sync")
-        # 游标使用独立 Session 读取：任务被中断后可从上次进度继续（订单归一化本身幂等）
-        with tenant_session(context.db_route) as progress_db:
-            run = tasks_repository.get_sync_run(progress_db, tenant_id, int(sync_run_id or 0))
-            cursor = str(run.cursor or "") if run is not None else ""
-
         with tenant_session(context.db_route) as db:
             store_ids = _target_store_ids(db, tenant_id, store_id)
             store_ids = _allowed_store_ids(context, store_ids)
@@ -126,7 +130,7 @@ def run_order_sync(
                     sync_run_id=sync_run_id,
                     requested_by=requested_by,
                     triggered_by=triggered_by,
-                    initial_cursor=cursor,
+
                 )
             except Exception as exc:  # noqa: BLE001 - 单店铺失败不影响其它店铺
                 summary["errors"] += 1
@@ -136,6 +140,8 @@ def run_order_sync(
             summary["stores"] += 1
             for key in ("total_processed", "orders_created", "orders_updated", "stock_changed"):
                 summary[key] += int(store_summary.get(key) or 0)
+            if not store_summary.get("complete", True):
+                summary["status"] = "partial"
             summary["errors"] += int(store_summary.get("errors") or 0)
             summary["messages"].extend(store_summary.get("messages") or [])
             with tenant_session(context.db_route) as progress_db:
@@ -144,7 +150,8 @@ def run_order_sync(
                 )
                 if run is not None:
                     run.total_processed = summary["total_processed"]
-                    run.cursor = str(store_summary.get("cursor") or "")
+                    # 真实断点保存在店铺检查点，任务级游标不混用不同店铺。
+                    run.cursor = ""
                     progress_db.commit()
 
     if summary["errors"] and summary["total_processed"] == 0:
@@ -174,53 +181,111 @@ def _sync_one_store(
     triggered_by: str,
     initial_cursor: str = "",
 ) -> dict[str, Any]:
-    """同步单个店铺：分页拉单 → 归一化，返回本店铺汇总。"""
-    result: dict[str, Any] = {
-        "total_processed": 0,
-        "orders_created": 0,
-        "orders_updated": 0,
-        "stock_changed": 0,
-        "errors": 0,
-        "messages": [],
-        "cursor": initial_cursor,
-    }
+    """一个店铺独立锁、固定窗口和断点；仅全部页面归一化成功才推进水位。"""
     context = require_tenant_context()
-    cursor = initial_cursor or None
+    lock_name = f"orders:sync:{tenant_id}:{store_id}"
+    token = acquire_lock(lock_name, ttl_seconds=900)
+    if token is None:
+        return {"complete": False, "errors": 0, "messages": [f"店铺 {store_id} 正在同步"]}
+    try:
+        return _sync_locked_store(tenant_id=tenant_id, store_id=store_id,
+                                 sync_run_id=sync_run_id, requested_by=requested_by,
+                                 triggered_by=triggered_by, context=context)
+    finally:
+        release_lock(lock_name, token)
+
+
+def _sync_locked_store(*, tenant_id: int, store_id: int, sync_run_id: int | None,
+                       requested_by: int | None, triggered_by: str, context: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "total_processed": 0, "orders_created": 0, "orders_updated": 0,
+        "stock_changed": 0, "errors": 0, "messages": [], "cursor": "", "complete": False,
+    }
     with tenant_session(context.db_route) as db:
-        since = sales_service.sync_since_default(db, tenant_id=tenant_id)
+        tasks_service.ensure_job_enabled(db, tenant_id, tasks_service.JOB_ORDER_SYNC)
+        store = db.execute(select(Store).where(Store.tenant_id == tenant_id,
+                                               Store.id == store_id)).scalar_one_or_none()
+        if store is None or store.status != "connected":
+            raise AppError(ErrorCode.STORE_NOT_CONNECTED)
+        channel, environment = str(store.channel), str(store.environment)
+        checkpoint = checkpoints.open_window(db, tenant_id=tenant_id, store_id=store_id,
+                                              channel=channel, environment=environment, now=utcnow())
+        since, until, cursor = checkpoint.window_start, checkpoint.window_end, checkpoint.cursor or None
+        db.commit()
     for _page in range(MAX_PAGES_PER_RUN):
-        page = _fetch_order_page(
-            tenant_id=tenant_id,
-            store_id=store_id,
-            since=since,
-            cursor=cursor,
-        )
+        # 每一页前重新检查功能开关和身份，停用/撤权不会继续下一次外部调用。
+        try:
+            with tenant_session(context.db_route) as db:
+                tasks_service.ensure_job_enabled(db, tenant_id, tasks_service.JOB_ORDER_SYNC)
+            if triggered_by == "manual":
+                with job_tenant_session(tenant_id, user_id=requested_by, automation=False) as (fresh, _db):
+                    guard_manual_permission(fresh, "order.sync")
+                    if not effective_from_context(fresh).covers("order.sync", store_id=store_id):
+                        raise AppError(ErrorCode.PERMISSION_DENIED, "店铺同步权限已撤销")
+            page = _fetch_order_page(tenant_id=tenant_id, store_id=store_id,
+                                     since=since, until=until, cursor=cursor)
+        except Exception as exc:  # 已提交的前面页面不能因后续网络/权限错误丢失统计
+            return _page_failure(result, cursor, exc)
         orders = list(page.get("orders") or [])
         if orders:
-            with tenant_session(context.db_route) as db:
-                ingest = sales_service.ingest_platform_orders(
-                    db,
-                    tenant_id=tenant_id,
-                    store_id=store_id,
-                    channel="shopee",
-                    payloads=orders,
-                    sync_run_id=sync_run_id,
-                    triggered_by=triggered_by,
-                )
-            result["total_processed"] += int(ingest.get("total") or 0)
-            result["orders_created"] += int(ingest.get("orders_created") or 0)
-            result["orders_updated"] += int(ingest.get("orders_updated") or 0)
-            result["stock_changed"] += int(ingest.get("stock_changed") or 0)
+            try:
+                with tenant_session(context.db_route) as db:
+                    ingest = sales_service.ingest_platform_orders(
+                        db, tenant_id=tenant_id, store_id=store_id, channel=channel,
+                        payloads=orders, sync_run_id=sync_run_id, triggered_by=triggered_by,
+                    )
+            except Exception as exc:
+                return _page_failure(result, cursor, exc)
+            for target, source in (("total_processed", "total"), ("orders_created", "orders_created"),
+                                   ("orders_updated", "orders_updated"), ("stock_changed", "stock_changed")):
+                result[target] += int(ingest.get(source) or 0)
             result["errors"] += int(ingest.get("errors") or 0)
             result["messages"].extend(ingest.get("messages") or [])
-        next_cursor = page.get("next_cursor")
-        result["cursor"] = str(next_cursor or "")
-        if not page.get("has_more") or not next_cursor:
-            break
-        cursor = str(next_cursor)
+            if ingest.get("errors"):
+                # 保留当前页的旧游标，重试会安全重放本页，不把失败页跳过去。
+                result["cursor"] = cursor or ""
+                return result
+        has_more = bool(page.get("has_more"))
+        next_cursor = str(page.get("next_cursor") or "")
+        if has_more and (not next_cursor or next_cursor == (cursor or "")):
+            raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "平台分页未返回有效的新游标")
+        complete = not has_more
+        with tenant_session(context.db_route) as db:
+            checkpoint = checkpoints.load_checkpoint(db, tenant_id, store_id, channel, environment)
+            if checkpoint is None:
+                raise AppError(ErrorCode.CONFLICT, "订单同步检查点不存在")
+            checkpoints.save_page(db, checkpoint, next_cursor=next_cursor, complete=complete)
+            if complete:
+                sales_service.mark_store_synced(db, tenant_id=tenant_id, store_id=store_id)
+            db.commit()
+        result["cursor"] = next_cursor
+        if complete:
+            result["complete"] = True
+            return result
+        cursor = next_cursor
+    # 本次预算用尽：保留同一窗口并投递下一批，不能当作完整成功。
     with tenant_session(context.db_route) as db:
-        sales_service.mark_store_synced(db, tenant_id=tenant_id, store_id=store_id)
+        continuation_id = tasks_service.create_sync_run(
+            db, tenant_id=tenant_id, job_type=tasks_service.JOB_ORDER_SYNC, store_id=store_id,
+            triggered_by=triggered_by, requested_by=requested_by,
+        )
+        tasks_service.enqueue_outbox(
+            db, tenant_id=tenant_id, event_type=tasks_service.EVENT_SYNC_RUN_CREATED,
+            aggregate_type="sync_run", aggregate_id=continuation_id,
+            payload={"tenant_id": tenant_id, "sync_run_id": continuation_id,
+                     "job_type": tasks_service.JOB_ORDER_SYNC, "store_id": store_id,
+                     "triggered_by": triggered_by}, available_delay_seconds=5,
+        )
         db.commit()
+    result["messages"].append(f"店铺 {store_id} 分页未完成，已安排续传任务 {continuation_id}")
+    return result
+
+
+def _page_failure(result: dict[str, Any], cursor: str | None, exc: Exception) -> dict[str, Any]:
+    """保留先前已提交页面的计数和当前待处理页游标，供后续任务从断点重试。"""
+    result["errors"] += 1
+    result["messages"].append(f"订单分页处理失败：{exc}"[:300])
+    result["cursor"] = cursor or ""
     return result
 
 
@@ -229,6 +294,7 @@ def _fetch_order_page(
     tenant_id: int,
     store_id: int,
     since: Any,
+    until: Any = None,
     cursor: str | None,
 ) -> dict[str, Any]:
     """读取一页平台订单（延迟 import 渠道契约，未就绪时给出可重试的明确错误）。"""
@@ -246,6 +312,7 @@ def _fetch_order_page(
                 tenant_id=int(tenant_id),
                 store_id=int(store_id),
                 since=since,
+                until=until,
                 cursor=cursor,
                 page_size=PAGE_SIZE,
             )

@@ -49,6 +49,7 @@ def create_session(
     csrf_token = new_csrf_token()
     now_ts = int(utc_now().timestamp())
     payload: dict[str, Any] = {
+        "auth_version": 2,
         "user_id": user_id,
         "scope": scope,
         "csrf": csrf_token,
@@ -71,11 +72,12 @@ def read_session(session_id: str) -> dict[str, Any] | None:
         return None
     try:
         payload = json.loads(raw)
-    except json.JSONDecodeError:
-        delete_session(session_id)
+    except (json.JSONDecodeError, TypeError):
+        cache_redis().delete(_session_key(session_id))
         return None
-    if not isinstance(payload, dict) or "user_id" not in payload:
-        delete_session(session_id)
+    if not isinstance(payload, dict) or "user_id" not in payload or payload.get("auth_version") != 2:
+        # 邀请身份修复发布后旧会话不能继续使用；不清空缓存或队列。
+        cache_redis().delete(_session_key(session_id))
         return None
     return payload
 

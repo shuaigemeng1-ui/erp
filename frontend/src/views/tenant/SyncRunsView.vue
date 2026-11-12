@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
+import type { SyncSettings } from '@/types/tasks'
 import { ElMessage } from 'element-plus'
 import { Refresh, Search } from '@element-plus/icons-vue'
 import { tasksApi } from '@/api/tasks'
@@ -60,6 +61,14 @@ async function openDetail(run: SyncRun): Promise<void> {
 
 /* ------------------------------ 重试 ------------------------------ */
 const retryingId = ref('')
+const jobPermissions: Record<string, string> = {
+  order_sync: 'order.sync', stock_push: 'stock.push',
+  listing_sync: 'channel.listing.map', token_refresh: 'store.connect',
+}
+function canRetry(run: SyncRun): boolean {
+  return Boolean(jobPermissions[run.job_type] && tenant.has(jobPermissions[run.job_type]!))
+}
+
 
 async function retry(run: SyncRun): Promise<void> {
   retryingId.value = run.id
@@ -67,6 +76,24 @@ async function retry(run: SyncRun): Promise<void> {
     await submitAndPoll((tenantId) => tasksApi.retrySyncRun(tenantId, run.id), reload)
   } finally {
     retryingId.value = ''
+  }
+}
+
+/* ------------------------------ 同步总开关 ------------------------------ */
+const syncSettings = ref<SyncSettings | null>(null)
+const settingsSaving = ref(false)
+async function loadSyncSettings(): Promise<void> {
+  if (!tenant.has('tenant.setting.manage')) return
+  syncSettings.value = await tasksApi.syncSettings(tid())
+}
+async function toggleSyncSetting(key: keyof SyncSettings, value: string | number | boolean): Promise<void> {
+  settingsSaving.value = true
+  try {
+    syncSettings.value = await tasksApi.updateSyncSettings(tid(), { [key]: Boolean(value) })
+    await tenant.reloadBootstrap()
+    ElMessage.success('同步开关已更新')
+  } finally {
+    settingsSaving.value = false
   }
 }
 
@@ -126,10 +153,17 @@ async function saveInterval(): Promise<void> {
 
 onMounted(() => {
   void loadSchedules()
+  void loadSyncSettings()
 })
 </script>
 
 <template>
+  <el-card v-if="syncSettings && tenant.has('tenant.setting.manage')" shadow="never" class="page-card">
+    <el-space :size="24">
+      <span>订单同步 <el-switch :model-value="syncSettings.order_sync_enabled" :loading="settingsSaving" @change="(value: string | number | boolean) => toggleSyncSetting('order_sync_enabled', value)" /></span>
+      <span>平台库存推送 <el-switch :model-value="syncSettings.stock_push_enabled" :loading="settingsSaving" @change="(value: string | number | boolean) => toggleSyncSetting('stock_push_enabled', value)" /></span>
+    </el-space>
+  </el-card>
   <el-card shadow="never" class="page-card">
     <div class="filter-bar">
       <el-select v-model="query.job_type" placeholder="任务类型" clearable style="width: 180px" @change="search()">
@@ -178,7 +212,7 @@ onMounted(() => {
         <template #default="{ row }">
           <el-button text type="primary" size="small" @click="openDetail(row as SyncRun)">详情</el-button>
           <el-button
-            v-if="row.status === 'failed' || row.status === 'partial'"
+            v-if="(row.status === 'failed' || row.status === 'partial') && canRetry(row as SyncRun)"
             text
             type="warning"
             size="small"
@@ -217,13 +251,14 @@ onMounted(() => {
       </el-table-column>
       <el-table-column label="间隔（分钟）" width="130" align="right">
         <template #default="{ row }">
-          <el-button text type="primary" size="small" @click="openInterval(row as SyncSchedule)">{{ row.interval_minutes }}</el-button>
+          <el-button text type="primary" size="small" :disabled="!tenant.has('task.schedule.manage')" @click="openInterval(row as SyncSchedule)">{{ row.interval_minutes }}</el-button>
         </template>
       </el-table-column>
       <el-table-column label="启用" width="100">
         <template #default="{ row }">
           <el-switch
             :model-value="row.enabled"
+            :disabled="!tenant.has('task.schedule.manage')"
             :loading="scheduleSavingId === row.id"
             @change="(value: string | number | boolean) => onToggleSchedule(row as SyncSchedule, value)"
           />

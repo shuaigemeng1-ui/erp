@@ -1649,7 +1649,8 @@ def test_e2e_create_tenant_eager_invitation_accept_bootstrap(monkeypatch: pytest
     invitation = issued.json()["data"]
     assert invitation["invitation_url"] == f"/activate/{invitation['token']}"
 
-    # 3) 负责人接受邀请（设置密码）
+    # 3) 负责人在未登录的浏览器接受邀请（不能沿用平台管理员身份激活他人）。
+    state["user_id"] = 0
     accepted = client.post(
         "/api/v1/auth/invitations/accept",
         json={

@@ -195,6 +195,8 @@ def get_platform_raw(db: Session, tenant_id: int, raw_id: int) -> PlatformOrderR
         select(PlatformOrderRaw).where(
             PlatformOrderRaw.tenant_id == tenant_id, PlatformOrderRaw.id == raw_id
         )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
 
 
@@ -207,4 +209,6 @@ def find_platform_raw(
             PlatformOrderRaw.store_id == store_id,
             PlatformOrderRaw.external_order_no == external_order_no,
         )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()

@@ -545,6 +545,8 @@ def create_store(
         raise AppError(ErrorCode.VALIDATION_ERROR, "店铺名称不能超过 128 个字符")
     region_value = (region or "").strip().upper() or None
     now = utc_now()
+    from app.modules.platform.quotas import ensure_tenant_capacity
+    ensure_tenant_capacity(db, tenant_id, {'max_stores': 1})
     code = _generate_store_code(db, tenant_id, channel_value)
     store = Store(
         tenant_id=tenant_id,
@@ -675,6 +677,9 @@ def start_shopee_authorization(
         store_id=store.id if store is not None else None,
         store_code=store.store_code if store is not None else "",
     )
+    from app.modules.channels.authorization import issue_link
+    from app.modules.channels.state import parse_signed_state
+    session = issue_link(center, channel=CHANNEL_SHOPEE, payload=parse_signed_state(session["state"]))
     record_audit(
         db,
         tenant_id=tenant_id,
@@ -740,6 +745,8 @@ def upsert_store_from_authorization(
         existing = repo.find_store_by_external(db, tenant_id, channel, external_id)
         if existing is not None and existing.id != store.id:
             raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "该平台店铺已绑定其他 ERP 店铺")
+        if store.status != STORE_STATUS_PENDING_AUTHORIZATION and store.external_store_id != external_id:
+            raise AppError(ErrorCode.CONFLICT, "已连接店铺不能更换平台身份，请新建店铺")
         store.store_code = store.store_code or _generate_store_code(db, tenant_id, channel)
         store.external_store_id = external_id
         store.environment = environment
@@ -752,6 +759,8 @@ def upsert_store_from_authorization(
     else:
         store = repo.find_store_by_external(db, tenant_id, channel, external_id)
         if store is None:
+            from app.modules.platform.quotas import ensure_tenant_capacity
+            ensure_tenant_capacity(db, tenant_id, {"max_stores": 1})
             store = Store(
                 tenant_id=tenant_id,
                 channel=channel,
@@ -822,10 +831,14 @@ def claim_store_registry(
 ) -> int:
     """在中心库登记外部店铺归属；同一环境同一店铺已被其他租户占用时抛冲突。"""
     external_id = normalize_external_id(external_account_id)
-    entry = repo.get_registry_entry(center, channel, environment, external_id)
+    entry = center.execute(select(ChannelAccountRegistry).where(
+        ChannelAccountRegistry.channel == channel,
+        ChannelAccountRegistry.environment == environment,
+        ChannelAccountRegistry.external_account_id == external_id,
+    ).with_for_update().execution_options(populate_existing=True)).scalar_one_or_none()
     now = utc_now()
     if entry is not None:
-        if entry.status == "bound" and entry.tenant_id not in (None, tenant_id):
+        if entry.status in {"bound", "reserved"} and entry.tenant_id not in (None, tenant_id):
             raise AppError(
                 ErrorCode.STORE_ALREADY_BOUND,
                 "该 Shopee 店铺已归属其他租户，请先在原租户断开授权",
@@ -1298,19 +1311,20 @@ def _fetch_tiktok_orders(
     tenant_id: int,
     store_id: int,
     since: datetime | None,
+    until: datetime | None = None,
     cursor: str | None,
     page_size: int,
 ) -> dict[str, Any]:
     store = get_store_or_raise(db, tenant_id, store_id)
     client = build_tiktok_client(center, db, tenant_id, store)
     try:
-        now = utc_now()
+        now = until or utc_now()
         start = since or (now - timedelta(days=1))
         if start.tzinfo is not None:
             start = start.astimezone(timezone.utc).replace(tzinfo=None)
         payload = client.search_orders(
-            create_time_ge=int(start.replace(tzinfo=timezone.utc).timestamp()),
-            create_time_lt=int(now.replace(tzinfo=timezone.utc).timestamp()),
+            update_time_ge=int(start.replace(tzinfo=timezone.utc).timestamp()),
+            update_time_lt=int(now.replace(tzinfo=timezone.utc).timestamp()),
             page_size=max(1, min(int(page_size), 100)),
             next_page_token=cursor or "",
         )
@@ -2242,6 +2256,33 @@ def resolve_listings_sku(
 
 
 # --------------------------------------------------------------------------- 库存推送
+def _check_push_access(tenant_id: int, store_id: int, actor_id: int | None) -> None:
+    """每个 SKU 使用新事务复核开关和手动操作者，避免批次中途撤权后继续写平台。"""
+    from app.db.session import center_session, tenant_session
+    from app.modules.identity.service import load_tenant_access, load_tenant_db_route, load_authenticated_user
+    from app.modules.access.service import load_access_snapshot
+    from app.modules.tasks.service import ensure_job_enabled, ensure_job_access
+    with center_session() as center:
+        ensure_tenant_active(center, tenant_id)
+        route = load_tenant_db_route(center, tenant_id)
+        access = None
+        if actor_id is not None:
+            user = load_authenticated_user(center, actor_id)
+            access = load_tenant_access(center, tenant_id, actor_id)
+            if user is None or user.status != "active" or access is None or access.member_status != "active":
+                raise AppError(ErrorCode.PERMISSION_DENIED)
+    if route is None:
+        raise AppError(ErrorCode.TENANT_DATABASE_UNAVAILABLE)
+    with tenant_session(route) as current:
+        ensure_job_enabled(current, tenant_id, "stock_push")
+        store = get_store_or_raise(current, tenant_id, store_id)
+        if store.status != STORE_STATUS_CONNECTED:
+            raise AppError(ErrorCode.STORE_NOT_CONNECTED)
+        if access is not None:
+            snapshot = load_access_snapshot(current, tenant_id, access.member_id)
+            ensure_job_access(snapshot.effective, "stock_push", store_id)
+
+
 def push_stock_for_sku(
     center: Session,
     db: Session,
@@ -2252,6 +2293,9 @@ def push_stock_for_sku(
     actor_id: int | None = None,
 ) -> dict[str, Any]:
     """推送单个 SKU 的库存到店铺（按 store+sku 串行，执行时读取最新库存）。"""
+    from app.modules.tasks.service import ensure_job_enabled
+    ensure_job_enabled(db, tenant_id, "stock_push")
+    ensure_tenant_active(center, tenant_id)
     lock_name = f"shopee:stock:{tenant_id}:{store_id}:{sku_id}"
     try:
         lock_token = acquire_lock(lock_name, ttl_seconds=STOCK_PUSH_LOCK_TTL_SECONDS)
@@ -2260,6 +2304,10 @@ def push_stock_for_sku(
     if lock_token is None:
         return {"sku_id": sku_id, "pushed": 0, "skipped": True, "reason": "同一 SKU 推送进行中"}
     try:
+        _check_push_access(tenant_id, store_id, actor_id)
+        # 本函数是独立外部写入操作；结束旧读视图后取得最新库存与凭据。
+        db.commit()
+        center.commit()
         store = get_store_or_raise(db, tenant_id, store_id)
         if store.status == STORE_STATUS_REAUTH_REQUIRED:
             raise AppError(ErrorCode.STORE_REAUTH_REQUIRED)
@@ -2365,6 +2413,9 @@ def run_stock_push(
                 ErrorCode.STORE_REAUTH_REQUIRED,
                 ErrorCode.STORE_NOT_CONNECTED,
                 ErrorCode.CHANNEL_APP_NOT_CONFIGURED,
+                ErrorCode.PERMISSION_DENIED,
+                ErrorCode.FEATURE_DISABLED,
+                ErrorCode.TENANT_SUSPENDED,
             }:
                 break
         except Exception as exc:  # noqa: BLE001 - 单 SKU 失败不阻断整批
@@ -2381,6 +2432,7 @@ def fetch_orders(
     tenant_id: int,
     store_id: int,
     since: datetime | None = None,
+    until: datetime | None = None,
     cursor: str | None = None,
     page_size: int = 50,
     center: Session | None = None,
@@ -2390,12 +2442,12 @@ def fetch_orders(
 
     if center is not None:
         return _fetch_orders(
-            center, db, tenant_id=tenant_id, store_id=store_id, since=since, cursor=cursor,
+            center, db, tenant_id=tenant_id, store_id=store_id, since=since, until=until, cursor=cursor,
             page_size=page_size,
         )
     with _center_session() as session:
         return _fetch_orders(
-            session, db, tenant_id=tenant_id, store_id=store_id, since=since, cursor=cursor,
+            session, db, tenant_id=tenant_id, store_id=store_id, since=since, until=until, cursor=cursor,
             page_size=page_size,
         )
 
@@ -2407,6 +2459,7 @@ def _fetch_orders(
     tenant_id: int,
     store_id: int,
     since: datetime | None,
+    until: datetime | None = None,
     cursor: str | None,
     page_size: int,
 ) -> dict[str, Any]:
@@ -2422,12 +2475,13 @@ def _fetch_orders(
             tenant_id=tenant_id,
             store_id=store_id,
             since=since,
+            until=until,
             cursor=cursor,
             page_size=page_size,
         )
     client = build_store_client(center, db, tenant_id, store)
     try:
-        now = utc_now()
+        now = until or utc_now()
         start = since or (now - timedelta(days=1))
         if start.tzinfo is not None:
             start = start.astimezone(timezone.utc).replace(tzinfo=None)

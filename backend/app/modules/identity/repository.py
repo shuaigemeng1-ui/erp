@@ -257,18 +257,22 @@ def get_role_by_code(db: Session, tenant_id: int, code: str) -> Role | None:
     ).scalar_one_or_none()
 
 
-def role_permission_map(db: Session, tenant_id: int, role_ids: list[int]) -> dict[int, list[str]]:
+def role_permission_map(
+    db: Session, tenant_id: int, role_ids: list[int], *, lock: bool = False,
+) -> dict[int, list[str]]:
     result: dict[int, list[str]] = {}
     if not role_ids:
         return result
-    rows = db.execute(
-        select(RolePermission.role_id, RolePermission.permission_code)
-        .where(
+    statement = (
+        select(RolePermission.role_id, RolePermission.permission_code).where(
             RolePermission.tenant_id == tenant_id,
             RolePermission.role_id.in_(role_ids),
         )
         .order_by(RolePermission.permission_code)
-    ).all()
+    )
+    if lock:
+        statement = statement.with_for_update()
+    rows = db.execute(statement).all()
     for role_id, permission_code in rows:
         result.setdefault(int(role_id), []).append(str(permission_code))
     return result

@@ -37,6 +37,7 @@ def _apply_run_filters(
     job_type: str | None,
     status: str | None,
     store_id: int | None,
+    allowed_store_ids: frozenset[int] | None = None,
 ) -> Select[Any]:
     stmt = stmt.where(SyncRun.tenant_id == tenant_id)
     if job_type:
@@ -45,6 +46,8 @@ def _apply_run_filters(
         stmt = stmt.where(SyncRun.status == status)
     if store_id is not None:
         stmt = stmt.where(SyncRun.store_id == store_id)
+    if allowed_store_ids is not None:
+        stmt = stmt.where(SyncRun.store_id.in_(allowed_store_ids))
     return stmt
 
 
@@ -57,9 +60,11 @@ def list_sync_runs(
     store_id: int | None = None,
     page: int = 1,
     page_size: int = 20,
+    allowed_store_ids: frozenset[int] | None = None,
 ) -> tuple[list[SyncRun], int]:
     base = _apply_run_filters(
-        select(SyncRun), tenant_id, job_type=job_type, status=status, store_id=store_id
+        select(SyncRun), tenant_id, job_type=job_type, status=status, store_id=store_id,
+        allowed_store_ids=allowed_store_ids,
     )
     total = int(
         db.execute(
@@ -80,7 +85,8 @@ def list_sync_runs(
 
 
 def find_pending_sync_run(
-    db: Session, tenant_id: int, job_type: str, store_id: int | None
+    db: Session, tenant_id: int, job_type: str, store_id: int | None,
+    *, triggered_by: str | None = None, requested_by: int | None = None,
 ) -> SyncRun | None:
     """同一目标已有待执行任务时复用，避免重复堆积（数据库记录级去重）。"""
     stmt = select(SyncRun).where(
@@ -91,6 +97,11 @@ def find_pending_sync_run(
     stmt = stmt.where(SyncRun.store_id.is_(None)) if store_id is None else stmt.where(
         SyncRun.store_id == store_id
     )
+    if triggered_by is not None:
+        stmt = stmt.where(SyncRun.triggered_by == triggered_by)
+        stmt = stmt.where(SyncRun.requested_by.is_(None)) if requested_by is None else stmt.where(
+            SyncRun.requested_by == requested_by
+        )
     return db.execute(stmt.order_by(SyncRun.id.asc()).limit(1)).scalar_one_or_none()
 
 
@@ -103,11 +114,14 @@ def get_schedule(db: Session, tenant_id: int, schedule_id: int) -> SyncSchedule 
 
 
 def list_schedules(
-    db: Session, tenant_id: int, *, job_type: str | None = None
+    db: Session, tenant_id: int, *, job_type: str | None = None,
+    allowed_store_ids: frozenset[int] | None = None,
 ) -> list[SyncSchedule]:
     stmt = select(SyncSchedule).where(SyncSchedule.tenant_id == tenant_id)
     if job_type:
         stmt = stmt.where(SyncSchedule.job_type == job_type)
+    if allowed_store_ids is not None:
+        stmt = stmt.where(SyncSchedule.store_id.in_(allowed_store_ids))
     return list(db.execute(stmt.order_by(SyncSchedule.id.asc())).scalars().all())
 
 

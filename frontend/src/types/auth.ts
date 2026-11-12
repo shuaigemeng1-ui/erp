@@ -34,12 +34,13 @@ export interface InvitationInfo {
   email: string
   status: string
   expires_at: string | null
+  requires_login: boolean
 }
 
 export interface InvitationAcceptPayload {
   token: string
-  password: string
-  display_name: string
+  password?: string
+  display_name?: string
 }
 
 export interface PasswordPayload {

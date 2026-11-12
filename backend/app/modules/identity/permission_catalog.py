@@ -83,6 +83,7 @@ PERMISSION_GROUPS: tuple[PermissionGroup, ...] = (
         items=(
             PermissionItem("audit.read", "查看审计日志"),
             PermissionItem("task.read", "查看任务记录"),
+            PermissionItem("task.schedule.manage", "管理定时同步配置"),
             PermissionItem("tenant.setting.manage", "管理租户设置"),
         ),
     ),

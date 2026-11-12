@@ -50,9 +50,16 @@ models_center.py / models_tenant.py   模型（禁止 ForeignKey）
 4. Worker / 手动任务：使用 `app.core.context` 重建 `TenantContext`，执行前用
    `app.api.deps.ensure_permission()` 复核成员权限。
 
-跨租户不信任请求体中的 `tenant_id`；回调只信签名 + 一次性授权会话。
+跨租户不信任请求体中的 `tenant_id`；回调只接受 600 秒且原子消费的一次性授权 state。
+长期可复制链接记录在中心库 `channel_authorization_links`，只存摘要，可撤销和轮换。它是生成短期 state 的入口，不直接充当永久回调 state。回调重新校验租户、成员、权限与目标店铺；多店铺授权显式选择。跨库保存失败时中心库保存加密结果，重试入口可恢复。
 
-## 跨模块接口（签名固定，禁止修改）
+任务列表、详情、状态及重试按店铺范围过滤；全租户任务只对明确全部范围可见。`task.read` 只读，定时配置修改需要 `task.schedule.manage`。任务 ID 必须先登记到租户库，不能凭任意 Celery UUID 读取后端结果。
+
+`tenant_settings.order_sync_enabled/stock_push_enabled` 为同步最终开关，优先于功能展示配置。API 创建、调度、Outbox、Worker 和外部操作前均复核。手动任务始终使用发起人并复核当前范围，不转换成所有者；自动任务使用限定能力。
+
+订单同步检查点由 `(tenant_id, store_id, channel, environment)` 唯一确定，固定窗口和游标跨批次保存，只有完整成功才推进水位。
+
+## 跨模块接口（修改时同步调用方与契约）
 
 `identity/service.py`（backend-identity 实现）：
 
@@ -109,18 +116,6 @@ mark_store_synced(db, tenant_id, store_id, at=None) -> None
 enqueue_order_sync(db, *, tenant_id, store_id, triggered_by="webhook") -> int   # 返回 sync_run_id
 ```
 
-## 模块写作用域（并行开发互斥）
-
-| 负责人 | 目录 / 文件 |
-| --- | --- |
-| lead | `backend/app/core/**`、`backend/app/db/**`、`backend/app/api/**`、`backend/app/main.py`、`backend/app/workers/celery_app.py`、`backend/alembic/*.ini`、`backend/alembic/*/env.py`、`docs/**`、根 `README.md`、`.gitignore` |
-| backend-identity | `app/modules/identity/**`、`app/modules/access/**`、`app/modules/platform/**`、`app/modules/audit/**`、`alembic/center/versions/0001_center_identity.py`、`alembic/tenant/versions/0001_tenant_identity.py` |
-| backend-catalog | `app/modules/catalog/**`、`app/modules/inventory/**`、`alembic/tenant/versions/0002_tenant_catalog.py` |
-| backend-channels | `app/modules/channels/**`、`alembic/center/versions/0002_center_channels.py`、`alembic/tenant/versions/0003_tenant_channels.py` |
-| backend-sales | `app/modules/sales/**`、`app/modules/tasks/**`、`alembic/tenant/versions/0004_tenant_sales.py` |
-| frontend-vue | `frontend/**` |
-| deploy-qa | `deploy/**`、`backend/scripts/**`、`backend/tests/contract/**`、`backend/tests/unit/test_contracts.py` |
-
 ## 验收命令（不启动服务、不连接生产）
 
 ```powershell
@@ -141,3 +136,9 @@ cd ..\deploy; docker compose config -q                                # 只做�
 SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS
 WHERE CONSTRAINT_SCHEMA IN ('ventasync_center', 'vs_tenant_1');  -- 必须为 0
 ```
+
+## 版本与验证范围
+
+迁移主线以实际 ScriptDirectory 为准。当前业务表中心库 15、租户库 29；版本末端为 center_0006 / tenant_0010。不得通过引用早期迁移文档跳过新增迁移。零外键和字段中文注释同时验证模型与最终 SQL，MODIFY 清除注释必须由后续增量迁移修复。
+
+本轮离线证据与真实环境待验收内容见 `acceptance.md`。历史 `real-deployment.md` 不作为当前代码已上线的证明。

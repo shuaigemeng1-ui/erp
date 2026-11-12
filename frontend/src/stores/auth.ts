@@ -1,7 +1,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { authApi } from '@/api/auth'
-import type { LoginPayload, MeProfile, MeTenant, SessionScope } from '@/types'
+import type { InvitationAcceptPayload, LoginPayload, MeProfile, MeTenant, SessionScope } from '@/types'
 
 /**
  * 登录态：会话在 HttpOnly Cookie 中，前端只保存当前用户信息用于展示。
@@ -82,11 +82,7 @@ export const useAuthStore = defineStore('auth', () => {
     await refreshTenants()
   }
 
-  async function acceptInvitation(payload: {
-    token: string
-    password: string
-    display_name: string
-  }): Promise<void> {
+  async function acceptInvitation(payload: InvitationAcceptPayload): Promise<void> {
     const result = await authApi.acceptInvitation(payload)
     applySession(result.user, result.tenants, 'tenant')
     await refreshTenants()

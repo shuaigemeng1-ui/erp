@@ -37,6 +37,7 @@ class Permission(StrEnum):
     # 审计与任务
     AUDIT_READ = "audit.read"
     TASK_READ = "task.read"
+    TASK_SCHEDULE_MANAGE = "task.schedule.manage"
     # 租户设置
     TENANT_SETTING_MANAGE = "tenant.setting.manage"
 

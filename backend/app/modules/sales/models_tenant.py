@@ -77,6 +77,25 @@ class PlatformOrderRaw(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
     )
 
 
+class OrderSyncCheckpoint(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
+    """每店铺每渠道环境的拉单检查点，不借用其他店铺的任务完成时间。"""
+
+    __tablename__ = "order_sync_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "store_id", "channel", "environment",
+                         name="uq_order_sync_checkpoint_scope"),
+        table_options("店铺订单同步检查点表"),
+    )
+
+    store_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="店铺ID")
+    channel: Mapped[str] = mapped_column(String(32), nullable=False, comment="渠道编码")
+    environment: Mapped[str] = mapped_column(String(16), nullable=False, comment="平台应用环境")
+    watermark: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="完整成功窗口的截止时间（UTC）")
+    window_start: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="当前固定查询窗口开始时间（UTC）")
+    window_end: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="当前固定查询窗口截止时间（UTC）")
+    cursor: Mapped[str] = mapped_column(String(2048), nullable=False, default="", comment="当前窗口尚未完成的分页游标")
+
+
 class Order(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
     """统一订单表：平台订单归一化后的唯一事实，按店铺 + 平台订单号防重。"""
 

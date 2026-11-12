@@ -69,6 +69,35 @@ tiktok_legacy_router = APIRouter(prefix="/tiktok", tags=["tiktok"])
 _VALID_MAPPING_FILTERS = frozenset({LISTING_FILTER_UNMAPPED}) | LINK_STATUSES
 
 
+@router.delete("/tenants/{tenant_id}/stores/{store_id}/authorization-link")
+def revoke_authorization_link(
+    tenant_id: int, store_id: int,
+    ctx: TenantContext = Depends(tenant_context),
+    db: Session = Depends(get_tenant_db), center: Session = Depends(get_center_db),
+    snapshot: AccessSnapshot = Depends(require_permission(Permission.STORE_CONNECT.value)),
+) -> dict[str, Any]:
+    from sqlalchemy import select
+    from app.modules.channels.models_center import AuthorizationLink
+    from app.modules.identity.models_center import Tenant
+    if not snapshot.effective.covers(Permission.STORE_CONNECT.value, store_id=store_id):
+        raise AppError(ErrorCode.NOT_FOUND)
+    service.get_store_or_raise(db, tenant_id, store_id)
+    center.execute(select(Tenant).where(Tenant.id == tenant_id).with_for_update()).scalar_one()
+    rows = list(center.execute(select(AuthorizationLink).where(
+        AuthorizationLink.tenant_id == tenant_id, AuthorizationLink.store_id == store_id,
+        AuthorizationLink.status.in_(["active", "pending_save"]),
+    ).with_for_update()).scalars())
+    if any(row.status == "pending_save" for row in rows):
+        raise AppError(ErrorCode.CONFLICT, "授权结果待恢复，请先打开原链接完成保存")
+    for row in rows:
+        row.status = "revoked"
+    center.commit()
+    service.record_audit(db, tenant_id=tenant_id, action="store.authorization_link.revoke",
+        resource_type="store", resource_id=store_id, actor_id=ctx.user_id, summary="撤销店铺授权邀请")
+    db.commit()
+    return success({"revoked": True})
+
+
 # --------------------------------------------------------------------------- 店铺
 @router.get("/tenants/{tenant_id}/stores")
 def list_stores(
@@ -271,13 +300,18 @@ def sync_channel_listings(
         raise AppError(ErrorCode.STORE_REAUTH_REQUIRED)
     if store.status != STORE_STATUS_CONNECTED:
         raise AppError(ErrorCode.STORE_NOT_CONNECTED)
-    task_id = _dispatch_task(
-        "sync_store_listings",
+    from app.modules.tasks import service as task_service
+
+    task_id = task_service.request_sync_run(
+        db,
         tenant_id=tenant_id,
+        job_type=task_service.JOB_LISTING_SYNC,
         store_id=body.store_id_int,
         requested_by=ctx.user_id,
+        triggered_by="manual",
     )
-    return accepted({"task_id": task_id})
+    db.commit()
+    return accepted({"task_id": str(task_id)})
 
 
 @router.post("/tenants/{tenant_id}/listings/{listing_id}/link")
@@ -338,63 +372,30 @@ def unlink_channel_listing(
 # --------------------------------------------------------------------------- 平台回调
 @integration_router.get("/oauth/callback")
 def shopee_oauth_callback(
-    code: str | None = Query(default=None, description="平台授权码"),
-    shop_id: str | None = Query(default=None, description="平台店铺ID"),
-    state: str | None = Query(default=None, description="一次性授权会话 state"),
-    error: str | None = Query(default=None, description="平台返回的错误码"),
+    code: str | None = Query(default=None), shop_id: str | None = Query(default=None),
+    state: str | None = Query(default=None), error: str | None = Query(default=None),
 ) -> RedirectResponse:
-    """Shopee 授权回调：校验一次性授权会话后换取 Token，成功 / 失败都 302 跳前端。"""
-    redirect_path: str | None = None
+    from app.modules.channels.authorization import validate_link, persist_result
+    redirect_path = None
     try:
         session = oauth.consume_authorization_session(state)
-        redirect_path = str(session.get("redirect_path") or "")
+        redirect_path = session["redirect_path"]
         if error:
-            raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, f"平台拒绝授权：{error}")
+            raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "平台拒绝授权")
         code_value, shop_value = oauth.validate_callback_params(code, shop_id)
-        environment = str(session["environment"])
-        tenant_id = int(session["tenant_id"])
         with center_session() as center:
-            config = service.require_channel_app(center, environment)
-            service.ensure_tenant_active(center, tenant_id)
-            route = _load_tenant_route(center, tenant_id)
-            partner_id = int(config.partner_id or 0)
-            partner_key = config.partner_key
-        # 外部 HTTP 请求在数据库事务之外执行
-        exchanged = exchange_authorization_code(
-            environment=environment,
-            partner_id=partner_id,
-            partner_key=partner_key,
-            code=code_value,
-            shop_id=shop_value,
-        )
-        with center_session() as center, tenant_session(route) as db:
-            result = oauth.complete_authorization(
-                center,
-                db,
-                session=session,
-                shop_id=shop_value,
-                token_data=exchanged["token"],
-                profile=exchanged["profile"],
-            )
-        return RedirectResponse(
-            oauth.frontend_redirect_url(
-                str(result.get("redirect_path") or redirect_path),
-                params={"shopee": "connected"},
-            ),
-            status_code=302,
-        )
+            validate_link(center, session["authorization_link_id"])
+            config = service.require_channel_app(center, session["environment"])
+        exchanged = exchange_authorization_code(environment=session["environment"],
+            partner_id=int(config.partner_id), partner_key=config.partner_key,
+            code=code_value, shop_id=shop_value)
+        output = persist_result(session, {**exchanged, "shop_id": shop_value})
+        return RedirectResponse(oauth.frontend_redirect_url(output["redirect_path"], params={"shopee": "connected"}), status_code=302)
     except AppError as exc:
-        logger.warning("Shopee 授权回调失败：%s %s", exc.code.value, exc.message)
-        return RedirectResponse(
-            callback_error_redirect(redirect_path=redirect_path, reason=exc.code.value),
-            status_code=302,
-        )
-    except Exception:  # noqa: BLE001 - 回调必须返回 302，不把异常抛给平台页面
-        logger.exception("Shopee 授权回调异常")
-        return RedirectResponse(
-            callback_error_redirect(redirect_path=redirect_path, reason="internal_error"),
-            status_code=302,
-        )
+        return RedirectResponse(callback_error_redirect(redirect_path=redirect_path, reason=exc.code.value), status_code=302)
+    except Exception:
+        logger.exception("保存 Shopee 授权结果失败")
+        return RedirectResponse(callback_error_redirect(redirect_path=redirect_path, reason="internal_error"), status_code=302)
 
 
 @integration_router.post("/webhook")
@@ -585,83 +586,27 @@ def authorize_tiktok_store(
 @tiktok_integration_router.get("/oauth/callback")
 @tiktok_legacy_router.get("/auth/callback")
 def tiktok_oauth_callback(
-    code: str | None = Query(default=None, description="TikTok 授权码"),
-    state: str | None = Query(default=None, description="一次性授权会话 state"),
-    error: str | None = Query(default=None, description="TikTok 返回的错误码"),
-) -> RedirectResponse:
-    """TikTok Shop 授权回调：校验一次性会话后换 token、读取店铺并绑定，302 回前端。"""
-    redirect_path: str | None = None
+    code: str | None = Query(default=None), state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+) -> Response:
+    from app.modules.channels.authorization import validate_link, persist_result, selection_response
+    redirect_path = None
     try:
         session = tiktok_oauth.consume_authorization_session(state)
-        redirect_path = str(session.get("redirect_path") or "")
-        if error:
-            raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, f"平台拒绝授权：{error}")
-        code_value = (code or "").strip()
-        if not code_value:
-            raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "缺少授权码 code")
-        environment = str(session["environment"])
-        tenant_id = int(session["tenant_id"])
-        target_store_id = int(session["store_id"]) if session.get("store_id") else None
+        redirect_path = session["redirect_path"]
+        if error or not code:
+            raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "平台拒绝授权或缺少授权码")
         with center_session() as center:
-            config = service.require_channel_app(center, environment, channel=CHANNEL_TIKTOK)
-            service.ensure_tenant_active(center, tenant_id)
-            route = _load_tenant_route(center, tenant_id)
-            app_key = config.app_key
-            app_secret = config.app_secret
-        # 先确认 state 指向的店铺仍然有效，避免把 token 写到错误的店铺
-        if target_store_id is not None:
-            with tenant_session(route) as check_db:
-                target_store = service.get_store_or_raise(check_db, tenant_id, target_store_id)
-                if target_store.channel != CHANNEL_TIKTOK:
-                    raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权目标店铺不是 TikTok Shop")
-                if target_store.status not in {
-                    STORE_STATUS_PENDING_AUTHORIZATION,
-                    STORE_STATUS_REAUTH_REQUIRED,
-                    STORE_STATUS_CONNECTED,
-                }:
-                    raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权目标店铺状态不允许授权")
-                logger.info(
-                    "TikTok 授权回调定位店铺：tenant=%s store=%s store_code=%s status=%s",
-                    tenant_id,
-                    target_store.id,
-                    target_store.store_code,
-                    target_store.status,
-                )
-        # 外部 HTTP 请求在数据库事务之外执行
-        exchanged = tiktok_oauth.exchange_code(app_key, app_secret, code_value)
-        with center_session() as center, tenant_session(route) as db:
-            result = tiktok_oauth.complete_authorization(
-                center,
-                db,
-                session=session,
-                token=exchanged["token"],
-                shop=exchanged["shop"],
-                warehouse_id=exchanged.get("warehouse_id") or "",
-            )
-        return RedirectResponse(
-            tiktok_oauth.frontend_redirect_url(
-                str(result.get("redirect_path") or redirect_path),
-                params={
-                    "tiktok": "connected",
-                    "store_code": str(result.get("store_code") or ""),
-                },
-            ),
-            status_code=302,
-        )
+            validate_link(center, session["authorization_link_id"])
+            config = service.require_channel_app(center, session["environment"], channel=CHANNEL_TIKTOK)
+        result = tiktok_oauth.exchange_code(config.app_key, config.app_secret, code)
+        if result.get("shops"):
+            return selection_response(session, result)
+        output = persist_result(session, result)
+        return RedirectResponse(tiktok_oauth.frontend_redirect_url(output["redirect_path"], params={"tiktok": "connected"}), status_code=302)
     except AppError as exc:
-        logger.warning("TikTok 授权回调失败：%s %s", exc.code.value, exc.message)
-        return RedirectResponse(
-            tiktok_oauth.callback_error_redirect(
-                redirect_path=redirect_path, reason=exc.code.value
-            ),
-            status_code=302,
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("TikTok 授权回调异常")
-        return RedirectResponse(
-            tiktok_oauth.callback_error_redirect(
-                redirect_path=redirect_path, reason="internal_error"
-            ),
-            status_code=302,
-        )
+        return RedirectResponse(tiktok_oauth.callback_error_redirect(redirect_path=redirect_path, reason=exc.code.value), status_code=302)
+    except Exception:
+        logger.exception("保存 TikTok 授权结果失败")
+        return RedirectResponse(tiktok_oauth.callback_error_redirect(redirect_path=redirect_path, reason="internal_error"), status_code=302)
 

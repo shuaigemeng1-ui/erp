@@ -18,8 +18,8 @@
 | POST | `/auth/login` | - | `{email, password, scope?}`；`scope=tenant`（默认）为租户 ERP 登录，`scope=platform` 仅平台管理员可登录；成功后轮换会话 Cookie 与 CSRF，返回 `{user, tenants, session_scope}` |
 | POST | `/auth/logout` | 登录 | 撤销当前会话 |
 | POST | `/auth/password` | 登录 | `{current_password, new_password}`；成功后撤销该用户其它会话 |
-| GET | `/auth/invitations/{token}` | - | `{tenant_name, email, status, expires_at}`；令牌不存在/过期/已用返回对应错误码 |
-| POST | `/auth/invitations/accept` | - | `{token, password, display_name}`；返回 `{user, tenants}` |
+| GET | `/auth/invitations/{token}` | - | `{tenant_name, email, status, expires_at, requires_login}`；令牌不存在/过期/已用返回对应错误码 |
+| POST | `/auth/invitations/accept` | - | `{token, password?, display_name?}`；新账号设置密码，已有账号必须先以匹配身份登录；不能通过邀请恢复全局停用账号；成功返回 `{user, tenants, session_scope}` |
 | GET | `/me` | 登录 | `{id, email, display_name, status, is_platform_admin, locale, session_scope}` |
 | GET | `/me/tenants` | 登录 | `[{id, code, name, status, timezone, member_status, roles: [code]}]` |
 
@@ -91,8 +91,9 @@
 | POST | `/tenants/{tenant_id}/stores` | `store.connect` | 新建店铺 `{channel, name}`，状态 `pending_authorization` |
 | POST | `/tenants/{tenant_id}/stores/{store_id}/tiktok/authorize` | `store.connect` | 为待授权店铺生成 Service ID 授权链接 |
 | POST | `/tenants/{tenant_id}/stores/{store_id}/shopee/authorize` | `store.connect` | 为待授权店铺生成 Shopee 授权链接 |
-| POST | `/tenants/{tenant_id}/stores/shopee/authorize` | `store.connect` | 生成一次性授权会话 → `{auth_url, expires_at}` |
+| POST | `/tenants/{tenant_id}/stores/shopee/authorize` | `store.connect` | 创建可撤销的长期授权入口 → `{auth_url, expires_at}`；打开入口后才生成 600 秒一次性 state |
 | POST | `/tenants/{tenant_id}/stores/tiktok/authorize` | 登录 + `store.connect` | `{environment?, redirect_path?}`；返回 TikTok Shop 授权地址 `auth_url` |
+| DELETE | `/tenants/{tenant_id}/stores/{store_id}/authorization-link` | `store.connect` + 店铺范围 | 撤销长期授权链接及其衍生会话 |
 | POST | `/tenants/{tenant_id}/stores/{store_id}/disconnect` | `store.connect` | 断开授权（停止依赖该凭据的任务） |
 | GET | `/tenants/{tenant_id}/listings?store_id&mapping_status&page` | `channel.listing.read` | 平台商品与映射状态 |
 | POST | `/tenants/{tenant_id}/listings/sync` | `channel.listing.map` | `{store_id}` → 202 `{task_id}` |
@@ -111,16 +112,22 @@
 | POST | `/tenants/{tenant_id}/orders/sync` | `order.sync` | `{store_id?}` → 202 `{task_id}` |
 | GET | `/tenants/{tenant_id}/sync-runs?page&job_type&status` | `task.read` | 任务记录 |
 | GET | `/tenants/{tenant_id}/sync-runs/{id}` | `task.read` | 任务详情 |
-| POST | `/tenants/{tenant_id}/sync-runs/{id}/retry` | `task.read` | 重试 → 202 |
+| POST | `/tenants/{tenant_id}/sync-runs/{id}/retry` | `task.read` + 原任务业务权限及店铺范围 | 重试 → 202，保留当前发起人 |
 | GET | `/tenants/{tenant_id}/sync-schedules` | `task.read` | 定时同步配置 |
-| PUT | `/tenants/{tenant_id}/sync-schedules/{id}` | `task.read` | `{enabled, interval_minutes}` |
-| GET | `/tenants/{tenant_id}/tasks/{task_id}` | 成员 | 异步任务状态：`{task_id, type, status, result, error}` |
+| PUT | `/tenants/{tenant_id}/sync-schedules/{id}` | `task.schedule.manage` + 对应任务业务权限及范围 | `{enabled, interval_minutes}` |
+| GET | `/tenants/{tenant_id}/sync-settings` | `tenant.setting.manage` + 全部范围 | `{order_sync_enabled, stock_push_enabled}` |
+| PUT | `/tenants/{tenant_id}/sync-settings` | `tenant.setting.manage` + 全部范围 | 修改同步总开关；开启时同时检查对应业务全部范围，写审计并递增权限版本 |
+| GET | `/tenants/{tenant_id}/tasks/{task_id}` | `task.read` + 店铺范围 | 仅查询租户库已登记数字任务 ID；无归属 Celery UUID 返回 404 |
 | GET | `/tenants/{tenant_id}/audit-logs?page&action` | `audit.read` | 租户审计 |
 
 ### 平台回调（不使用用户会话）
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
+| GET | `/integrations/authorization/{token}` | 可复制的长期入口：校验邀请及发起人当前授权，生成短期一次性 state，302 到平台；必要时恢复待保存结果 |
+| GET | `/integrations/authorization-selection?token&shop_id` | TikTok 多店铺选择，校验一次性选择凭据并只接受平台已返回的店铺 |
+| GET | `/integrations/tiktok/oauth/callback?code&state` | 消费短期 state 后换取凭据；多店铺进入选择页面，单店铺保存后跳转前端 |
+| GET | `/tiktok/auth/callback?code&state` | TikTok 历史回调路径兼容入口，使用同样的 state 校验 |
 | GET | `/integrations/shopee/oauth/callback?code&shop_id&state` | 校验一次性授权会话后换取 Token，成功 302 跳转前端店铺页；失败 302 带错误码 |
 | POST | `/integrations/shopee/webhook` | Shopee 推送：验签 + 事件防重后写 `webhook_events`，返回 200；无效签名 401 |
 
@@ -132,7 +139,7 @@
 
 `catalog.product.read/create/update`、`catalog.cost.read`、`inventory.read/adjust`、`store.connect/read`、
 `channel.listing.read/map`、`order.read/sync`、`stock.push`、`member.read/invite`、`role.manage/assign`、
-`audit.read`、`task.read`、`tenant.setting.manage`。
+`audit.read`、`task.read`、`task.schedule.manage`、`tenant.setting.manage`。
 
 ## 前端行为要求
 
@@ -140,3 +147,11 @@
 * 租户切换时：取消旧请求（AbortController）、清空旧数据与勾选、重新加载 bootstrap 权限、丢弃迟到的旧租户响应。
 * 不同标签页可同时处理不同租户（不把租户存全局单例）。
 * 按钮 / 菜单按有效权限显示，但后端始终独立授权。
+## 任务与授权边界
+
+* 任务列表、总数、详情、状态和重试均检查租户及店铺范围；全租户任务仅对显式全部范围可见。
+* 定时任务配置写入使用单独权限；只读角色不自动获得管理能力。
+* 手动任务不与自动化或其他用户的 pending 任务合并，Worker 缺失原始发起人时拒绝执行。
+* TenantSettings 的同步总开关是最终门禁，优先于 FeatureSetting；关闭开关后，尚未执行的 Outbox/Worker 不能继续调用相关平台接口。
+* 长期授权入口保持可复制，重新生成会撤销旧入口；旧的永久签名 state 不再直接用于回调。真实 state 仅有效 600 秒且原子消费。
+* 已连接 ERP 店铺只能重新授权同一外部身份，替换店铺必须走明确业务操作。跨库保存失败时使用加密恢复记录，不暴露令牌。

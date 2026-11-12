@@ -104,6 +104,7 @@ def create_authorization_session(
         "store_id": int(store_id) if store_id else None,
         "store_code": (store_code or "").strip(),
         "created_at": utc_now().isoformat(),
+        "expires_at": utc_after(ttl_seconds).isoformat(),
         "nonce": secrets.token_urlsafe(18),
     }
     state = build_signed_state(payload)
@@ -116,7 +117,7 @@ def create_authorization_session(
     )
     return {
         "auth_url": auth_url,
-        "expires_at": None,
+        "expires_at": payload["expires_at"],
         "environment": env,
         "state": state,
         "store_id": payload["store_id"],
@@ -197,16 +198,8 @@ def _consume_legacy_session(state: str | None) -> dict[str, Any]:
 
 
 def consume_authorization_session(state: str | None) -> dict[str, Any]:
-    """解析回调 state：优先自包含签名 state，兼容旧 Redis 会话。"""
-    token = (state or "").strip()
-    try:
-        payload = parse_signed_state(token)
-    except AppError as signed_error:
-        try:
-            return _consume_legacy_session(token)
-        except AppError:
-            raise signed_error from None
-    return validate_authorization_session(payload)
+    from app.modules.channels.authorization import consume_state
+    return validate_authorization_session(consume_state(state, "shopee")) | {"authorization_link_id": parse_signed_state(state)["authorization_link_id"]}
 
 
 # --------------------------------------------------------------------------- 回调

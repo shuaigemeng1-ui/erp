@@ -33,6 +33,7 @@ from app.api.deps import (
     AccessSnapshotDep,
     CenterDb,
     CurrentUser,
+    OptionalUser,
     RequirePermission,
     TenantCtx,
     TenantDb,
@@ -155,20 +156,29 @@ def preview_invitation(
 
 
 @router.post("/auth/invitations/accept", summary="接受邀请并设置密码")
-def accept_invitation(payload: InvitationAcceptRequest, center: CenterDb) -> JSONResponse:
+def accept_invitation(
+    payload: InvitationAcceptRequest, center: CenterDb, request: Request, user: OptionalUser,
+) -> JSONResponse:
     """激活邀请：校验一次性令牌后建立成员关系、写入角色绑定并签发会话。"""
-    user, tenants = service.accept_invitation(
+    if user is not None and session_scope(getattr(request.state, "session_payload", None)) == "platform":
+        raise AppError(ErrorCode.SCOPE_DENIED, "请使用租户登录入口接受邀请")
+    accepted_user, tenants = service.accept_invitation(
         center,
         token=payload.token,
         password=payload.password,
         display_name=payload.display_name,
+        authenticated_user_id=user.user_id if user is not None else None,
     )
+    # 只有新账号激活或已经通过本人登录验证的账号会到达这里。
+    old_session_id = getattr(request.state, "session_id", "")
+    if old_session_id:
+        delete_session(old_session_id)
     session_id, _session_payload, csrf_token = create_session(
-        int(user.id), scope="tenant"
+        int(accepted_user.id), scope="tenant"
     )
     data = {
         "user": service.user_payload(
-            user, is_platform_admin=service.is_platform_admin(center, int(user.id))
+            accepted_user, is_platform_admin=service.is_platform_admin(center, int(accepted_user.id))
         ),
         "tenants": tenants,
         "session_scope": "tenant",

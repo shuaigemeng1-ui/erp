@@ -558,7 +558,10 @@ class TestTaskRules:
             requested_by=None,
             triggered_by="schedule",
         )
-        assert stock_kwargs == {"tenant_id": 1, "store_id": 3, "sync_run_id": 2}
+        assert stock_kwargs == {
+            "tenant_id": 1, "store_id": 3, "sync_run_id": 2,
+            "requested_by": None, "triggered_by": "schedule",
+        }
 
     def test_interpret_result(self) -> None:
         assert interpret_result(

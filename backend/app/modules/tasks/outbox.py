@@ -168,6 +168,14 @@ def dispatch_tenant_batch(db: Any, tenant_id: int, *, limit: int) -> dict[str, i
     events = repository.pending_outbox_events(db, now=now, limit=limit, tenant_id=tenant_id)
     summary = {"scanned": len(events), "dispatched": 0, "failed": 0}
     for event in events:
+        from app.modules.tasks import service as task_service
+        payload = event.payload or {}
+        job_type = (task_service.JOB_STOCK_PUSH if event.event_type == "stock.push.requested"
+                    else task_service.JOB_ORDER_SYNC if event.event_type == "order.normalize"
+                    else str(payload.get("job_type") or ""))
+        if not task_service.job_enabled(db, tenant_id, job_type):
+            event.available_at = now + timedelta(seconds=60)
+            continue
         ok, error, exc = _dispatch_one(event)
         if ok:
             event.status = "dispatched"

@@ -104,6 +104,8 @@ def handler_kwargs(
             "tenant_id": int(tenant_id),
             "store_id": int(store_id or 0),
             "sync_run_id": int(sync_run_id),
+            "requested_by": requested_by,
+            "triggered_by": triggered_by,
         }
     if job_type == tasks_service.JOB_LISTING_SYNC:
         return {
@@ -111,8 +113,9 @@ def handler_kwargs(
             "store_id": int(store_id or 0),
             "requested_by": requested_by,
             "sync_run_id": int(sync_run_id),
+            "triggered_by": triggered_by,
         }
-    return {"tenant_id": int(tenant_id)}
+    return {"tenant_id": int(tenant_id), "requested_by": requested_by, "triggered_by": triggered_by}
 
 
 def interpret_result(result: Any) -> tuple[str, int, str]:
@@ -120,7 +123,9 @@ def interpret_result(result: Any) -> tuple[str, int, str]:
     if not isinstance(result, dict):
         return tasks_service.RUN_SUCCEEDED, 0, ""
     raw_status = str(result.get("status") or "").strip()
-    errors = int(result.get("errors") or 0)
+    raw_errors = result.get("errors") or 0
+    errors = len(raw_errors) if isinstance(raw_errors, (list, tuple, dict)) else int(raw_errors)
+    errors = max(errors, int(result.get("failed") or 0))
     processed = int(
         result.get("total_processed")
         or result.get("processed")
@@ -130,8 +135,12 @@ def interpret_result(result: Any) -> tuple[str, int, str]:
     message = str(result.get("error") or result.get("error_message") or "").strip()
     if not message and errors:
         messages = result.get("messages") or []
+        if not messages and isinstance(raw_errors, (list, tuple)):
+            messages = raw_errors
         message = "；".join(str(item) for item in messages)[:1000]
     status = raw_status or (tasks_service.RUN_PARTIAL if errors else tasks_service.RUN_SUCCEEDED)
+    if errors and status == tasks_service.RUN_SUCCEEDED:
+        status = tasks_service.RUN_PARTIAL
     if status not in {tasks_service.RUN_SUCCEEDED, tasks_service.RUN_PARTIAL, tasks_service.RUN_FAILED}:
         status = tasks_service.RUN_SUCCEEDED
     return status, processed, message[:1000]
@@ -260,19 +269,22 @@ def execute_sync_run(
         return {"status": run.status, "skipped": True}
     actual_job_type = str(run.job_type)
     requested_by = int(run.requested_by) if run.requested_by else None
-    actual_store_id = int(run.store_id) if run.store_id else store_id
+    actual_store_id = int(run.store_id) if run.store_id else None
     actual_triggered_by = str(run.triggered_by or triggered_by)
 
     permission = JOB_PERMISSIONS.get(actual_job_type)
-    if actual_triggered_by == "manual" and permission:
-        # 手动任务执行前复核权限：成员停用 / 权限撤销后不再执行
-        with job_tenant_session(tenant_id, user_id=requested_by, automation=False) as (
-            context,
-            _db,
-        ):
-            guard_manual_permission(context, permission)
-
     try:
+        with job_tenant_session(
+            tenant_id, user_id=requested_by,
+            automation=actual_triggered_by != "manual",
+        ) as (context, db):
+            tasks_service.ensure_job_enabled(db, tenant_id, actual_job_type)
+            if actual_triggered_by == "manual" and permission:
+                guard_manual_permission(context, permission)
+                from app.core.access import effective_from_context
+                tasks_service.ensure_job_access(
+                    effective_from_context(context), actual_job_type, actual_store_id,
+                )
         handler = load_handler(actual_job_type)
         kwargs = handler_kwargs(
             actual_job_type,

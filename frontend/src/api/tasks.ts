@@ -1,4 +1,5 @@
 import { http, requestPage } from './http'
+import type { SyncSettings } from '@/types/tasks'
 import { segment, tenantPath } from './paths'
 import type {
   AcceptedTask,
@@ -25,6 +26,14 @@ function toList<T>(raw: T[] | { items?: T[] } | null): T[] {
 }
 
 export const tasksApi = {
+  syncSettings(tenantId: EntityId): Promise<SyncSettings> {
+    return http.get<SyncSettings>(tenantPath(tenantId, '/sync-settings'))
+  },
+
+  updateSyncSettings(tenantId: EntityId, payload: Partial<SyncSettings>): Promise<SyncSettings> {
+    return http.put<SyncSettings>(tenantPath(tenantId, '/sync-settings'), payload)
+  },
+
   syncRuns(tenantId: EntityId, query: SyncRunQuery = {}): Promise<PagedData<SyncRun>> {
     return requestPage<SyncRun>(tenantPath(tenantId, '/sync-runs'), query as QueryParams)
   },

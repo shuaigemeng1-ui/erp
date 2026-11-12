@@ -51,6 +51,8 @@ def run_tenant_schedules(
     due = repository.due_schedules(db, tenant_id, now, limit=limit)
     summary["scanned"] = len(due)
     for schedule in due:
+        if not tasks_service.job_enabled(db, tenant_id, str(schedule.job_type)):
+            continue
         store_id = int(schedule.store_id) if schedule.store_id else None
         pending = repository.find_pending_sync_run(db, tenant_id, str(schedule.job_type), store_id)
         tasks_service.request_sync_run(

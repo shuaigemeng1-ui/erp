@@ -46,7 +46,7 @@ class InvitationAcceptRequest(BaseModel):
     """接受邀请请求。"""
 
     token: str = Field(min_length=10, max_length=256, description="邀请令牌原文")
-    password: str = Field(min_length=10, max_length=256, description="设置的新密码")
+    password: str = Field(default="", max_length=256, description="新账号设置密码；已有账号须先登录")
     display_name: str = Field(default="", max_length=100, description="显示名称")
 
 

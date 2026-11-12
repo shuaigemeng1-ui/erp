@@ -65,6 +65,14 @@ class SyncScheduleUpdate(BaseModel):
     )
 
 
+class SyncSettingsUpdate(BaseModel):
+    """租户同步总开关，只接受明确的布尔配置。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    order_sync_enabled: bool | None = Field(default=None, description="是否允许主动同步订单")
+    stock_push_enabled: bool | None = Field(default=None, description="是否允许向平台推送库存")
+
+
 class TaskStatusOut(BaseModel):
     """异步任务状态（tasks/{task_id}）。"""
 

@@ -143,6 +143,18 @@ function channelLabel(channel: string): string {
 
 const authStoreLabel = computed(() => authStore.value?.name ?? '')
 
+async function revokeAuthLink(store: Store): Promise<void> {
+  try {
+    await ElMessageBox.confirm(`撤销店铺「${store.name}」已生成的授权链接？`, '撤销授权链接', { type: 'warning' })
+    await channelsApi.revokeAuthorizationLink(tid(), store.id)
+    authResult.value = null
+    authVisible.value = false
+    ElMessage.success('授权链接已撤销')
+  } catch (cause) {
+    if (cause !== 'cancel' && cause !== 'close') console.error(cause)
+  }
+}
+
 async function disconnect(store: Store): Promise<void> {
   try {
     await ElMessageBox.confirm(
@@ -224,6 +236,7 @@ onMounted(load)
             >
               复制授权链接
             </el-button>
+            <el-button v-permission="'store.connect'" link type="warning" @click="revokeAuthLink(row as Store)">撤销链接</el-button>
             <el-button
               v-if="row.status === 'connected'"
               text
@@ -299,7 +312,7 @@ onMounted(load)
       />
       <el-alert type="warning" :closable="false" show-icon class="auth-link-alert">
         <p>请复制链接，用该店铺的 TikTok 主账号在任意浏览器打开并同意授权。</p>
-        <p>链接长期有效，请妥善保管；授权成功后本页刷新即可看到状态变为「已连接」。</p>
+        <p>链接可长期使用；重新生成会使旧链接失效，也可以随时撤销。授权后刷新店铺状态。</p>
       </el-alert>
       <div class="auth-link-actions">
         <el-button @click="authVisible = false">关闭</el-button>

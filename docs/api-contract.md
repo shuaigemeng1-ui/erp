@@ -47,6 +47,11 @@
 | PUT | `/platform/storage-profiles/{profile_id}` | 提交完整非敏感配置与version；同厂商空凭据保留旧值，换厂商须重填两项 |
 | PUT | `/platform/system-settings/default-storage` | {profile_id,version}；选择已启用且凭据完整的账号，返回完整system-settings结构 |
 | POST | `/platform/storage-profiles/{profile_id}/test` | 对已保存账号执行HeadBucket检查，成功返回{ok:true,message}；不上传测试图片、不修改桶读权限 |
+| GET | `/platform/email-profiles` | 邮件服务账号列表；返回 `{profiles, providers}`，凭据只返回 `has_access_key/has_secret_key` |
+| POST | `/platform/email-profiles` | 新增邮件账号：`{name, provider, region, from_address, from_name, enabled, access_key_id, secret_access_key}` |
+| PUT | `/platform/email-profiles/{profile_id}` | 更新邮件账号；同服务商空密钥保留旧值，更换服务商须重填密钥，带 `version` |
+| POST | `/platform/email-profiles/{profile_id}/default` | 设为默认邮件账号（要求已启用且密钥完整） |
+| POST | `/platform/email-profiles/{profile_id}/test` | `{to, subject?}` 发送测试邮件；支持 aliyun_directmail/tencent_ses |
 
 ### 平台系统配置与对象存储
 

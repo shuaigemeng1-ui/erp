@@ -140,3 +140,10 @@ class AgentJobEvent(BaseModel):
     message: str = Field(default="", max_length=1000)
     result: dict[str, Any] | None = None
     error: str = Field(default="", max_length=500)
+
+
+class MaintenanceWindowCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    starts_at: datetime
+    ends_at: datetime
+    reason: str = Field(default="", max_length=255)

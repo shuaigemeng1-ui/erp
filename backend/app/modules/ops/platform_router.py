@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, Query
 from app.api.deps import CenterDb, PlatformAdmin
 from app.core.http import PageParams, paged, success
 from app.modules.ops import service
-from app.modules.ops.schemas import AlertAckIn, InstanceCreate, InstanceUpdate, OperationCreate, ReleaseCreate
+from app.modules.ops.schemas import AlertAckIn, InstanceCreate, InstanceUpdate, MaintenanceWindowCreate, OperationCreate, ReleaseCreate
 
 router = APIRouter(prefix="/platform", tags=["platform-ops"])
 
@@ -117,6 +117,21 @@ def operation_detail(center: CenterDb, _: PlatformAdmin, job_id: int) -> dict:
 def backups(center: CenterDb, _: PlatformAdmin, pagination: PageParams = Depends(), instance_id: str = Query(default="", max_length=32)) -> dict:
     data = service.list_backups(center, instance_id=int(instance_id) if instance_id.isdigit() else None, page=pagination.page, page_size=pagination.page_size)
     return paged(data["items"], data["total"], data["page"], data["page_size"])
+
+
+@router.get("/instances/{instance_id}/maintenance-windows", summary="实例维护窗口")
+def maintenance_windows(center: CenterDb, _: PlatformAdmin, instance_id: int) -> dict:
+    return success(service.list_maintenance_windows(center, instance_id))
+
+
+@router.post("/instances/{instance_id}/maintenance-windows", summary="创建维护窗口")
+def create_maintenance_window(center: CenterDb, admin: PlatformAdmin, instance_id: int, payload: MaintenanceWindowCreate) -> dict:
+    return success(service.create_maintenance_window(center, instance_id, payload, actor_user_id=admin.user_id))
+
+
+@router.delete("/maintenance-windows/{window_id}", summary="删除维护窗口")
+def delete_maintenance_window(center: CenterDb, _: PlatformAdmin, window_id: int) -> dict:
+    return success(service.delete_maintenance_window(center, window_id))
 
 
 @router.get("/alerts", summary="告警列表")

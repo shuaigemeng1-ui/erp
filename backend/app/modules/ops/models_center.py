@@ -246,3 +246,17 @@ class BackupRecord(IdMixin, CenterBase):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="完成UTC")
     retention_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="保留到期UTC")
     error: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="", comment="失败原因")
+
+
+class MaintenanceWindow(IdMixin, TimestampMixin, CenterBase):
+    __tablename__ = "maintenance_windows"
+    __table_args__ = (
+        Index("ix_maintenance_windows_instance_time", "instance_id", "starts_at", "ends_at"),
+        table_options("实例维护窗口表"),
+    )
+
+    instance_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="实例ID")
+    starts_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, comment="开始时间UTC")
+    ends_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, comment="结束时间UTC")
+    reason: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="", comment="维护原因")
+    created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="创建人用户ID")

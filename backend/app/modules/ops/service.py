@@ -787,6 +787,19 @@ def _platform_admin_emails(center) -> list[str]:
     return [str(row[0]) for row in rows if row[0]]
 
 
+def _in_maintenance(center, instance_id: int, now: datetime | None = None) -> bool:
+    from app.modules.ops.models_center import MaintenanceWindow
+
+    moment = now or _now()
+    return center.execute(
+        select(MaintenanceWindow.id).where(
+            MaintenanceWindow.instance_id == instance_id,
+            MaintenanceWindow.starts_at <= moment,
+            MaintenanceWindow.ends_at >= moment,
+        ).limit(1)
+    ).first() is not None
+
+
 def notify_open_alerts(center) -> int:
     """对未通知或超过 30 分钟的未恢复告警发送邮件（尽力而为）。"""
     global _last_alert_email_at
@@ -806,6 +819,9 @@ def notify_open_alerts(center) -> int:
             ),
         ).limit(20)
     ).scalars().all()
+    if not rows:
+        return 0
+    rows = [row for row in rows if not _in_maintenance(center, row.instance_id, now)]
     if not rows:
         return 0
     from app.modules.email import service as email_service
@@ -1044,3 +1060,44 @@ def agent_job_event(center, node: ServerNode, job_id: int, payload) -> dict[str,
         row.status = "running"
     center.commit()
     return {"ok": True}
+
+
+def list_maintenance_windows(center, instance_id: int) -> list[dict[str, Any]]:
+    from app.modules.ops.models_center import MaintenanceWindow
+
+    get_instance(center, instance_id)
+    rows = center.execute(
+        select(MaintenanceWindow)
+        .where(MaintenanceWindow.instance_id == instance_id)
+        .order_by(MaintenanceWindow.starts_at.desc())
+    ).scalars().all()
+    return [
+        {"id": str(row.id), "instance_id": str(row.instance_id), "starts_at": _iso(row.starts_at),
+         "ends_at": _iso(row.ends_at), "reason": row.reason}
+        for row in rows
+    ]
+
+
+def create_maintenance_window(center, instance_id: int, payload, *, actor_user_id: int) -> dict[str, Any]:
+    from app.modules.ops.models_center import MaintenanceWindow
+
+    instance = get_instance(center, instance_id)
+    starts = _aware_utc(payload.starts_at)
+    ends = _aware_utc(payload.ends_at)
+    if starts is None or ends is None or ends <= starts:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "结束时间必须晚于开始时间")
+    row = MaintenanceWindow(instance_id=instance.id, starts_at=starts, ends_at=ends,
+                            reason=payload.reason, created_by=actor_user_id)
+    center.add(row); center.commit()
+    return {"id": str(row.id), "instance_id": str(instance.id), "starts_at": _iso(starts),
+            "ends_at": _iso(ends), "reason": row.reason}
+
+
+def delete_maintenance_window(center, window_id: int) -> dict[str, Any]:
+    from app.modules.ops.models_center import MaintenanceWindow
+
+    row = center.get(MaintenanceWindow, int(window_id))
+    if row is None:
+        raise AppError(ErrorCode.NOT_FOUND, "维护窗口不存在")
+    center.delete(row); center.commit()
+    return {"deleted": True}

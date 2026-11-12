@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
+import type { FormInstance, FormRules } from 'element-plus'
 import { refreshCsrfToken } from '@/api/http'
 import { useAuthStore } from '@/stores/auth'
 import { useEnterSession } from '@/composables/useEnterSession'
@@ -54,22 +54,12 @@ async function submit(): Promise<void> {
   }
 }
 
-function goTenantSelect(): void {
-  if (auth.isAuthenticated) void router.push('/tenant-select')
-  else ElMessage.info('请先登录')
-}
-
-function goPlatformLogin(): void {
-  void router.push('/admin/login')
-}
 </script>
 
 <template>
   <div class="auth-page">
     <div class="auth-card">
-      <div class="auth-badge">租户业务</div>
       <h1 class="auth-title">ERP 登录</h1>
-      <p class="auth-subtitle">多租户 ERP 业务系统</p>
       <el-form ref="formRef" :model="form" :rules="rules" label-position="top" @submit.prevent="submit">
         <el-form-item label="邮箱" prop="email">
           <el-input
@@ -92,23 +82,8 @@ function goPlatformLogin(): void {
         </el-form-item>
         <el-button type="primary" :loading="loading" style="width: 100%" @click="submit">登录</el-button>
       </el-form>
-      <div class="auth-footer">
-        <el-button text type="primary" @click="goTenantSelect">已登录，选择租户</el-button>
-        <el-button text @click="goPlatformLogin">平台管理员登录</el-button>
-      </div>
     </div>
   </div>
 </template>
 
-<style scoped>
-.auth-badge {
-  display: inline-block;
-  padding: 2px 10px;
-  margin-bottom: 12px;
-  border-radius: 10px;
-  background: var(--el-color-primary-light-9);
-  color: var(--el-color-primary);
-  font-size: 12px;
-  letter-spacing: 1px;
-}
-</style>
+

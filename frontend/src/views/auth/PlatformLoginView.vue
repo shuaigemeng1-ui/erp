@@ -4,6 +4,11 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { refreshCsrfToken } from '@/api/http'
 import { useAuthStore } from '@/stores/auth'
+import {
+  clearRememberedCredentials,
+  loadRememberedCredentials,
+  saveRememberedCredentials,
+} from '@/utils/rememberedCredentials'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -11,6 +16,7 @@ const route = useRoute()
 
 const formRef = ref<FormInstance>()
 const loading = ref(false)
+const remember = ref(false)
 const form = reactive({
   email: '',
   password: '',
@@ -27,7 +33,28 @@ const rules: FormRules = {
 onMounted(() => {
   // 进入登录页强制获取新的匿名 CSRF，避免旧会话 Cookie 导致登录 403
   void refreshCsrfToken()
+  void restoreRemembered()
 })
+
+async function restoreRemembered(): Promise<void> {
+  const saved = await loadRememberedCredentials('platform')
+  if (!saved) return
+  form.email = saved.email
+  form.password = saved.password
+  remember.value = true
+}
+
+async function persistRemembered(): Promise<void> {
+  if (remember.value) {
+    await saveRememberedCredentials('platform', form.email.trim(), form.password)
+  } else {
+    clearRememberedCredentials('platform')
+  }
+}
+
+function onRememberChange(value: string | number | boolean): void {
+  if (!value) clearRememberedCredentials('platform')
+}
 
 async function submit(): Promise<void> {
   const formInstance = formRef.value
@@ -43,6 +70,7 @@ async function submit(): Promise<void> {
       ElMessage.error('该账号不是平台管理员')
       return
     }
+    await persistRemembered()
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
     const target = redirect.startsWith('/platform/') ? redirect : '/platform/tenants'
     await router.replace(target)
@@ -79,6 +107,9 @@ async function submit(): Promise<void> {
             @keyup.enter="submit"
           />
         </el-form-item>
+        <div class="login-form-options">
+          <el-checkbox v-model="remember" @change="onRememberChange">记住密码</el-checkbox>
+        </div>
         <el-button type="primary" :loading="loading" style="width: 100%" @click="submit">
           登录平台控制台
         </el-button>

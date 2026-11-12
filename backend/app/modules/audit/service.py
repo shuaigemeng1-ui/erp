@@ -66,11 +66,14 @@ def audit_payload(row: AuditLog, *, include_cost: bool = False) -> dict[str, Any
     """审计日志响应结构（ID 一律字符串、时间 UTC ISO）。"""
     from app.modules.identity.service import iso_utc
 
+    snapshot = (row.actor_name_snapshot or "").strip()
+    if snapshot.isdigit():
+        snapshot = ""
     return {
         "id": str(row.id),
         "tenant_id": str(row.tenant_id),
         "actor_id": str(row.actor_id) if row.actor_id else None,
-        "actor_name": row.actor_name_snapshot or "",
+        "actor_name": snapshot,
         "action": row.action,
         "resource_type": row.resource_type,
         "resource_id": str(row.resource_id) if row.resource_id else None,

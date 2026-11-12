@@ -788,6 +788,7 @@ def run_center_maintenance(center, *, probe_interval_seconds: int = 60) -> dict[
                 failed += 1
         _last_probe_at = now
     aggregate_metrics(center)
+    mark_stale_operations(center)
     notifications = check_backup_alerts(center)
     notified = notify_open_alerts(center)
     cleaned = cleanup_old_monitoring_data(center)
@@ -1047,10 +1048,26 @@ def list_backups(center, *, instance_id: int | None = None, page: int = 1, page_
 def poll_agent_job(center, node: ServerNode) -> dict[str, Any] | None:
     from app.modules.ops.models_center import OperationJob
     now = _now()
+    # 过期租约先标记为 unknown；绝不自动重新执行，必须人工核对。
+    stale = center.execute(
+        select(OperationJob).where(
+            OperationJob.node_id == node.id,
+            OperationJob.status.in_(("leased", "running")),
+            OperationJob.lease_expires_at.is_not(None),
+            OperationJob.lease_expires_at < now,
+        )
+    ).scalars().all()
+    for item in stale:
+        item.status = "unknown"
+        item.error = "执行中失联，结果待核对"
+        item.finished_at = now
+        item.updated_at = now
+    if stale:
+        center.commit()
     row = center.execute(
         select(OperationJob).where(
             OperationJob.node_id == node.id,
-            or_(OperationJob.status == "pending", and_(OperationJob.status == "leased", OperationJob.lease_expires_at < now)),
+            OperationJob.status == "pending",
         ).order_by(OperationJob.id.asc()).with_for_update()
     ).scalars().first()
     if row is None:
@@ -1298,3 +1315,40 @@ def list_metric_aggregates(center, node_id: int, *, resolution: str = "5m", hour
             for row in rows
         ],
     }
+
+
+def mark_stale_operations(center) -> int:
+    """任务租约过期后标记结果待核对，不自动重跑。"""
+    from app.modules.ops.models_center import OperationJob
+
+    now = _now()
+    rows = center.execute(
+        select(OperationJob).where(
+            OperationJob.status.in_(("leased", "running")),
+            OperationJob.lease_expires_at.is_not(None),
+            OperationJob.lease_expires_at < now,
+        )
+    ).scalars().all()
+    for row in rows:
+        row.status = "unknown"
+        row.error = "执行中失联，结果待核对"
+        row.finished_at = now
+        row.updated_at = now
+    if rows:
+        center.commit()
+    return len(rows)
+
+
+def retry_operation(center, job_id: int, *, actor_user_id: int) -> dict[str, Any]:
+    from app.modules.ops.models_center import OperationJob
+
+    old = center.get(OperationJob, int(job_id))
+    if old is None:
+        raise AppError(ErrorCode.NOT_FOUND, "运维任务不存在")
+    if old.status in {"pending", "leased", "running"}:
+        raise ConflictError("任务仍在执行中，不能重试")
+    payload = OperationCreate(
+        job_type=old.job_type, target_version=old.target_version,
+        payload=old.payload_json or {}, idempotency_key="",
+    )
+    return create_operation(center, old.instance_id, payload, actor_user_id=actor_user_id)

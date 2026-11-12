@@ -14,7 +14,8 @@ backend/.env
 
 # 前端
 frontend/node_modules/
-frontend/dist/
+# 说明：frontend/dist 是部署产物，但服务器（2C2G）不执行 Node 构建，
+# 为保证 git pull 即可部署，构建产物纳入版本管理；改前端后必须先 npm run build 再提交。
 frontend/.vite/
 frontend/*.local
 frontend/.eslintcache

@@ -422,3 +422,23 @@ curl -fsS http://127.0.0.1:8080/api/v1/auth/csrf
 
 > `docker compose down` 不会删除命名卷；`docker compose down -v` 会删除数据卷，**禁止**在未备份时执行。
 
+## 13. Git 管理（本地与服务器统一）
+
+仓库：<https://github.com/shuaigemeng1-ui/erp.git>，默认分支 `main`。服务器 `/opt/ventasync`
+是同一仓库的 git 工作树，更新只通过 git，不再用 tar 包覆盖。完整约定见
+`docs/git-workflow.md`，服务器更新脚本：
+
+```bash
+cd /opt/ventasync
+bash deploy/scripts/git_update.sh          # pull -> build -> up -d -> migrate
+bash deploy/scripts/git_update.sh --skip-migrate
+```
+
+要点：
+
+* `deploy/.env`、`backend/.env` 等敏感配置不入库，`git pull` 不会覆盖服务器配置；
+* `frontend/dist` 已入库（服务器 2C2G 不跑 Node 构建），改前端后必须在本地
+  `npm run build` 再提交；
+* 发布打 tag（如 `v1.0.0`），回滚用 `git checkout <tag>` + `git_update.sh`；
+* 仓库当前为 public，提交前确认没有真实密码/密钥。
+

@@ -1,5 +1,7 @@
 # VentaSync 多租户 SaaS（FastAPI + Vue 3 + MySQL）
 
+仓库：<https://github.com/shuaigemeng1-ui/erp.git>（`main` 分支；本地与服务器统一用 git 管理，见 [docs/git-workflow.md](docs/git-workflow.md)）。
+
 依据仓库根目录 `plan.txt` 建设的全新系统，与桌面 `ventasync` Laravel 项目相互独立：
 `ventasync` 只作为业务参考（Shopee 订单 / 库存扣减 / 状态映射），本目录不复用其代码、不改动其文件。
 
@@ -50,6 +52,7 @@ npm run build     # 提交前必须通过
 * 只允许域名访问：HTTP IP 301 跳转域名、HTTPS IP 无法握手、Host≠SNI 返回 421；`TRUSTED_HOSTS` 限制后端 Host
 * 平台管理员凭据保存在服务器 `/root/ventasync-credentials.txt`（600 权限）
 * 架构与步骤：`docs/real-deployment.md`
+* 服务器代码目录 `/opt/ventasync` 为 git 工作树，更新执行 `bash deploy/scripts/git_update.sh`
 * 已验证：双租户真实开通（各 29 表、0 外键）、邀请激活、权限、商品/库存、租户隔离、暂停/启用、登录限流、备份脚本
 * P0 已上线：域名 + HTTPS（自动续期）、管理员/MySQL/中心库密码轮换、每日 03:30 全量备份、单租户恢复演练
 * 待外部条件：Shopee 应用与真实测试店铺联调（需 Partner ID/Key 与店铺授权）；详见 `docs/real-deployment.md` §8

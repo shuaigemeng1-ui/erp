@@ -21,7 +21,7 @@ plan.txt    需求与实施计划（原样保留）
   `https://erp.alienyan.store/api/v1/integrations/tiktok/oauth/callback`（需加入 TikTok 应用白名单）
 - 租户 → **店铺连接** → **授权 TikTok Shop**，完成 OAuth 后店铺与加密凭据自动入库
 - 已实现：OAuth 授权、token 换取/刷新、HMAC-SHA256 签名客户端、店铺绑定、`shop_cipher` 加密保存
-- 待做：Phase 2 订单拉取、库存推送、商品映射（后续再接商品发布/退货/结算）
+- Phase 2 已完成：订单拉取/落库、商品同步与映射、库存推送；回调 Webhook、退货/结算/商品发布后续补
 
 ## 登录入口（租户与平台管理已隔离）
 

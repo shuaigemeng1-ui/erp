@@ -299,3 +299,19 @@ caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl re
 > 本地代码没有 `.env` 与数据库，无法直接复用；需要在新 ERP 渠道应用中填写 TikTok 应用凭据，
 > 或在 TikTok 后台新建应用后重新授权。
 
+## 11. TikTok Shop Phase 2（订单 / 商品 / 库存，2026-11-12）
+
+| 能力 | 实现 |
+| --- | --- |
+| 商品同步 | `POST /product/202309/products/search` → `channel_listings`，按 `seller_sku` 自动匹配本地 SKU |
+| 订单拉取 | `POST /order/202309/orders/search` → `channels.service.fetch_orders` 渠道分支 → `platform_order_raw` → 归一化订单/明细/库存影响 |
+| 订单状态 | UNPAID/ON_HOLD→pending、AWAITING_SHIPMENT/AWAITING_COLLECTION→paid、IN_TRANSIT/DELIVERED→shipped、COMPLETED→completed、CANCELLED→cancelled |
+| 库存推送 | `POST /product/202309/products/{id}/inventory/update`，按仓库写入；仓库来自 `/logistics/202309/warehouses`，存 `stores.warehouse_id` |
+| Token 刷新 | access token 过期前自动用 refresh token 刷新，失败标记 `reauth_required` |
+| 数据隔离 | 复用租户库表与现有同步流水线；订单/库存幂等逻辑不变 |
+| 迁移 | 租户库 `tenant_0006`（stores.warehouse_id） |
+| 尚未实现 | TikTok Webhook 回调、退货/结算、商品发布（Phase 2 后续） |
+
+> 实际联调需要 TikTok Shop 应用凭据与已授权店铺；当前平台渠道应用为空，
+> 配置 App Key/Secret 并完成授权后，定时任务/手动同步即可走 TikTok 分支。
+

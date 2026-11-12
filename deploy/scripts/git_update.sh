@@ -48,7 +48,7 @@ cd "${REPO_ROOT}"
 log "拉取最新代码（只允许 fast-forward）..."
 git pull --ff-only
 
-if git ls-files -m --error-unmatch >/dev/null 2>&1; then
+if [[ -n "$(git status --porcelain)" ]]; then
     log "警告：工作树存在未提交修改，请先检查（git status）"
 fi
 

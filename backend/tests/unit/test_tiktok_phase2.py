@@ -58,7 +58,7 @@ def test_parse_tiktok_listings() -> None:
     assert len(rows) == 1
     row = rows[0]
     assert row.external_item_id == "1729000000000000001"
-    assert row.external_sku_id == "1729000000000000002"
+    assert row.external_sku_id == "SKU-1"
     assert row.title == "Test TikTok Product"
     assert row.price == Decimal("19.90")
     assert row.remote_stock == 10
@@ -74,7 +74,7 @@ def test_parse_tiktok_order_and_status() -> None:
     assert parsed.buyer_name == "Buyer"
     assert len(parsed.lines) == 1
     assert parsed.lines[0].external_item_id == "1729000000000000001"
-    assert parsed.lines[0].external_sku_id == "1729000000000000002"
+    assert parsed.lines[0].external_sku_id == "SKU-1"
     assert parsed.lines[0].quantity == 2
     assert normalize_platform_status("tiktok", "IN_TRANSIT") == NormalizedOrderStatus.SHIPPED
     assert normalize_platform_status("tiktok", "COMPLETED") == NormalizedOrderStatus.COMPLETED

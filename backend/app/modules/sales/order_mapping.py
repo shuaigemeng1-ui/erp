@@ -318,7 +318,7 @@ def _parse_tiktok_lines(payload: dict) -> list[ParsedOrderLine]:
             item.get("product_id") or item.get("item_id") or item.get("sku_id"), 64
         )
         external_sku_id = _text(
-            item.get("sku_id") or item.get("seller_sku") or item.get("id"), 64
+            item.get("seller_sku") or item.get("sku_id") or item.get("id"), 64
         )
         quantity = item.get("quantity", 1)
         try:

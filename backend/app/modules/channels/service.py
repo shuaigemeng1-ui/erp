@@ -1105,7 +1105,10 @@ def parse_tiktok_listings(products: Sequence[Mapping[str, Any]]) -> list[RemoteL
         for sku in skus:
             if not isinstance(sku, Mapping):
                 continue
-            sku_id = normalize_external_id(sku.get("id") or sku.get("sku_id") or sku.get("seller_sku"))
+            # 映射键优先用 seller_sku（与本地 SKU 编码匹配）；API 调用仍使用原始 sku.id
+            sku_id = normalize_external_id(
+                sku.get("seller_sku") or sku.get("sku_id") or sku.get("id")
+            )
             specs = _tiktok_specs(sku)
             rows.append(
                 RemoteListing(
@@ -1213,12 +1216,16 @@ def _push_tiktok_stock(
             raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "TikTok 店铺未返回可用仓库")
         pushed = 0
         for listing in listings:
-            sku_id = normalize_external_id(listing.external_sku_id)
-            if not sku_id:
+            raw = listing.raw if isinstance(listing.raw, Mapping) else {}
+            raw_sku = raw.get("sku") if isinstance(raw.get("sku"), Mapping) else {}
+            api_sku_id = normalize_external_id(
+                raw_sku.get("id") or raw_sku.get("sku_id") or listing.external_sku_id
+            )
+            if not api_sku_id:
                 continue
             client.update_inventory(
                 listing.external_item_id,
-                [{"id": sku_id, "inventory": [{"warehouse_id": warehouse_id, "quantity": clamp_stock_quantity(stock)}]}],
+                [{"id": api_sku_id, "inventory": [{"warehouse_id": warehouse_id, "quantity": clamp_stock_quantity(stock)}]}],
             )
             listing.remote_stock = stock
             listing.synced_at = utc_now()

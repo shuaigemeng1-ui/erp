@@ -49,9 +49,13 @@ export const channelsApi = {
     return http.post<AuthorizeResult>(tenantPath(tenantId, '/stores/tiktok/authorize'), payload)
   },
 
-  authorizeStore(tenantId: EntityId, storeId: EntityId): Promise<AuthorizeResult> {
+  authorizeStore(
+    tenantId: EntityId,
+    storeId: EntityId,
+    channel: 'tiktok' | 'shopee',
+  ): Promise<AuthorizeResult> {
     return http.post<AuthorizeResult>(
-      tenantPath(tenantId, `/stores/${segment(storeId)}/tiktok/authorize`),
+      tenantPath(tenantId, `/stores/${segment(storeId)}/${channel}/authorize`),
     )
   },
 

@@ -88,6 +88,8 @@ def create_authorization_session(
     partner_id: int,
     partner_key: str,
     redirect_url: str,
+    store_id: int | None = None,
+    store_code: str = "",
     ttl_seconds: int = OAUTH_SESSION_TTL_SECONDS,
 ) -> dict[str, Any]:
     """创建一次性授权会话并返回 ``{auth_url, expires_at, environment}``。"""
@@ -100,6 +102,8 @@ def create_authorization_session(
         "member_id": int(member_id),
         "environment": env,
         "redirect_path": safe_redirect_path(redirect_path, f"/tenants/{tenant_id_int}/stores"),
+        "store_id": int(store_id) if store_id else None,
+        "store_code": (store_code or "").strip(),
         "created_at": utc_now().isoformat(),
         "expires_at": expires_at.isoformat(),
     }
@@ -158,11 +162,15 @@ def validate_authorization_session(
     redirect_path = safe_redirect_path(
         str(payload.get("redirect_path") or ""), f"/tenants/{tenant_id}/stores"
     )
+    raw_store_id = payload.get("store_id")
+    store_id = int(raw_store_id) if raw_store_id not in (None, "", 0, "0") else None
     return {
         "tenant_id": tenant_id,
         "member_id": member_id,
         "environment": environment,
         "redirect_path": redirect_path,
+        "store_id": store_id,
+        "store_code": str(payload.get("store_code") or ""),
     }
 
 
@@ -328,6 +336,7 @@ def complete_authorization(
             access_token_expires_at=access_expires,
             refresh_token_expires_at=refresh_expires,
             member_id=int(session.get("member_id") or 0) or None,
+            store_id=int(session["store_id"]) if session.get("store_id") else None,
         )
         channel_service.claim_store_registry(
             center,
@@ -349,6 +358,7 @@ def complete_authorization(
                 "channel": CHANNEL_SHOPEE,
                 "environment": environment,
                 "external_store_id": str(shop_id),
+                "store_code": str(session.get("store_code") or ""),
             },
         )
         tenant_db.commit()

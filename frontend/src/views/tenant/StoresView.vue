@@ -84,9 +84,7 @@ async function submitCreate(): Promise<void> {
     createVisible.value = false
     ElMessage.success(`店铺「${name}」已创建，状态：待授权`)
     await load()
-    if (created.channel === 'tiktok') {
-      await openAuthorizationLink(created)
-    }
+    await openAuthorizationLink(created)
   } finally {
     creating.value = false
   }
@@ -98,7 +96,11 @@ async function openAuthorizationLink(store: Store): Promise<void> {
   authVisible.value = true
   authLoadingStoreId.value = String(store.id)
   try {
-    const result = await channelsApi.authorizeStore(tid(), store.id)
+    const result = await channelsApi.authorizeStore(
+      tid(),
+      store.id,
+      store.channel === 'shopee' ? 'shopee' : 'tiktok',
+    )
     authResult.value = result
     const copied = await copyText(result.auth_url)
     if (copied) {
@@ -213,10 +215,7 @@ onMounted(load)
         <template #default="{ row }">
           <template v-if="canConnect">
             <el-button
-              v-if="
-                row.channel === 'tiktok' &&
-                (row.status === 'pending_authorization' || row.status === 'reauth_required')
-              "
+              v-if="row.status === 'pending_authorization' || row.status === 'reauth_required'"
               text
               type="primary"
               size="small"
@@ -235,12 +234,6 @@ onMounted(load)
             >
               断开
             </el-button>
-            <span
-              v-if="row.status === 'pending_authorization' && row.channel !== 'tiktok'"
-              class="muted"
-            >
-              待接入授权
-            </span>
           </template>
         </template>
       </el-table-column>
@@ -266,8 +259,7 @@ onMounted(load)
     </el-form>
     <el-alert type="info" :closable="false" show-icon>
       <p>创建后店铺状态为「待授权」，不会参与订单/库存同步。</p>
-      <p>TikTok Shop 会立即生成授权链接并自动复制；把它发给该店铺的主账号打开完成授权。</p>
-      <p v-if="createForm.channel === 'shopee'">Shopee 暂未接入「先建店铺后授权」，创建后可先保留记录。</p>
+      <p>系统会立即生成授权链接并自动复制；把它发给该店铺的主账号打开完成授权。</p>
     </el-alert>
     <template #footer>
       <el-button @click="createVisible = false">取消</el-button>
@@ -275,17 +267,27 @@ onMounted(load)
     </template>
   </el-dialog>
 
-  <el-dialog v-model="authVisible" title="TikTok Shop 授权链接" width="600px" destroy-on-close>
+  <el-dialog
+    v-model="authVisible"
+    :title="`${authStore ? channelLabel(authStore.channel) : ''} 授权链接`"
+    width="600px"
+    destroy-on-close
+  >
     <div v-if="authResult" class="auth-link-dialog">
       <el-descriptions :column="2" border size="small">
         <el-descriptions-item label="ERP 店铺">{{ authStoreLabel }}</el-descriptions-item>
         <el-descriptions-item label="店铺编码">
           <span class="mono">{{ textOrDash(authStore?.store_code) }}</span>
         </el-descriptions-item>
-        <el-descriptions-item label="Service ID">
+        <el-descriptions-item v-if="authStore?.channel === 'tiktok'" label="Service ID">
           <span class="mono">{{ textOrDash(authResult.service_id) }}</span>
         </el-descriptions-item>
-        <el-descriptions-item label="授权市场">{{ authResult.market || 'ROW' }}</el-descriptions-item>
+        <el-descriptions-item v-if="authStore?.channel === 'tiktok'" label="授权市场">
+          {{ authResult.market || 'ROW' }}
+        </el-descriptions-item>
+        <el-descriptions-item v-else label="授权环境">
+          {{ authResult.environment || '-' }}
+        </el-descriptions-item>
       </el-descriptions>
       <div class="auth-link-label">完整授权链接</div>
       <el-input

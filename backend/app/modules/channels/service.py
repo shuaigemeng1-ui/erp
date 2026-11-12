@@ -637,6 +637,7 @@ def start_shopee_authorization(
     *,
     tenant_id: int,
     member_id: int,
+    store_id: int | None = None,
     environment: str | None = None,
     redirect_path: str | None = None,
     actor_id: int | None = None,
@@ -644,7 +645,20 @@ def start_shopee_authorization(
     ip: str = "",
 ) -> dict[str, Any]:
     """发起 Shopee 店铺授权，返回一次性授权会话与 ``auth_url``。"""
-    env = normalize_environment(environment) or resolve_environment(settings.app_env)
+    store = None
+    if store_id is not None:
+        store = get_store_or_raise(db, tenant_id, int(store_id))
+        if store.channel != CHANNEL_SHOPEE:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "该店铺不是 Shopee 渠道")
+        if store.status not in {
+            STORE_STATUS_PENDING_AUTHORIZATION,
+            STORE_STATUS_REAUTH_REQUIRED,
+            STORE_STATUS_CONNECTED,
+        }:
+            raise AppError(ErrorCode.STORE_NOT_CONNECTED, "当前店铺状态不允许发起授权")
+        env = normalize_environment(environment) or store.environment
+    else:
+        env = normalize_environment(environment) or resolve_environment(settings.app_env)
     config = require_channel_app(center, env)
     callback_url = config.redirect_url or default_callback_url()
     if not callback_url.startswith("http"):
@@ -658,6 +672,8 @@ def start_shopee_authorization(
         partner_id=int(config.partner_id or 0),
         partner_key=config.partner_key,
         redirect_url=callback_url,
+        store_id=store.id if store is not None else None,
+        store_code=store.store_code if store is not None else "",
     )
     record_audit(
         db,
@@ -666,7 +682,12 @@ def start_shopee_authorization(
         resource_type="store",
         actor_id=actor_id,
         summary=f"发起 Shopee 店铺授权（{env}）",
-        payload={"channel": CHANNEL_SHOPEE, "environment": env},
+        payload={
+            "channel": CHANNEL_SHOPEE,
+            "environment": env,
+            "store_id": session.get("store_id"),
+            "store_code": session.get("store_code"),
+        },
         request_id=request_id,
         ip=ip,
     )
@@ -675,6 +696,8 @@ def start_shopee_authorization(
         "auth_url": session["auth_url"],
         "expires_at": session["expires_at"],
         "environment": session["environment"],
+        "store_id": session.get("store_id"),
+        "store_code": session.get("store_code"),
     }
 
 

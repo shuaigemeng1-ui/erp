@@ -304,6 +304,7 @@ caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl re
 | 能力 | 实现 |
 | --- | --- |
 | 商品同步 | `POST /product/202309/products/search` → `channel_listings`，按 `seller_sku` 自动匹配本地 SKU |
+| 店铺授权 | 新建店铺（待授权）→ 操作栏复制 `services.tiktokshop.com/open/authorize?service_id=...&state=...` 链接 → 回调绑定该店铺 |
 | 订单拉取 | `POST /order/202309/orders/search` → `channels.service.fetch_orders` 渠道分支 → `platform_order_raw` → 归一化订单/明细/库存影响 |
 | 订单状态 | UNPAID/ON_HOLD→pending、AWAITING_SHIPMENT/AWAITING_COLLECTION→paid、IN_TRANSIT/DELIVERED→shipped、COMPLETED→completed、CANCELLED→cancelled |
 | 库存推送 | `POST /product/202309/products/{id}/inventory/update`，按仓库写入；仓库来自 `/logistics/202309/warehouses`，存 `stores.warehouse_id` |

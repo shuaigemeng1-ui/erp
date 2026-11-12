@@ -122,6 +122,38 @@ def create_tenant_store(
     return success(schemas.store_payload(items[0]))
 
 
+@router.post("/tenants/{tenant_id}/stores/{store_id}/shopee/authorize")
+def authorize_shopee_store_link(
+    request: Request,
+    tenant_id: int = Path(ge=1),
+    store_id: int = Path(ge=1),
+    ctx: TenantContext = Depends(tenant_context),
+    db: Session = Depends(get_tenant_db),
+    center: Session = Depends(get_center_db),
+    snapshot: AccessSnapshot = Depends(require_permission(Permission.STORE_CONNECT.value)),
+) -> dict[str, Any]:
+    """为「待授权」店铺生成 Shopee 授权会话。"""
+    allowed = service.allowed_store_ids(snapshot.effective, Permission.STORE_CONNECT.value)
+    if not service.store_in_scope(store_id, allowed):
+        raise AppError(ErrorCode.NOT_FOUND, "店铺不存在或不可见")
+    store = service.get_store_or_raise(db, tenant_id, store_id)
+    if store.channel != "shopee":
+        raise AppError(ErrorCode.VALIDATION_ERROR, "该店铺不是 Shopee 渠道")
+    result = service.start_shopee_authorization(
+        center,
+        db,
+        tenant_id=tenant_id,
+        member_id=ctx.member_id,
+        store_id=store_id,
+        environment=store.environment,
+        redirect_path=f"/tenants/{tenant_id}/stores",
+        actor_id=ctx.user_id,
+        request_id=ctx.request_id,
+        ip=_client_ip(request),
+    )
+    return success(schemas.authorize_payload(result))
+
+
 @router.post("/tenants/{tenant_id}/stores/shopee/authorize")
 def authorize_shopee_store(
     request: Request,

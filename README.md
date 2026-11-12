@@ -98,3 +98,17 @@ npm run build     # 提交前必须通过
 * 金额用 `DECIMAL` + `Decimal`；时间存 UTC；大整数 ID 以字符串返回前端。
 * 迁移由独立发布任务执行，API 不在启动时自动迁移。
 * 不擅自启动前后端项目或连接生产环境。
+
+### TikTok Shop「先建店铺、后授权」流程
+
+1. 店铺连接 → **新建店铺**：选择渠道（TikTok Shop / Shopee）+ 填写 ERP 显示名称；
+2. 创建后状态为 **待授权**，不会参与订单 / 库存同步；
+3. 操作栏点击 **复制授权链接**：
+   - 后端用平台应用 `App ID` 作为 TikTok `service_id`，拼接
+     `https://services.tiktokshop.com/open/authorize?service_id=...&state=...`
+     （US 应用使用 `services.us.tiktokshop.com`）；
+   - 链接绑定该 ERP 店铺的一次性 state，可直接复制给店铺主账号在任意浏览器打开；
+4. 店铺主账号授权后，TikTok 回调到
+   `/api/v1/integrations/tiktok/oauth/callback`，后端换取 token、读取 shops，
+   把原「待授权」店铺更新为 **已连接**，并保存加密凭据。
+

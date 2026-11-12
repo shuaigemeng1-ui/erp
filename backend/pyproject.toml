@@ -1,7 +1,7 @@
 [project]
 name = "ventasync-backend"
 version = "1.0.0"
-description = "VentaSync 多租户 SaaS 后端（FastAPI + SQLAlchemy 2 + MySQL）"
+description = "ERP 多租户 SaaS 后端（FastAPI + SQLAlchemy 2 + MySQL）"
 requires-python = ">=3.12"
 
 [tool.pytest.ini_options]

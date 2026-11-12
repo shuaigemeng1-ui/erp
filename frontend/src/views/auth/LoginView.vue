@@ -56,7 +56,7 @@ function goTenantSelect(): void {
 <template>
   <div class="auth-page">
     <div class="auth-card">
-      <h1 class="auth-title">VentaSync 管理后台</h1>
+      <h1 class="auth-title">ERP 管理后台</h1>
       <p class="auth-subtitle">多租户 SaaS 运营平台</p>
       <el-form ref="formRef" :model="form" :rules="rules" label-position="top" @submit.prevent="submit">
         <el-form-item label="邮箱" prop="email">

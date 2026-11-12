@@ -1,4 +1,4 @@
-# VentaSync 前端（多租户 SaaS 后台）
+# ERP 前端（多租户 SaaS 后台）
 
 Vue 3.5 + TypeScript + Vite + Vue Router 4 + Pinia 3 + Element Plus 2 首版后台工程。
 只负责前端工程与页面，数据全部按 `docs/api-contract.md` 契约调用 `/api/v1`。

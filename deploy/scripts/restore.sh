@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# VentaSync 单库恢复脚本（mysqldump 备份恢复）
+# ERP 单库恢复脚本（mysqldump 备份恢复）
 #
 # 用法：
 #   deploy/scripts/restore.sh -f deploy/backups/vs_tenant_1_20260101T000000Z.sql.gz \

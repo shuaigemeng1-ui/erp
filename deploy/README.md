@@ -1,4 +1,4 @@
-# VentaSync 部署与运维（Docker Compose + Nginx）
+# ERP 部署与运维（Docker Compose + Nginx）
 
 本目录负责首版多租户 SaaS 的部署编排（plan.txt §1 / §5 P6）：MySQL 8.4、Redis（缓存/队列分离）、
 API、Celery Worker、独立调度进程、独立迁移发布任务、Nginx 反向代理与前端静态托管、备份恢复脚本。

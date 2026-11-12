@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # ---------------------------------------------------------------------------
-# VentaSync 前端镜像：node:22-alpine 构建 → nginx:alpine 静态托管
+# ERP 前端镜像：node:22-alpine 构建 → nginx:alpine 静态托管
 #
 # 构建（在 deploy/ 目录执行）：
 #   docker compose -f docker-compose.yml build nginx

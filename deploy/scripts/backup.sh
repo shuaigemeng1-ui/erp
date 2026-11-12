@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# VentaSync 单库备份脚本（mysqldump）
+# ERP 单库备份脚本（mysqldump）
 #
 # 用法（在仓库根目录或任意目录执行）：
 #   deploy/scripts/backup.sh -d ventasync_center        # 备份中心库

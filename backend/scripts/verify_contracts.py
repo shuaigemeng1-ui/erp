@@ -578,7 +578,7 @@ def check_routes(checker: Checker, docs_text: str) -> None:
 
 # --------------------------------------------------------------------------- 主流程
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="VentaSync 离线契约校验")
+    parser = argparse.ArgumentParser(description="ERP 离线契约校验")
     parser.add_argument("--verbose", action="store_true", help="输出异常堆栈等调试信息")
     args = parser.parse_args(argv)
 

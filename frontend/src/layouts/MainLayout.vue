@@ -114,8 +114,8 @@ async function submitPassword(): Promise<void> {
   <el-container class="app-layout">
     <el-aside :width="collapsed ? '64px' : '224px'" class="app-aside">
       <div class="app-brand">
-        <span v-if="!collapsed">VentaSync</span>
-        <span v-else>VS</span>
+        <span v-if="!collapsed">ERP</span>
+        <span v-else>ERP</span>
       </div>
       <el-menu
         :default-active="activeMenu"

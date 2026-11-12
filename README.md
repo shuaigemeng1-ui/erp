@@ -1,4 +1,4 @@
-# VentaSync 多租户 SaaS（FastAPI + Vue 3 + MySQL）
+# ERP 多租户 SaaS（FastAPI + Vue 3 + MySQL）
 
 仓库：<https://github.com/shuaigemeng1-ui/erp.git>（`main` 分支；本地与服务器统一用 git 管理，见 [docs/git-workflow.md](docs/git-workflow.md)）。
 

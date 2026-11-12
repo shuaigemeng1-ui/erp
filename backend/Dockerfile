@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # ---------------------------------------------------------------------------
-# VentaSync 后端镜像（API / Worker / 调度器 / 迁移发布任务共用）
+# ERP 后端镜像（API / Worker / 调度器 / 迁移发布任务共用）
 #
 # 构建（在 deploy/ 目录执行）：
 #   docker compose -f docker-compose.yml build api

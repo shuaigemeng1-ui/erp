@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "VentaSync 多租户 SaaS 后台（Vue 3 + TypeScript + Vite + Element Plus）",
+  "description": "ERP 多租户 SaaS 后台（Vue 3 + TypeScript + Vite + Element Plus）",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",

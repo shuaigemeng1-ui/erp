@@ -1,5 +1,5 @@
 -- ============================================================================
--- VentaSync 表 / 字段注释验收（plan.txt P0：应用表与字段有中文注释）
+-- ERP 表 / 字段注释验收（plan.txt P0：应用表与字段有中文注释）
 --
 -- 用法（在部署机执行）：
 --   docker compose -f deploy/docker-compose.yml exec -T mysql \

@@ -183,7 +183,7 @@ def _release_lock(connection) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="VentaSync 发布迁移：中心库与租户库执行 alembic upgrade head",
+        description="ERP 发布迁移：中心库与租户库执行 alembic upgrade head",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(

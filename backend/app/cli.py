@@ -140,7 +140,7 @@ def _config_check(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m app.cli",
-        description="VentaSync 运维命令",
+        description="ERP 运维命令",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

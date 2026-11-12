@@ -1,5 +1,5 @@
 # =============================================================================
-# VentaSync 首版部署编排（plan.txt §1 / §5 P6）
+# ERP 首版部署编排（plan.txt §1 / §5 P6）
 #
 # 进程分离（plan.txt「部署」与「迁移使用独立发布任务执行」）：
 #   mysql / redis-cache / redis-queue  数据服务（仅内部网络）
@@ -51,7 +51,7 @@ x-backend: &backend
 # 仅外部地址指向容器服务名；生产环境用 deploy/.env 覆盖。
 x-app-env: &app-env
   # 基础
-  APP_NAME: ${APP_NAME:-VentaSync}
+  APP_NAME: ${APP_NAME:-ERP}
   APP_ENV: ${APP_ENV:-production}
   API_PREFIX: ${API_PREFIX:-/api/v1}
   DEBUG: ${DEBUG:-false}

@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------ 基础
-    app_name: str = "VentaSync"
+    app_name: str = "ERP"
     app_env: str = "development"  # development | test | production
     api_prefix: str = "/api/v1"
     debug: bool = False

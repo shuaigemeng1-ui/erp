@@ -1,5 +1,5 @@
 -- ============================================================================
--- VentaSync 零外键验收（plan.txt §5 验证项 8）
+-- ERP 零外键验收（plan.txt §5 验证项 8）
 --
 -- 用法（在部署机执行，需 MySQL root 或具备 information_schema 读权限的账号）：
 --   docker compose -f deploy/docker-compose.yml exec -T mysql \

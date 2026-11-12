@@ -1,8 +1,8 @@
-# VentaSync 多租户 SaaS 重构计划
+# ERP 多租户 SaaS 重构计划
 
 ## 1. 已确认的目标与首版范围
 
-基于现有 VentaSync 业务逻辑，建设全新的 FastAPI + Vue 3 + MySQL 系统。
+基于现有 ERP 业务逻辑，建设全新的 FastAPI + Vue 3 + MySQL 系统。
 
 已确认的决策：
 

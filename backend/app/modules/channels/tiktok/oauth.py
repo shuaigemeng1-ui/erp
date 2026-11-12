@@ -9,6 +9,9 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import re
@@ -67,6 +70,53 @@ def authorization_session_key(tenant_id: int, nonce: str) -> str:
     return f"{OAUTH_SESSION_PREFIX}:{int(tenant_id)}:{nonce}"
 
 
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def build_signed_state(payload: Mapping[str, Any]) -> str:
+    """把店铺授权上下文签名进 state，回调不依赖 Redis 也能定位店铺。
+
+    与参考项目 TikTok Shop 授权 state 同思路：payload + HMAC-SHA256，
+    支付加载的 state 中包含 tenant_id / store_id / store_code / environment。
+    """
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encoded = _b64url_encode(body)
+    signature = hmac.new(
+        settings.secret_key_bytes, encoded.encode("ascii"), hashlib.sha256
+    ).digest()
+    return f"{encoded}.{_b64url_encode(signature)}"
+
+
+def parse_signed_state(state: str | None) -> dict[str, Any]:
+    token = (state or "").strip()
+    try:
+        encoded, signature = token.split(".", 1)
+    except ValueError as exc:
+        raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权 state 格式无效") from exc
+    expected = hmac.new(
+        settings.secret_key_bytes, encoded.encode("ascii"), hashlib.sha256
+    ).digest()
+    try:
+        provided = _b64url_decode(signature)
+    except Exception as exc:  # noqa: BLE001
+        raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权 state 签名无效") from exc
+    if not hmac.compare_digest(expected, provided):
+        raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权 state 签名无效")
+    try:
+        payload = json.loads(_b64url_decode(encoded).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权 state 内容无效") from exc
+    if not isinstance(payload, dict):
+        raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权 state 内容无效")
+    return payload
+
+
 def build_authorization_url(
     *, service_id: str, state: str, market: str = "ROW"
 ) -> str:
@@ -94,8 +144,7 @@ def create_authorization_session(
     ttl_seconds: int = OAUTH_SESSION_TTL_SECONDS,
 ) -> dict[str, Any]:
     env = normalize_environment(environment) or resolve_environment(settings.app_env)
-    state = build_state(tenant_id)
-    tenant_id_int, nonce = parse_state(state)
+    tenant_id_int = int(tenant_id)
     expires_at = utc_after(max(60, int(ttl_seconds)))
     payload = {
         "tenant_id": tenant_id_int,
@@ -108,21 +157,14 @@ def create_authorization_session(
         "market": (market or "ROW").strip().upper(),
         "created_at": utc_now().isoformat(),
         "expires_at": expires_at.isoformat(),
+        "nonce": secrets.token_urlsafe(18),
     }
+    state = build_signed_state(payload)
     auth_url = build_authorization_url(
         service_id=payload["service_id"],
         state=state,
         market=payload["market"],
     )
-    try:
-        cache_redis().setex(
-            authorization_session_key(tenant_id_int, nonce),
-            max(60, int(ttl_seconds)),
-            json.dumps(payload, ensure_ascii=False),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("保存 TikTok 授权会话失败")
-        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "缓存服务不可用") from exc
     return {
         "auth_url": auth_url,
         "expires_at": expires_at,
@@ -177,7 +219,7 @@ def validate_authorization_session(
     }
 
 
-def consume_authorization_session(state: str | None) -> dict[str, Any]:
+def _consume_legacy_session(state: str | None) -> dict[str, Any]:
     tenant_id, nonce = parse_state(state)
     key = authorization_session_key(tenant_id, nonce)
     try:
@@ -195,6 +237,19 @@ def consume_authorization_session(state: str | None) -> dict[str, Any]:
     except (TypeError, json.JSONDecodeError) as exc:
         raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权会话已损坏") from exc
     return validate_authorization_session(payload, expected_tenant_id=tenant_id)
+
+
+def consume_authorization_session(state: str | None) -> dict[str, Any]:
+    """解析回调 state：优先自包含签名 state，兼容旧 Redis 一次性会话。"""
+    token = (state or "").strip()
+    try:
+        payload = parse_signed_state(token)
+    except AppError as signed_error:
+        try:
+            return _consume_legacy_session(token)
+        except AppError:
+            raise signed_error from None
+    return validate_authorization_session(payload)
 
 
 # --------------------------------------------------------------------------- 发起授权

@@ -598,12 +598,32 @@ def tiktok_oauth_callback(
             raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "缺少授权码 code")
         environment = str(session["environment"])
         tenant_id = int(session["tenant_id"])
+        target_store_id = int(session["store_id"]) if session.get("store_id") else None
         with center_session() as center:
             config = service.require_channel_app(center, environment, channel=CHANNEL_TIKTOK)
             service.ensure_tenant_active(center, tenant_id)
             route = _load_tenant_route(center, tenant_id)
             app_key = config.app_key
             app_secret = config.app_secret
+        # 先确认 state 指向的店铺仍然有效，避免把 token 写到错误的店铺
+        if target_store_id is not None:
+            with tenant_session(route) as check_db:
+                target_store = service.get_store_or_raise(check_db, tenant_id, target_store_id)
+                if target_store.channel != CHANNEL_TIKTOK:
+                    raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权目标店铺不是 TikTok Shop")
+                if target_store.status not in {
+                    STORE_STATUS_PENDING_AUTHORIZATION,
+                    STORE_STATUS_REAUTH_REQUIRED,
+                    STORE_STATUS_CONNECTED,
+                }:
+                    raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权目标店铺状态不允许授权")
+                logger.info(
+                    "TikTok 授权回调定位店铺：tenant=%s store=%s store_code=%s status=%s",
+                    tenant_id,
+                    target_store.id,
+                    target_store.store_code,
+                    target_store.status,
+                )
         # 外部 HTTP 请求在数据库事务之外执行
         exchanged = tiktok_oauth.exchange_code(app_key, app_secret, code_value)
         with center_session() as center, tenant_session(route) as db:
@@ -618,7 +638,10 @@ def tiktok_oauth_callback(
         return RedirectResponse(
             tiktok_oauth.frontend_redirect_url(
                 str(result.get("redirect_path") or redirect_path),
-                params={"tiktok": "connected"},
+                params={
+                    "tiktok": "connected",
+                    "store_code": str(result.get("store_code") or ""),
+                },
             ),
             status_code=302,
         )

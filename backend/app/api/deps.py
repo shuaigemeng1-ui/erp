@@ -12,7 +12,7 @@ from typing import Annotated
 from fastapi import Depends, Path, Request
 from sqlalchemy.orm import Session
 
-from app.core.auth import AuthenticatedUser, TenantAccessInfo
+from app.core.auth import AuthenticatedUser, TenantAccessInfo, session_scope
 from app.core.context import (
     TenantContext,
     reset_tenant_context,
@@ -78,9 +78,15 @@ def optional_user(request: Request, center: CenterDb) -> AuthenticatedUser | Non
 OptionalUser = Annotated[AuthenticatedUser | None, Depends(optional_user)]
 
 
-def platform_admin(user: CurrentUser) -> AuthenticatedUser:
+def platform_admin(request: Request, user: CurrentUser) -> AuthenticatedUser:
     if not user.is_platform_admin:
         raise AppError(ErrorCode.PLATFORM_PERMISSION_REQUIRED)
+    scope = session_scope(getattr(request.state, "session_payload", None))
+    if scope is not None and scope != "platform":
+        raise AppError(
+            ErrorCode.SCOPE_DENIED,
+            "当前为租户会话，请使用平台管理登录入口",
+        )
     return user
 
 
@@ -103,6 +109,12 @@ async def tenant_context(
     说明：首版同步 SQLAlchemy Session 在事件循环中打开/关闭会短暂阻塞，
     后续可由 anyio.to_thread.run_sync 包装；数据访问本身仍在线程池执行。
     """
+    scope = session_scope(getattr(request.state, "session_payload", None))
+    if scope == "platform":
+        raise AppError(
+            ErrorCode.SCOPE_DENIED,
+            "当前为平台管理会话，请使用租户登录入口",
+        )
     with center_session() as center:
         access: TenantAccessInfo | None = load_tenant_access(center, tenant_id, user.user_id)
         if access is None:

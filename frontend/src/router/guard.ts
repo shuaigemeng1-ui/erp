@@ -5,10 +5,10 @@ import { resolveHomePath } from './home'
 
 /**
  * 路由守卫：
- * - 公开页（登录/激活）直接放行；已登录用户访问登录页回首页
- * - 其余页面先探测 /me，401 交给登录页
- * - 平台页要求平台管理员
- * - 租户页要求已选择租户、成员状态 active、bootstrap 权限覆盖 meta.permission
+ * - 公开页（租户登录 / 平台登录 / 邀请激活）直接放行；已登录访问登录页按当前登录端回首页
+ * - 平台管理页要求：平台管理员 + 平台管理登录会话（scope=platform）
+ * - 租户页要求：租户登录会话（scope=tenant）+ 已选租户 + 成员 active + 页面权限
+ * - 平台会话不能进入租户 ERP，租户会话不能进入平台控制台（前后端双重隔离）
  */
 export function setupRouterGuards(router: Router): void {
   router.beforeEach(async (to) => {
@@ -16,26 +16,45 @@ export function setupRouterGuards(router: Router): void {
     const tenant = useTenantStore()
 
     if (to.meta.public) {
-      if (to.name === 'login' && (await auth.loadMe())) {
-        return { path: resolveHomePath() }
+      if (to.name === 'login' || to.name === 'platform-login') {
+        const authenticated = await auth.loadMe()
+        if (authenticated) {
+          if (to.name === 'platform-login') {
+            // 已以平台身份登录时直接进控制台；租户身份访问则允许切换到平台登录
+            if (auth.isPlatformMode && auth.isPlatformAdmin) return { path: '/platform/tenants' }
+            return true
+          }
+          return auth.isPlatformMode
+            ? { path: '/platform/tenants' }
+            : { path: resolveHomePath() }
+        }
       }
       return true
     }
 
     const authenticated = await auth.loadMe()
     if (!authenticated) {
-      return {
-        name: 'login',
-        query: to.fullPath && to.fullPath !== '/' ? { redirect: to.fullPath } : undefined,
-      }
+      const target = to.meta.platform ? { name: 'platform-login' } : { name: 'login' }
+      const query = to.fullPath && to.fullPath !== '/' ? { redirect: to.fullPath } : undefined
+      return { ...target, query }
     }
 
     if (to.meta.platform) {
       if (!auth.isPlatformAdmin) return { name: 'forbidden' }
+      if (!auth.isPlatformMode) {
+        return { name: 'platform-login', query: { redirect: to.fullPath } }
+      }
+      return true
+    }
+
+    // 租户选择页：平台会话不允许进入
+    if (to.name === 'tenant-select') {
+      if (auth.isPlatformMode) return { path: '/platform/tenants' }
       return true
     }
 
     if (to.meta.tenant) {
+      if (auth.isPlatformMode) return { path: '/platform/tenants' }
       const ready = await tenant.ensureReady()
       if (!ready) return { name: 'tenant-select' }
       const membership = auth.tenants.find((item) => item.id === tenant.activeTenantId)

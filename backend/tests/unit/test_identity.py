@@ -1077,7 +1077,13 @@ def _route_client(
     # identity.service 内部打开租户库会话（接受邀请 / 签发负责人邀请）同样使用 SQLite
     monkeypatch.setattr(identity_service, "tenant_session", tenant_cm)
     monkeypatch.setattr(
-        main_module, "load_session_payload", lambda request: {"user_id": state["user_id"], "csrf": "x"}
+        main_module,
+        "load_session_payload",
+        lambda request: {
+            "user_id": state["user_id"],
+            "csrf": "x",
+            **({"scope": state["scope"]} if "scope" in state else {}),
+        },
     )
     monkeypatch.setattr(main_module, "touch_session", lambda session_id, payload: None)
     monkeypatch.setattr(main_module, "verify_csrf", lambda request, payload: None)
@@ -1140,7 +1146,9 @@ def test_login_route_rate_limited_after_five_failures(monkeypatch: pytest.Monkey
 
     fake_redis = _FakeRedis()
     monkeypatch.setattr(rate_limit, "cache_redis", lambda: fake_redis)
-    monkeypatch.setattr(identity_router, "create_session", lambda user_id: ("sid", {}, "csrf"))
+    monkeypatch.setattr(
+        identity_router, "create_session", lambda user_id, *, scope="tenant": ("sid", {}, "csrf")
+    )
     monkeypatch.setattr(identity_router, "delete_session", lambda session_id, user_id=None: None)
     client, center, tenant, _state = _route_client(monkeypatch)
     _seed_tenant(center, tenant)
@@ -1524,6 +1532,30 @@ def test_platform_owner_invitation_requires_platform_admin(monkeypatch: pytest.M
     assert response.json()["error"]["code"] == ErrorCode.PLATFORM_PERMISSION_REQUIRED.value
 
 
+def test_platform_route_denied_for_tenant_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    """租户登录会话不能访问平台管理接口（登录端隔离）。"""
+    client, center, tenant, state = _route_client(monkeypatch, user_id=20)
+    _seed_platform_admin(center)
+    state["scope"] = "tenant"
+
+    response = client.post(
+        "/api/v1/platform/tenants/1/owner-invitation", headers={"X-CSRF-Token": "x"}
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == ErrorCode.SCOPE_DENIED.value
+
+
+def test_tenant_route_denied_for_platform_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    """平台管理登录会话不能访问租户 ERP 接口（登录端隔离）。"""
+    client, center, tenant, state = _route_client(monkeypatch, user_id=20)
+    _seed_platform_admin(center)
+    state["scope"] = "platform"
+
+    response = client.get("/api/v1/tenants/1/bootstrap")
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == ErrorCode.SCOPE_DENIED.value
+
+
 def test_e2e_create_tenant_eager_invitation_accept_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
     """完整链路：创建租户（eager 开通）→ 签发负责人邀请 → 接受 → bootstrap 有权限。"""
     from types import SimpleNamespace
@@ -1541,7 +1573,9 @@ def test_e2e_create_tenant_eager_invitation_accept_bootstrap(monkeypatch: pytest
         monkeypatch, user_id=20, sessions=(center, tenant)
     )
     _seed_platform_admin(center, user_id=20)
-    monkeypatch.setattr(identity_router, "create_session", lambda user_id: ("sid", {}, "csrf"))
+    monkeypatch.setattr(
+        identity_router, "create_session", lambda user_id, *, scope="tenant": ("sid", {}, "csrf")
+    )
     monkeypatch.setattr(provisioning.settings, "celery_task_always_eager", True)
 
     def fake_provision(center_session, tenant_id, *, operator_user_id=None):  # noqa: ANN001

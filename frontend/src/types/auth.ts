@@ -1,6 +1,8 @@
 import type { EntityId } from './common'
 import type { TenantLifecycleStatus } from './tenant'
 
+export type SessionScope = 'tenant' | 'platform'
+
 export interface MeProfile {
   id: EntityId
   email: string
@@ -8,16 +10,19 @@ export interface MeProfile {
   status: string
   is_platform_admin: boolean
   locale: string
+  session_scope?: SessionScope
 }
 
 export interface LoginPayload {
   email: string
   password: string
+  scope?: SessionScope
 }
 
 export interface LoginResult {
   user: MeProfile
   tenants: import('./tenant').MeTenant[]
+  session_scope?: SessionScope
 }
 
 export interface CsrfResult {

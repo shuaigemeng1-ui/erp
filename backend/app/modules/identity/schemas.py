@@ -21,6 +21,10 @@ class LoginRequest(BaseModel):
 
     email: str = Field(min_length=3, max_length=255, description="登录邮箱")
     password: str = Field(min_length=1, max_length=256, description="登录密码")
+    scope: Literal["tenant", "platform"] = Field(
+        default="tenant",
+        description="登录端：tenant=租户 ERP，platform=平台管理控制台",
+    )
 
     @field_validator("email")
     @classmethod

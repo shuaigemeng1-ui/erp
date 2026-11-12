@@ -2,12 +2,16 @@ import { useAuthStore } from '@/stores/auth'
 import { useTenantStore } from '@/stores/tenant'
 
 /**
- * 首页按有效权限决定，避免打开无权限页面。
- * 平台管理员且无租户权限时进入平台管理。
+ * 首页按登录端与有效权限决定：
+ * - 平台管理会话：固定进平台控制台
+ * - 租户会话：按租户权限选第一个可访问页面；未选租户则去租户选择页
+ * 平台管理员用租户入口登录时，同样只走租户 ERP 首页。
  */
 export function resolveHomePath(): string {
   const auth = useAuthStore()
   const tenant = useTenantStore()
+
+  if (auth.isPlatformMode) return '/platform/tenants'
 
   if (tenant.isReady) {
     const candidates: Array<[string, string]> = [
@@ -25,6 +29,5 @@ export function resolveHomePath(): string {
       if (tenant.has(permission)) return path
     }
   }
-  if (auth.isPlatformAdmin) return '/platform/tenants'
   return '/tenant-select'
 }

@@ -33,9 +33,10 @@ async function submit(): Promise<void> {
 
   loading.value = true
   try {
-    await auth.login({ email: form.email.trim(), password: form.password })
+    await auth.login({ email: form.email.trim(), password: form.password }, 'tenant')
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
-    if (redirect) {
+    // 租户登录不能跳到平台管理页面；平台入口需要单独登录
+    if (redirect && !redirect.startsWith('/platform')) {
       await router.replace(redirect)
       return
     }
@@ -51,13 +52,18 @@ function goTenantSelect(): void {
   if (auth.isAuthenticated) void router.push('/tenant-select')
   else ElMessage.info('请先登录')
 }
+
+function goPlatformLogin(): void {
+  void router.push('/platform/login')
+}
 </script>
 
 <template>
   <div class="auth-page">
     <div class="auth-card">
-      <h1 class="auth-title">ERP 管理后台</h1>
-      <p class="auth-subtitle">多租户 SaaS 运营平台</p>
+      <div class="auth-badge">租户业务</div>
+      <h1 class="auth-title">ERP 登录</h1>
+      <p class="auth-subtitle">多租户 ERP 业务系统</p>
       <el-form ref="formRef" :model="form" :rules="rules" label-position="top" @submit.prevent="submit">
         <el-form-item label="邮箱" prop="email">
           <el-input
@@ -82,7 +88,21 @@ function goTenantSelect(): void {
       </el-form>
       <div class="auth-footer">
         <el-button text type="primary" @click="goTenantSelect">已登录，选择租户</el-button>
+        <el-button text @click="goPlatformLogin">平台管理员登录</el-button>
       </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.auth-badge {
+  display: inline-block;
+  padding: 2px 10px;
+  margin-bottom: 12px;
+  border-radius: 10px;
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+  font-size: 12px;
+  letter-spacing: 1px;
+}
+</style>

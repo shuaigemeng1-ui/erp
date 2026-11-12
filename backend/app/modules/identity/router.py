@@ -40,9 +40,11 @@ from app.api.deps import (
 )
 from app.core.auth import (
     clear_session_cookies,
+    session_scope,
     set_csrf_cookie,
     set_session_cookies,
 )
+from app.core.errors import AppError, ErrorCode
 from app.core.http import PageParams, paged, success
 from app.core.permissions import Permission
 from app.core.redis import (
@@ -87,18 +89,27 @@ def get_csrf_token(response: Response) -> dict:
 def login(payload: LoginRequest, request: Request, center: CenterDb) -> JSONResponse:
     """邮箱 + 密码登录，成功后下发 HttpOnly 会话 Cookie 与 CSRF Cookie。
 
+    ``scope`` 区分两个独立入口：租户登录（tenant）与平台管理登录（platform）。
+    平台管理端只允许平台管理员登录；会话内记录 scope，后续平台/租户接口分别校验。
+
     连续失败 5 次 / 15 分钟（同一邮箱 + IP）返回 ``429 AUTH_RATE_LIMITED``。
     """
     user = service.authenticate(center, payload.email, payload.password, ip=_client_ip(request))
+    is_platform_admin = service.is_platform_admin(center, int(user.id))
+    if payload.scope == "platform" and not is_platform_admin:
+        raise AppError(ErrorCode.PLATFORM_PERMISSION_REQUIRED, "该账号不是平台管理员")
     service.record_login(center, user)
     # 轮换会话：旧会话（若存在）立即失效
     old_session_id = getattr(request.state, "session_id", "")
     if old_session_id:
         delete_session(old_session_id)
-    session_id, _session_payload, csrf_token = create_session(int(user.id))
+    session_id, _session_payload, csrf_token = create_session(
+        int(user.id), scope=payload.scope
+    )
     data = {
-        "user": service.user_payload(user, is_platform_admin=service.is_platform_admin(center, int(user.id))),
+        "user": service.user_payload(user, is_platform_admin=is_platform_admin),
         "tenants": service.list_user_tenants(center, int(user.id)),
+        "session_scope": payload.scope,
     }
     response = JSONResponse(status_code=200, content=success(data))
     set_session_cookies(response, session_id, csrf_token)
@@ -122,11 +133,14 @@ def change_password(
 ) -> JSONResponse:
     """修改密码后撤销该用户全部会话，并为当前请求重新签发会话。"""
     service.change_password(center, user.user_id, payload.current_password, payload.new_password)
+    current_scope = session_scope(getattr(request.state, "session_payload", None)) or "tenant"
     old_session_id = getattr(request.state, "session_id", "")
     if old_session_id:
         delete_session(old_session_id, user.user_id)
     revoke_user_sessions(user.user_id)
-    session_id, _session_payload, csrf_token = create_session(user.user_id)
+    session_id, _session_payload, csrf_token = create_session(
+        user.user_id, scope=current_scope
+    )
     response = JSONResponse(status_code=200, content=success({"updated": True}))
     set_session_cookies(response, session_id, csrf_token)
     return response
@@ -149,12 +163,15 @@ def accept_invitation(payload: InvitationAcceptRequest, center: CenterDb) -> JSO
         password=payload.password,
         display_name=payload.display_name,
     )
-    session_id, _session_payload, csrf_token = create_session(int(user.id))
+    session_id, _session_payload, csrf_token = create_session(
+        int(user.id), scope="tenant"
+    )
     data = {
         "user": service.user_payload(
             user, is_platform_admin=service.is_platform_admin(center, int(user.id))
         ),
         "tenants": tenants,
+        "session_scope": "tenant",
     }
     response = JSONResponse(status_code=200, content=success(data))
     set_session_cookies(response, session_id, csrf_token)
@@ -163,7 +180,8 @@ def accept_invitation(payload: InvitationAcceptRequest, center: CenterDb) -> JSO
 
 # --------------------------------------------------------------------------- 本人
 @router.get("/me", summary="当前账号")
-def me(user: CurrentUser) -> dict:
+def me(request: Request, user: CurrentUser) -> dict:
+    scope = session_scope(getattr(request.state, "session_payload", None)) or "tenant"
     return success(
         {
             "id": str(user.user_id),
@@ -172,6 +190,7 @@ def me(user: CurrentUser) -> dict:
             "status": user.status,
             "is_platform_admin": user.is_platform_admin,
             "locale": user.locale,
+            "session_scope": scope,
         }
     )
 

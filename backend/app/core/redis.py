@@ -37,13 +37,20 @@ def _user_sessions_key(user_id: int) -> str:
     return f"{USER_SESSIONS_KEY_PREFIX}{user_id}"
 
 
-def create_session(user_id: int) -> tuple[str, dict[str, Any], str]:
-    """创建登录会话，返回 ``(session_id, payload, csrf_token)``。"""
+def create_session(
+    user_id: int, *, scope: str = "tenant"
+) -> tuple[str, dict[str, Any], str]:
+    """创建登录会话，返回 ``(session_id, payload, csrf_token)``。
+
+    ``scope`` 区分登录端：``tenant`` 只允许访问租户 ERP，``platform`` 只允许
+    访问平台管理控制台；会话内保存后由平台/租户依赖分别校验。
+    """
     session_id = new_session_id()
     csrf_token = new_csrf_token()
     now_ts = int(utc_now().timestamp())
     payload: dict[str, Any] = {
         "user_id": user_id,
+        "scope": scope,
         "csrf": csrf_token,
         "created_at": now_ts,
         "last_seen": now_ts,

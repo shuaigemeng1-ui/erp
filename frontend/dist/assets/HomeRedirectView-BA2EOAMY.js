@@ -1,1 +1,0 @@
-import{d as o,l as s,S as a,c as n,o as r,k as i,T as c,U as l}from"./index-DbfAgNuu.js";const _={"element-loading-text":"正在进入...",style:{height:"60vh"}},h=o({__name:"HomeRedirectView",setup(d){const e=i();return s(async()=>{await e.replace(l())}),(u,m)=>{const t=c("loading");return a((r(),n("div",_,null,512)),[[t,!0]])}}});export{h as default};

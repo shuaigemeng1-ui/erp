@@ -101,6 +101,18 @@ def load_session_payload(request: Request) -> dict | None:
     return read_session(session_id)
 
 
+def session_scope(payload: dict | None) -> str | None:
+    """读取会话登录端：``tenant`` / ``platform``。
+
+    兼容升级前创建的旧会话：旧会话没有 ``scope`` 字段，返回 ``None``，
+    由调用方按“同时允许”处理；用户重新登录后即带显式 scope。
+    """
+    if not payload:
+        return None
+    value = payload.get("scope")
+    return str(value) if value else None
+
+
 def set_session_cookies(response: Response, session_id: str, csrf_token: str) -> None:
     max_age = settings.session_ttl_seconds
     response.set_cookie(

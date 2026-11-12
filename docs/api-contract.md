@@ -15,13 +15,15 @@
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
 | GET | `/auth/csrf` | - | 签发匿名 CSRF 令牌，同时写 `vs_csrf` Cookie；`data.csrf_token` |
-| POST | `/auth/login` | - | `{email, password}`；成功后轮换会话 Cookie 与 CSRF，返回 `{user, tenants}` |
+| POST | `/auth/login` | - | `{email, password, scope?}`；`scope=tenant`（默认）为租户 ERP 登录，`scope=platform` 仅平台管理员可登录；成功后轮换会话 Cookie 与 CSRF，返回 `{user, tenants, session_scope}` |
 | POST | `/auth/logout` | 登录 | 撤销当前会话 |
 | POST | `/auth/password` | 登录 | `{current_password, new_password}`；成功后撤销该用户其它会话 |
 | GET | `/auth/invitations/{token}` | - | `{tenant_name, email, status, expires_at}`；令牌不存在/过期/已用返回对应错误码 |
 | POST | `/auth/invitations/accept` | - | `{token, password, display_name}`；返回 `{user, tenants}` |
-| GET | `/me` | 登录 | `{id, email, display_name, status, is_platform_admin, locale}` |
+| GET | `/me` | 登录 | `{id, email, display_name, status, is_platform_admin, locale, session_scope}` |
 | GET | `/me/tenants` | 登录 | `[{id, code, name, status, timezone, member_status, roles: [code]}]` |
+
+> 登录端隔离：租户登录会话只能访问 `/tenants/{tenant_id}/...` 业务接口；平台管理登录会话只能访问 `/platform/...` 接口。跨端访问返回 `403 SCOPE_DENIED`。
 
 ## 平台管理（中心库，平台管理员）
 

@@ -40,6 +40,7 @@ export type {
   LoginResult,
   MeProfile,
   PasswordPayload,
+  SessionScope,
   TenantStatus,
 } from './auth'
 export type { MeTenant } from './tenant'

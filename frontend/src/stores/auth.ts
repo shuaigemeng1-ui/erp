@@ -1,10 +1,11 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { authApi } from '@/api/auth'
-import type { LoginPayload, MeProfile, MeTenant } from '@/types'
+import type { LoginPayload, MeProfile, MeTenant, SessionScope } from '@/types'
 
 /**
  * 登录态：会话在 HttpOnly Cookie 中，前端只保存当前用户信息用于展示。
+ * ``mode`` 区分登录入口：租户 ERP（tenant）/ 平台管理控制台（platform）。
  * 不把用户/租户写入 localStorage。
  */
 export const useAuthStore = defineStore('auth', () => {
@@ -12,22 +13,30 @@ export const useAuthStore = defineStore('auth', () => {
   const tenants = ref<MeTenant[]>([])
   const loaded = ref(false)
   const loading = ref(false)
+  const mode = ref<SessionScope>('tenant')
   let inflight: Promise<boolean> | null = null
 
   const isAuthenticated = computed(() => user.value !== null)
   const isPlatformAdmin = computed(() => user.value?.is_platform_admin === true)
+  const isPlatformMode = computed(() => mode.value === 'platform')
   const displayName = computed(() => user.value?.display_name || user.value?.email || '未登录')
   const tenantCount = computed(() => tenants.value.length)
 
-  function applySession(nextUser: MeProfile, nextTenants: MeTenant[]): void {
+  function applySession(
+    nextUser: MeProfile,
+    nextTenants: MeTenant[],
+    nextMode?: SessionScope,
+  ): void {
     user.value = nextUser
     tenants.value = nextTenants
+    mode.value = nextMode ?? nextUser.session_scope ?? 'tenant'
     loaded.value = true
   }
 
   function clearSession(): void {
     user.value = null
     tenants.value = []
+    mode.value = 'tenant'
     loaded.value = false
     inflight = null
     loading.value = false
@@ -50,6 +59,7 @@ export const useAuthStore = defineStore('auth', () => {
       try {
         const me = await authApi.me()
         user.value = me
+        mode.value = me.session_scope ?? 'tenant'
         loaded.value = true
         await refreshTenants()
         return true
@@ -66,9 +76,9 @@ export const useAuthStore = defineStore('auth', () => {
     return inflight
   }
 
-  async function login(payload: LoginPayload): Promise<void> {
-    const result = await authApi.login(payload)
-    applySession(result.user, result.tenants)
+  async function login(payload: LoginPayload, scope: SessionScope = 'tenant'): Promise<void> {
+    const result = await authApi.login({ ...payload, scope })
+    applySession(result.user, result.tenants, result.session_scope ?? scope)
     await refreshTenants()
   }
 
@@ -78,7 +88,7 @@ export const useAuthStore = defineStore('auth', () => {
     display_name: string
   }): Promise<void> {
     const result = await authApi.acceptInvitation(payload)
-    applySession(result.user, result.tenants)
+    applySession(result.user, result.tenants, 'tenant')
     await refreshTenants()
   }
 
@@ -99,6 +109,8 @@ export const useAuthStore = defineStore('auth', () => {
     loading,
     isAuthenticated,
     isPlatformAdmin,
+    isPlatformMode,
+    mode,
     displayName,
     tenantCount,
     loadMe,

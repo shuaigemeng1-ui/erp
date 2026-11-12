@@ -13,6 +13,11 @@ export function useEnterSession() {
   const router = useRouter()
 
   async function enterApp(): Promise<void> {
+    // 平台管理登录：只进入平台控制台，不混入租户 ERP
+    if (auth.isPlatformMode) {
+      await router.replace('/platform/tenants')
+      return
+    }
     const activeTenants = auth.tenants.filter((item) => item.status === 'active')
     if (activeTenants.length === 1) {
       const success = await tenant.switchTenant(activeTenants[0].id)
@@ -20,10 +25,7 @@ export function useEnterSession() {
       await router.replace('/')
       return
     }
-    if (activeTenants.length === 0) {
-      await router.replace(auth.isPlatformAdmin ? '/platform/tenants' : '/tenant-select')
-      return
-    }
+    // 租户入口登录后始终走 ERP 流程；平台管理员也需从平台登录入口进入控制台
     await router.replace('/tenant-select')
   }
 

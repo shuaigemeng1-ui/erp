@@ -33,10 +33,6 @@ async function enter(tenantId: string): Promise<void> {
   }
 }
 
-async function goPlatform(): Promise<void> {
-  await router.push('/platform/tenants')
-}
-
 async function logout(): Promise<void> {
   await auth.logout()
   tenant.resetForLogout()
@@ -80,7 +76,6 @@ async function logout(): Promise<void> {
       <el-empty v-else description="当前账号还没有可访问的租户" />
 
       <div class="auth-footer">
-        <el-button v-if="auth.isPlatformAdmin" text type="primary" @click="goPlatform">平台管理</el-button>
         <el-button text @click="logout">退出登录</el-button>
       </div>
     </div>

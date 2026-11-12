@@ -14,7 +14,7 @@ const route = useRoute()
 const router = useRouter()
 
 const collapsed = ref(false)
-const isPlatformArea = computed(() => route.path.startsWith('/platform/'))
+const isPlatformArea = computed(() => route.meta.platform === true)
 const visibleTenantMenu = computed(() =>
   tenantMenuItems.filter((item) => (!item.permission || tenant.has(item.permission)) && (!item.permissions || tenant.hasAny(item.permissions))),
 )
@@ -46,10 +46,6 @@ async function handleSwitchTenant(command: string | number | object): Promise<vo
 
 async function handleUserCommand(command: string | number | object): Promise<void> {
   const action = String(command)
-  if (action === 'platform') {
-    await router.push('/platform/tenants')
-    return
-  }
   if (action === 'password') {
     passwordVisible.value = true
     return
@@ -60,9 +56,10 @@ async function handleUserCommand(command: string | number | object): Promise<voi
     } catch {
       return
     }
+    const wasPlatform = auth.isPlatformMode
     await auth.logout()
     tenant.resetForLogout()
-    await router.replace({ name: 'login' })
+    await router.replace({ name: wasPlatform ? 'platform-login' : 'login' })
   }
 }
 
@@ -129,12 +126,6 @@ async function submitPassword(): Promise<void> {
             <el-icon><component :is="item.icon" /></el-icon>
             <template #title>{{ item.title }}</template>
           </el-menu-item>
-          <el-menu-item-group v-if="visiblePlatformMenu.length > 0" title="平台管理">
-            <el-menu-item v-for="item in visiblePlatformMenu" :key="item.path" :index="item.path">
-              <el-icon><component :is="item.icon" /></el-icon>
-              <template #title>{{ item.title }}</template>
-            </el-menu-item>
-          </el-menu-item-group>
         </template>
         <template v-else>
           <el-menu-item v-for="item in visiblePlatformMenu" :key="item.path" :index="item.path">
@@ -185,7 +176,6 @@ async function submitPassword(): Promise<void> {
             <template #dropdown>
               <el-dropdown-menu>
                 <el-dropdown-item disabled>{{ auth.user?.email }}</el-dropdown-item>
-                <el-dropdown-item v-if="auth.isPlatformAdmin" command="platform">平台管理</el-dropdown-item>
                 <el-dropdown-item command="password">修改密码</el-dropdown-item>
                 <el-dropdown-item divided command="logout">退出登录</el-dropdown-item>
               </el-dropdown-menu>

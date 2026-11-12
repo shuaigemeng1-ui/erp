@@ -44,7 +44,6 @@ export const tenantMenuItems: MenuItem[] = [
 export const platformMenuItems: MenuItem[] = [
   { path: '/platform/tenants', title: '租户管理', icon: OfficeBuilding },
   { path: '/platform/plans', title: '套餐管理', icon: Coin },
-  { path: '/platform/channel-apps', title: '渠道应用', icon: SetUp },
-  { path: '/platform/system-settings', title: '系统配置', icon: SetUp },
+  { path: '/platform/system-config', title: '系统配置', icon: SetUp },
   { path: '/platform/audit-logs', title: '平台审计', icon: Document },
 ]

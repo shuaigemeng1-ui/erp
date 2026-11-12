@@ -131,15 +131,19 @@ export const routes: RouteRecordRaw[] = [
         meta: { platform: true, title: '套餐管理' },
       },
       {
+        path: 'platform/system-config',
+        name: 'platform-system-config',
+        component: () => import('@/views/platform/PlatformSystemConfigView.vue'),
+        meta: { platform: true, title: '系统配置' },
+      },
+      {
         path: 'platform/channel-apps',
-        name: 'platform-channel-apps',
-        component: () => import('@/views/platform/PlatformChannelAppsView.vue'),
-        meta: { platform: true, title: '渠道应用' },
+        redirect: { name: 'platform-system-config', query: { tab: 'channels' } },
+        meta: { platform: true, title: '系统配置' },
       },
       {
         path: 'platform/system-settings',
-        name: 'platform-system-settings',
-        component: () => import('@/views/platform/PlatformSystemSettingsView.vue'),
+        redirect: { name: 'platform-system-config', query: { tab: 'storage' } },
         meta: { platform: true, title: '系统配置' },
       },
       {

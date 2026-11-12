@@ -236,7 +236,7 @@ onMounted(load)
       </el-form-item>
       <el-form-item label="权限">
         <div style="width: 100%">
-          <div class="text-muted" style="font-size: 12px; margin-bottom: 6px">
+          <div v-if="permissionTotal > 0" class="text-muted" style="font-size: 12px; margin-bottom: 6px">
             已选 {{ form.permissions.length }} / {{ permissionTotal }} 项
           </div>
           <div style="max-height: 44vh; overflow: auto; width: 100%">

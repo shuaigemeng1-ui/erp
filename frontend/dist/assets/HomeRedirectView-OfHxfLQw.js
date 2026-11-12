@@ -1,0 +1,1 @@
+import{d as o,o as s,T as a,c as n,f as r,l as i,U as c,V as l}from"./index-DHz_tw5m.js";const _={"element-loading-text":"正在进入...",style:{height:"60vh"}},h=o({__name:"HomeRedirectView",setup(d){const e=i();return s(async()=>{await e.replace(l())}),(u,m)=>{const t=c("loading");return a((r(),n("div",_,null,512)),[[t,!0]])}}});export{h as default};

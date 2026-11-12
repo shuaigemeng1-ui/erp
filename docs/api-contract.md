@@ -67,7 +67,7 @@
 | POST | `/tenants/{tenant_id}/roles` | `role.manage` | `{code, name, permissions: [code], copy_from_role_id?}` |
 | PATCH | `/tenants/{tenant_id}/roles/{role_id}` | `role.manage` | 修改名称与权限 |
 | DELETE | `/tenants/{tenant_id}/roles/{role_id}` | `role.manage` | 仅非系统角色且无绑定；否则 409 |
-| GET | `/tenants/{tenant_id}/permissions` | `role.manage` | 权限编码目录（分组、中文名） |
+| GET | `/tenants/{tenant_id}/permissions` | `role.manage` | 权限编码目录：`{groups: [{code, name, permissions: [{code, name}]}], permissions: [code]}`（角色编辑器按 `groups` 分组渲染，分组内条目字段是 `permissions`） |
 
 ### 商品与库存
 

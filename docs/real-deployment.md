@@ -368,3 +368,28 @@ caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl re
 本次证据与备份目录：`/opt/backups/releases/erp-4bfe4f7/`。`database/` 为发布前备份，`post-publish/` 为发布后租户与图片备份；其他文件包含前后结构、业务指纹、接口结果、恢复脚本和权限600的环境配置备份。
 
 旧镜像保留为 `ventasync-backend:rollback-4bfe4f7`、`ventasync-frontend:rollback-4bfe4f7`。页面刷新后进入新版 SPU 商品中心。本次不涉及真实平台调价或库存写入；高并发与真店闭环仍按验收清单推进。
+
+## 14. 系统配置、云对象存储与商品设置发布（2026-11-12）
+
+业务提交`3658871`已推送至`origin/main`，并发布到ERP服务器`121.37.45.132`的`/opt/ventasync`，入口为`https://erp.alienyan.store/`。
+
+平台新增“系统配置”，可维护OSS、COS、OBS、AWS S3及S3兼容账号、测试桶连接、选择默认账号；新图片URL登记入库，旧本地图片继续兼容。租户新增“基础设置 → 商品设置”，集中维护供应商、品牌、分类、特性标签、包材；供应商联系人、联系方式、备注选填，停用保留历史关联。
+
+发布前已通过相关后端回归、38项完整契约和前端`npm run build`。服务器阿里云PyPI镜像未同步`boto3==1.44.1`，官方源下载速度较慢，因此本地从官方源下载Python 3.12/Linux x86_64 wheels，检查Linux依赖闭包并上传校验；使用临时Dockerfile与wheel构建上下文完成离线构建，项目requirements及运行时Dockerfile逻辑保持一致。依赖包和构建记录保存在本次发布目录。
+
+发布过程为构建镜像、保留回退镜像、停止API/Worker/scheduler、备份中心及全部租户库和图片卷、独立迁移、核对关键业务指纹和行数，再更新四个应用容器。MySQL和两个Redis容器及数据卷未重建，现有应用密钥和数据库凭据未更换。
+
+| 检查 | 结果 |
+| --- | --- |
+| 迁移 | 中心库`center_0006 → center_0007`；`vs_tenant_demo`和`vs_tenant_demo2`均为`tenant_0011 → tenant_0012 → tenant_0013`，标准迁移正常完成 |
+| 结构 | 中心17张业务表，租户各32张业务表；三个库外键0，表及字段中文注释完整 |
+| 数据保留 | 关键账号、租户、成员、SPU资料、SKU成本及规格、订单、库存、映射、供应商、字典、图片和旧文件字段指纹及相关行数与停写前一致 |
+| 公开访问 | 首页、两类登录页、`/settings/products`、`/platform/system-settings`、healthz、CSRF均200；首页与主资源及两个新页面JS/CSS的SHA-256与发布产物一致，CSP允许HTTPS图片 |
+| 鉴权接口 | 可用租户身份的商品列表、详情、日志、SKU搜索及选项GET均200；选项含can_manage_options和供应商新字段；租户会话访问平台系统配置403；平台管理员GET系统配置200，五类厂商选项完整 |
+| 进程与图片 | API readyz 200，Celery ping为1节点在线，应用容器正常；历史图片目录UID/GID 10001可读写，验证临时文件已删除 |
+| 备份 | 三个数据库sql.gz与旧图片卷tar.gz均通过SHA-256及gzip校验；环境配置备份权限600 |
+| 云账号边界 | 线上存储账号数量0、默认账号未配置；未请求真实云服务，需配置账号后实际上传并验证返回URL |
+
+本次证据目录为`/opt/backups/releases/erp-3658871/`，包含`database/`、迁移前后结构及业务指纹、构建和迁移日志、鉴权及公开访问检查、部署脚本和回退脚本。鉴权检查仅创建临时Redis会话并在finally中清理，没有修改商品或供应商业务数据。
+
+回退镜像为`ventasync-backend:rollback-3658871`和`ventasync-frontend:rollback-3658871`。回退脚本只切换应用镜像；数据库恢复应独立评估，不能因镜像可回退而直接执行降级或恢复旧备份。真实云上传、真实店铺调价及库存写入未纳入本次生产验证。

@@ -73,6 +73,21 @@ def list_tenants(
 
 
 # --------------------------------------------------------------------------- 成员关系
+def allocate_member_no(center: Session, tenant_id: int) -> int:
+    """锁定租户高水位，在调用方事务内分配编号，不提交事务。"""
+    tenant = center.execute(
+        select(Tenant).where(Tenant.id == tenant_id).with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if tenant is None:
+        from app.core.errors import AppError, ErrorCode
+        raise AppError(ErrorCode.TENANT_NOT_FOUND)
+    number = int(tenant.next_member_no)
+    tenant.next_member_no = number + 1
+    center.flush()
+    return number
+
+
 def get_membership(center: Session, tenant_id: int, user_id: int) -> TenantMembership | None:
     return center.execute(
         select(TenantMembership).where(

@@ -20,6 +20,7 @@ export interface TenantInfo {
 }
 
 export interface MeTenant extends TenantInfo {
+  member_no: EntityId
   member_status: MemberStatus
   roles: string[]
 }
@@ -44,6 +45,7 @@ export interface RoleBindingInput {
 /** GET /tenants/{tenant_id}/bootstrap */
 export interface BootstrapMember {
   id: EntityId
+  member_no: EntityId
   roles: string[]
   bindings: RoleBinding[]
 }
@@ -59,6 +61,7 @@ export interface BootstrapData {
 
 export interface Member {
   id: EntityId
+  member_no: EntityId
   email: string
   display_name: string
   status: MemberStatus

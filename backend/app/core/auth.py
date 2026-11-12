@@ -46,6 +46,7 @@ class TenantAccessInfo:
     member_id: int
     member_status: str
     role_summary: tuple[str, ...] = ()
+    member_no: int | None = None
 
 
 def allowed_origins() -> set[str]:

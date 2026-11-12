@@ -13,8 +13,8 @@
 | 表 | 归属模块 | 关键字段 |
 | --- | --- | --- |
 | `users` | identity | email(唯一), password_hash, display_name, status(active/disabled), locale, last_login_at |
-| `tenants` | identity | code(唯一), name, status(provisioning/active/suspended/provision_failed), timezone, plan_id, owner_user_id, suspended_at |
-| `tenant_memberships` | identity | tenant_id, user_id, status(active/invited/disabled), is_owner, joined_at；唯一(tenant_id,user_id) |
+| `tenants` | identity | code(唯一), name, status(provisioning/active/suspended/provision_failed), timezone, plan_id, owner_user_id, suspended_at, next_member_no(下一租户内成员编号，初始1) |
+| `tenant_memberships` | identity | tenant_id, user_id, member_no(租户内成员编号，从1递增), status(active/invited/disabled), is_owner, joined_at；唯一(tenant_id,user_id)及(tenant_id,member_no)，id保留全局内部关联 |
 | `tenant_invitations` | identity | tenant_id, email, token_hash, role_ids(JSON), status(pending/accepted/revoked/expired), expires_at, invited_by, accepted_at |
 | `tenant_databases` | identity | tenant_id(唯一), host, port, database_name, username, password_cipher, credentials_version, schema_version, status |
 | `provisioning_jobs` | identity | tenant_id, step, status(pending/running/succeeded/failed), attempts, error_message, started_at, finished_at |
@@ -105,6 +105,7 @@
 | 中心库 | `alembic/center/versions/0006_center_authorization_links.py` | center_0006 | 中心库：可撤销授权邀请和跨库写入恢复记录，禁止外键。 |
 | 中心库 | `alembic/center/versions/0007_center_system_storage.py` | center_0007 | 平台系统配置与多个云对象存储账号，凭据密文保存，固定默认配置行，无外键。 |
 | 中心库 | `alembic/center/versions/0008_center_email_profiles.py` | center_0008 | 平台邮件服务账号：阿里云 DirectMail / 腾讯云 SES，密钥密文保存，默认账号唯一。 |
+| 中心库 | `alembic/center/versions/0009_center_tenant_member_numbers.py` | center_0009 | 按租户历史创建顺序回填member_no并初始化计数器，租户内从1递增，原内部ID与业务关联保留，无外键。 |
 | 租户库 | `alembic/tenant/versions/0001_tenant_identity.py` | tenant_0001 | 租户库基线：角色、权限、绑定范围、租户设置、功能开关、审计与支撑表（tenant_0001）。 |
 | 租户库 | `alembic/tenant/versions/0002_tenant_catalog.py` | tenant_0002 | 租户库：商品、SKU、图片、库存地点、库存余额、库存流水。 |
 | 租户库 | `alembic/tenant/versions/0003_tenant_channels.py` | tenant_0003 | 租户库迁移：店铺、店铺凭据、平台商品与 SKU 映射。 |
@@ -119,7 +120,7 @@
 | 租户库 | `alembic/tenant/versions/0012_tenant_cloud_file_urls.py` | tenant_0012 | files记录云厂商、配置ID和长期URL；商品及SKU图片URL扩至2048，旧文件保留local，无外键。 |
 | 租户库 | `alembic/tenant/versions/0013_tenant_supplier_contacts.py` | tenant_0013 | 供应商增加选填联系人、联系方式和备注，保留原供应商及商品关联，无外键。 |
 
-模型业务表：中心库 18 张、租户库 32 张（均不计 Alembic 版本表），完整版本图共 21 个迁移文件。当前末端为中心库 `center_0008`、租户库 `tenant_0013`。
+模型业务表：中心库 18 张、租户库 32 张（均不计 Alembic 版本表），完整版本图共 22 个迁移文件。当前末端为中心库 `center_0009`、租户库 `tenant_0013`。
 
 `tenant_0008` 仅补授系统 owner/admin 的 `task.schedule.manage`，不扩张普通角色。`tenant_0010` 修复旧 MODIFY 丢失的 store_code 中文注释，适用于现有数据库的增量升级。
 

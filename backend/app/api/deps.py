@@ -139,6 +139,7 @@ async def tenant_context(
             tenant_status=access.tenant_status,
             timezone=access.timezone,
             member_id=access.member_id,
+            member_no=access.member_no,
             member_status=access.member_status,
             user_id=user.user_id,
             db_route=route,

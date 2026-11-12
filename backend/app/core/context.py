@@ -108,6 +108,7 @@ class TenantContext:
     feature_flags: frozenset[str] = frozenset()
     created_at: datetime | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    member_no: int | None = None
 
     def __post_init__(self) -> None:
         if self.tenant_id <= 0 or self.member_id <= 0 or self.user_id <= 0:

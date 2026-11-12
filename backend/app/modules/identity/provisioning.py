@@ -349,6 +349,7 @@ def _ensure_owner_membership(center: Session, tenant_id: int, user_id: int) -> T
     membership = TenantMembership(
         tenant_id=tenant_id,
         user_id=user_id,
+        member_no=repo.allocate_member_no(center, tenant_id),
         status=MembershipStatus.INVITED.value,
         is_owner=True,
     )

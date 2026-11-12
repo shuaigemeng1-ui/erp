@@ -220,7 +220,7 @@ onMounted(loadReferences)
 
     <el-table v-loading="loading" :data="rows" border size="small" row-key="id">
       <el-table-column label="成员 ID" width="110">
-        <template #default="{ row }"><IdCopy :id="row.id" /></template>
+        <template #default="{ row }"><IdCopy :id="row.member_no" /></template>
       </el-table-column>
       <el-table-column prop="display_name" label="姓名" width="140" />
       <el-table-column prop="email" label="邮箱" min-width="200" show-overflow-tooltip />

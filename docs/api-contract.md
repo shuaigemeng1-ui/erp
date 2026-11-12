@@ -21,7 +21,7 @@
 | GET | `/auth/invitations/{token}` | - | `{tenant_name, email, status, expires_at, requires_login}`；令牌不存在/过期/已用返回对应错误码 |
 | POST | `/auth/invitations/accept` | - | `{token, password?, display_name?}`；新账号设置密码，已有账号必须先以匹配身份登录；不能通过邀请恢复全局停用账号；成功返回 `{user, tenants, session_scope}` |
 | GET | `/me` | 登录 | `{id, email, display_name, status, is_platform_admin, locale, session_scope}` |
-| GET | `/me/tenants` | 登录 | `[{id, code, name, status, timezone, member_status, roles: [code]}]` |
+| GET | `/me/tenants` | 登录 | `[{id, code, name, status, timezone, member_no, member_status, roles: [code]}]`，member_no为租户内成员编号 |
 
 > 登录端隔离：租户登录会话只能访问 `/tenants/{tenant_id}/...` 业务接口；平台管理登录会话只能访问 `/platform/...` 接口。跨端访问返回 `403 SCOPE_DENIED`。
 
@@ -73,9 +73,11 @@ StorageProfile响应为上述非敏感字段，加 `id/version/has_access_key/ha
 
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
-| GET | `/tenants/{tenant_id}/bootstrap` | 成员 | `{tenant, member: {id, roles, bindings}, permissions: [code], feature_flags: {code: bool}, permission_version, server_time}` |
+| GET | `/tenants/{tenant_id}/bootstrap` | 成员 | `{tenant, member: {id, member_no, roles, bindings}, permissions: [code], feature_flags: {code: bool}, permission_version, server_time}` |
 
 ### 成员、角色、数据范围
+
+成员响应的`member_no`为租户内持久编号：每租户首位成员为1，创建后依次递增，停用、重邀、激活或负责人转移均不重排。成员页展示并复制该编号；`id`及路由参数`member_id`仍为稳定的内部成员ID，角色、商品人员及任务继续使用原内部关联。邀请占用编号，未激活也不会重复分配。历史记录按每租户`created_at,id`排序回填，高水位确保已分配编号不复用。
 
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |

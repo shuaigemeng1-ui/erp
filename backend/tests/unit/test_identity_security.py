@@ -93,6 +93,7 @@ def test_existing_invitee_logged_in_can_join_without_password_reset(identity_dat
     assert verify_password('Original-Password-881!', user.password_hash)
     membership = repository.get_membership(center, 1, 33)
     assert membership.status == 'active'
+    assert membership.member_no == 3
     with pytest.raises(AppError) as repeated:
         service.accept_invitation(center, token=token, authenticated_user_id=33)
     assert repeated.value.code is ErrorCode.AUTH_TOKEN_USED
@@ -136,6 +137,7 @@ def test_tenant_binding_failure_leaves_invitation_retryable(identity_data, monke
     assert user.password_hash is None
     assert service.preview_invitation(center, token)['status'] == 'pending'
     assert repository.get_membership(center, 1, 33).status == 'invited'
+    assert repository.get_membership(center, 1, 33).member_no == 3
     monkeypatch.setattr(service, '_write_bindings', original)
     service.accept_invitation(center, token=token, password='New-Password-771!')
     assert repository.get_membership(center, 1, 33).status == 'active'

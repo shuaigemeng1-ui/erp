@@ -31,7 +31,7 @@ def api(monkeypatch,tmp_path):
     _sqlite_metadata(CenterBase.metadata,("users","tenant_memberships","storage_profiles","platform_system_settings","platform_audit_logs")).create_all(engines[1])
     db,center=[Session(e,expire_on_commit=False) for e in engines]
     center.add_all([User(id=9,email="one@example.test",display_name="张三"),User(id=10,email="two@example.test",display_name="李四")])
-    center.add_all([TenantMembership(id=11,tenant_id=1,user_id=9,status="active"),TenantMembership(id=22,tenant_id=2,user_id=10,status="active")])
+    center.add_all([TenantMembership(id=11,tenant_id=1,user_id=9,member_no=1,status="active"),TenantMembership(id=22,tenant_id=2,user_id=10,member_no=1,status="active")])
     center.commit()
     actor=SimpleNamespace(effective=EffectivePermissions(grants=(ScopeGrant(role_binding_id=1,role_id=1,scope_type="all",permissions=ALL_PERMISSIONS),)))
     app=FastAPI()

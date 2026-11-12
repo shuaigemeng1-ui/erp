@@ -163,6 +163,7 @@ def load_tenant_access(center: Session, tenant_id: int, user_id: int) -> TenantA
         member_id=int(membership.id),
         member_status=membership.status,
         role_summary=(),
+        member_no=int(membership.member_no),
     )
 
 
@@ -252,6 +253,7 @@ def list_user_tenants(center: Session, user_id: int) -> list[dict[str, Any]]:
                 "status": tenant.status,
                 "timezone": tenant.timezone,
                 "member_status": membership.status,
+                "member_no": str(membership.member_no),
                 "is_owner": bool(membership.is_owner),
                 "roles": role_codes,
             }
@@ -401,6 +403,7 @@ def _accept_invitation_locked(
             membership = TenantMembership(
                 tenant_id=int(tenant.id),
                 user_id=int(user.id),
+                member_no=repo.allocate_member_no(center, int(tenant.id)),
                 status=MembershipStatus.INVITED.value,
                 is_owner=False,
                 joined_at=utc_now(),
@@ -484,6 +487,7 @@ def create_member_invitation(
             membership = TenantMembership(
                 tenant_id=tenant_id,
                 user_id=int(user.id),
+                member_no=repo.allocate_member_no(center, tenant_id),
                 status=MembershipStatus.INVITED.value,
                 is_owner=False,
             )
@@ -684,6 +688,7 @@ def issue_owner_invitation(
         center.flush()
         payload = invitation_payload(invitation, token=token)
     payload["membership_id"] = str(membership.id)
+    payload["member_no"] = str(membership.member_no)
     return payload
 
 
@@ -972,6 +977,7 @@ def list_members(
         items.append(
             {
                 "id": str(membership.id),
+                "member_no": str(membership.member_no),
                 "user_id": str(user.id),
                 "email": user.email,
                 "display_name": user.display_name,
@@ -1510,6 +1516,7 @@ def bootstrap_payload(
         },
         "member": {
             "id": str(context.member_id),
+            "member_no": str(context.member_no) if context.member_no is not None else None,
             "roles": member["roles"],
             "bindings": member["bindings"],
         },

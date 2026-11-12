@@ -123,6 +123,13 @@ class Tenant(IdMixin, TimestampMixin, CenterBase):
         nullable=True,
         comment="负责人用户ID（关联 users.id，逻辑关联不建外键）",
     )
+    next_member_no: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=1,
+        server_default="1",
+        comment="下一个租户内成员编号（从1开始，已分配编号不重复使用）",
+    )
     suspended_at: Mapped[datetime | None] = mapped_column(
         DateTime,
         nullable=True,
@@ -141,6 +148,7 @@ class TenantMembership(IdMixin, TimestampMixin, CenterBase):
     __tablename__ = "tenant_memberships"
     __table_args__ = (
         UniqueConstraint("tenant_id", "user_id", name="uq_tenant_memberships_tenant_id_user_id"),
+        UniqueConstraint("tenant_id", "member_no", name="uq_tenant_memberships_tenant_member_no"),
         Index("ix_tenant_memberships_user_id", "user_id"),
         table_options("租户成员关系表"),
     )
@@ -154,6 +162,11 @@ class TenantMembership(IdMixin, TimestampMixin, CenterBase):
         BigInteger,
         nullable=False,
         comment="用户ID（关联 users.id，不建外键）",
+    )
+    member_no: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        comment="租户内成员编号（每个租户从1递增，内部关联仍使用全局主键ID）",
     )
     status: Mapped[str] = mapped_column(
         String(32),

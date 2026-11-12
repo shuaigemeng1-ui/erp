@@ -811,12 +811,14 @@ def _seed_tenant(center, db, *, tenant_id: int = 1, owner_user_id: int = 10, tar
             status="active",
             timezone="Asia/Shanghai",
             owner_user_id=owner_user_id,
+            next_member_no=3,
         )
     )
     center.add(
         TenantMembership(
             id=100,
             tenant_id=tenant_id,
+            member_no=1,
             user_id=owner_user_id,
             status="active",
             is_owner=True,
@@ -826,6 +828,7 @@ def _seed_tenant(center, db, *, tenant_id: int = 1, owner_user_id: int = 10, tar
         TenantMembership(
             id=101,
             tenant_id=tenant_id,
+            member_no=2,
             user_id=target_user_id,
             status="active",
             is_owner=False,
@@ -898,6 +901,7 @@ def test_transfer_owner_moves_bindings_and_flags(monkeypatch: pytest.MonkeyPatch
     new_owner = identity_repo.get_membership_by_id(center, 1, 101)
     assert old_owner is not None and old_owner.is_owner is False
     assert new_owner is not None and new_owner.is_owner is True
+    assert (old_owner.member_no, new_owner.member_no) == (1, 2)
     tenant = identity_repo.get_tenant(center, 1)
     assert tenant is not None and tenant.owner_user_id == 11
 
@@ -984,7 +988,7 @@ def test_last_owner_cannot_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
     center.add(
         TenantMembership(
-            id=102, tenant_id=1, user_id=12, status="active", is_owner=True
+            id=102, tenant_id=1, user_id=12, member_no=3, status="active", is_owner=True
         )
     )
     center.commit()
@@ -1340,6 +1344,7 @@ def test_issue_owner_invitation_rotates_token(monkeypatch: pytest.MonkeyPatch) -
     _patch_service_tenant_session(monkeypatch, tenant)
 
     first = service.issue_owner_invitation(center, 1, actor_user_id=20)
+    assert first["member_no"] == "1"
     assert first["email"] == "owner@example.com"
     assert first["status"] == "pending"
     assert first["invitation_url"] == f"/activate/{first['token']}"
@@ -1352,6 +1357,7 @@ def test_issue_owner_invitation_rotates_token(monkeypatch: pytest.MonkeyPatch) -
     assert len(stored.token_hash) == 64
 
     second = service.issue_owner_invitation(center, 1, actor_user_id=20)
+    assert second["member_no"] == "1"
     assert second["token"] != first["token"]
     with pytest.raises(AppError) as old_token:
         service.preview_invitation(center, first["token"])
@@ -1668,12 +1674,14 @@ def test_e2e_create_tenant_eager_invitation_accept_bootstrap(monkeypatch: pytest
     center.expire_all()
     owner_membership = identity_repo.get_membership(center, tenant_id, owner_user_id)
     assert owner_membership is not None and owner_membership.status == "active"
+    assert owner_membership.member_no == 1
 
     # 4) 负责人 bootstrap：成员状态正常且有权限
     state["user_id"] = owner_user_id
     bootstrap = client.get(f"/api/v1/tenants/{tenant_id}/bootstrap")
     assert bootstrap.status_code == 200, bootstrap.text
     bootstrap_data = bootstrap.json()["data"]
+    assert bootstrap_data["member"]["member_no"] == "1"
     assert "owner" in bootstrap_data["member"]["roles"]
     assert "role.manage" in bootstrap_data["permissions"]
     assert bootstrap_data["permission_version"] >= 1

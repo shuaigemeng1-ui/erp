@@ -64,10 +64,10 @@ class OptionUpdate(BaseModel):
 
 
 def member_options(center,tenant_id):
-    rows=center.execute(select(TenantMembership.id,User.display_name,TenantMembership.status,User.status)
+    rows=center.execute(select(TenantMembership.id,TenantMembership.member_no,User.display_name,TenantMembership.status,User.status)
         .join(User,User.id==TenantMembership.user_id).where(TenantMembership.tenant_id==tenant_id).order_by(User.display_name,TenantMembership.id)).all()
-    return [{"id":str(id_),"name":name or str(id_),"status":"active" if status=="active" and user_status=="active" else "disabled"}
-        for id_,name,status,user_status in rows]
+    return [{"id":str(id_),"member_no":str(member_no),"name":name or str(member_no),"status":"active" if status=="active" and user_status=="active" else "disabled"}
+        for id_,member_no,name,status,user_status in rows]
 
 
 def validate_members(center,tenant_id,payload):

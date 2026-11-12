@@ -417,3 +417,22 @@ caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl re
 OBS访问方式及兼容性依据：[华为OBS访问规则](https://support.huaweicloud.com/usermanual-obs/obs_41_0003.html)、[Boto3使用说明](https://support.huaweicloud.com/obs_faq/obs_faq_0274.html)。
 
 桶ACL的匿名READ属于桶级权限，不能据此认定对象内容可读；对象外链可使用限定图片目录的GetObject桶策略或单独对象public-read ACL，不能直接扩大为整个桶公开。参考[官方ACL权限定义](https://support.huaweicloud.com/perms-cfg-obs/obs_40_0005.html)与[指定对象只读策略](https://support.huaweicloud.com/perms-cfg-obs/obs_40_0004.html)。
+
+## 16. 租户内成员编号发布（2026-11-12）
+
+业务提交`7cbe4b8`已推送至origin/main并发布到`/opt/ventasync`，保留此前邮件配置及登录页等已发布功能。新增`TenantMembership.member_no`及唯一约束`(tenant_id,member_no)`，租户`next_member_no`记录下一编号。三个成员创建入口统一锁租户行后在同事务分配，初始1、后续独立递增；停用、重邀、开通重试、激活及负责人转移均不改号。
+
+中心库迁移`center_0008 → center_0009`按每租户`created_at,id`回填编号，高水位设为最大编号加1；三个租户库继续为`tenant_0013`。全局账号和内部成员主键不变，角色/范围、商品采购等人员、审计与任务关联仍使用原内部ID。成员页显示并复制本租户编号，响应在内部id旁新增member_no，避免破坏已有接口参数。
+
+发布前通过79项身份/权限/商品相关回归、38项完整契约、npm run build及diff检查。镜像使用符合当前requirements的Linux wheels离线构建，前端使用受管理dist；停写后备份中心库、全部三个租户库及图片卷，再执行迁移并比较业务指纹。MySQL/Redis及数据卷未重建，应用密钥未更换。
+
+| 检查 | 结果 |
+| --- | --- |
+| 成员编号 | 三租户分别为`[1,2]`、`[1]`、`[1]`，首号均1，高水位分别为3、2、2 |
+| 数据保留 | 中心与三个租户库的关键业务指纹及行数一致，特别包括原成员id/user_id、成员角色、数据范围和商品人员引用 |
+| 数据库规范 | 中心18张业务表、租户各32张，四个库外键0、中文表及字段注释完整 |
+| 实际接口 | 可用租户身份成员列表、bootstrap、/me/tenants和商品选项GET均200；该租户首位成员member_no为1，内部成员ID保持4；临时会话已清理 |
+| 前端与服务 | 首页、登录入口、设置页及健康接口200，成员页及主资源SHA-256与发布产物一致；应用容器正常，readyz 200 |
+| 备份 | 中心、三个租户的sql.gz及图片卷tar.gz校验通过，发布环境配置备份权限600 |
+
+证据目录为`/opt/backups/releases/erp-7cbe4b8/`，包含备份、迁移前后结构及业务指纹、编号核对、接口与公开资源结果、构建及迁移日志。旧镜像保留为`ventasync-backend:rollback-7cbe4b8`和`ventasync-frontend:rollback-7cbe4b8`。成员编号列为NOT NULL，回退需在停写状态下同步评估数据库结构与数据恢复，不能只切旧镜像后恢复旧版成员创建逻辑。

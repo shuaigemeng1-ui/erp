@@ -29,7 +29,7 @@ Thumbs.db
 # 运行期产物
 deploy/.env
 deploy/volumes/
-storage/
+/storage/
 backend/var/
 build/
 *.tmp.txt

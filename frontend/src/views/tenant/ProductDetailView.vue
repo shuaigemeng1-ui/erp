@@ -134,7 +134,7 @@ watch(productId, () => { product.value = undefined; activeTab.value = 'basic'; l
         <el-tabs v-model="activeTab">
           <el-tab-pane label="基本信息" name="basic">
             <div class="summary-row"><span v-if="canCost">指导成本：{{ summaryText(product.cost_summary?.guidance) }}</span><span v-if="canCost">平均成本：{{ summaryText(product.cost_summary?.average) }}</span><span v-if="canCost">当前成本：{{ summaryText(product.cost_summary?.current) }} {{ product.cost_currency ?? 'CNY' }}</span><span>重量：{{ summaryText(product.weight_summary, true) }}</span></div>
-            <SpuBasicFields :model="form" :options="options" :disabled="!canUpdate" @refresh-options="loadOptions" />
+            <SpuBasicFields :model="form" :options="options" :disabled="!canUpdate" />
             <div v-if="canUpdate" class="save-row"><el-button @click="form = spuForm(product)">还原输入</el-button><el-button type="primary" :loading="saving" @click="saveBasic">保存基本信息</el-button></div>
           </el-tab-pane>
           <el-tab-pane label="销售信息" name="skus">

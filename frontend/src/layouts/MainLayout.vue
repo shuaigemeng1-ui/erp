@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { ArrowDown, Expand, Fold, OfficeBuilding, UserFilled } from '@element-plus/icons-vue'
 import { authApi } from '@/api/auth'
-import { platformMenuItems, tenantMenuItems } from '@/router/menu'
+import { platformMenuItems, tenantMenuItems, type MenuItem } from '@/router/menu'
 import { useAuthStore } from '@/stores/auth'
 import { useTenantStore } from '@/stores/tenant'
 
@@ -15,11 +15,17 @@ const router = useRouter()
 
 const collapsed = ref(false)
 const isPlatformArea = computed(() => route.meta.platform === true)
-const visibleTenantMenu = computed(() =>
-  tenantMenuItems.filter((item) => (!item.permission || tenant.has(item.permission)) && (!item.permissions || tenant.hasAny(item.permissions))),
-)
+function filterTenantMenu(items: MenuItem[]): MenuItem[] {
+  return items.flatMap((item) => {
+    if ((item.permission && !tenant.has(item.permission)) || (item.permissions && !tenant.hasAny(item.permissions))) return []
+    if (!item.children) return [item]
+    const children = filterTenantMenu(item.children)
+    return children.length ? [{ ...item, children }] : []
+  })
+}
+const visibleTenantMenu = computed(() => filterTenantMenu(tenantMenuItems))
 const visiblePlatformMenu = computed(() => (auth.isPlatformAdmin ? platformMenuItems : []))
-const activeMenu = computed(() => route.path)
+const activeMenu = computed(() => route.name === 'product-detail' ? '/products' : route.path)
 const pageTitle = computed(() => route.meta.title ?? '')
 
 /** 租户切换/重新加载权限后通过 key 强制重建页面：清空旧数据与勾选。 */
@@ -122,10 +128,18 @@ async function submitPassword(): Promise<void> {
         class="app-menu"
       >
         <template v-if="!isPlatformArea">
-          <el-menu-item v-for="item in visibleTenantMenu" :key="item.path" :index="item.path">
-            <el-icon><component :is="item.icon" /></el-icon>
-            <template #title>{{ item.title }}</template>
-          </el-menu-item>
+          <template v-for="item in visibleTenantMenu" :key="item.path">
+            <el-sub-menu v-if="item.children?.length" :index="item.path">
+              <template #title><el-icon><component :is="item.icon" /></el-icon><span>{{ item.title }}</span></template>
+              <el-menu-item v-for="child in item.children" :key="child.path" :index="child.path">
+                <el-icon><component :is="child.icon" /></el-icon><template #title>{{ child.title }}</template>
+              </el-menu-item>
+            </el-sub-menu>
+            <el-menu-item v-else :index="item.path">
+              <el-icon><component :is="item.icon" /></el-icon>
+              <template #title>{{ item.title }}</template>
+            </el-menu-item>
+          </template>
         </template>
         <template v-else>
           <el-menu-item v-for="item in visiblePlatformMenu" :key="item.path" :index="item.path">

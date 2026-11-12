@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Path, Query, Request, UploadFile, File
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 
 from app.api.deps import (
     TenantCtx,
@@ -120,6 +120,7 @@ def product_options(ctx: TenantCtx, db: TenantDb, center: CenterDb, snapshot: Re
     catalog_service._require_master_scope(snapshot.effective,"catalog.product.read")
     data=resources.get_options(db,center,ctx.tenant_id)
     data["can_read_cost"]=catalog_service.can_read_cost(snapshot.effective)
+    data["can_manage_options"]="all" in snapshot.effective.granted_scope_types(Permission.CATALOG_PRODUCT_UPDATE)
     return success(data)
 
 
@@ -135,20 +136,38 @@ def create_supplier(body: resources.SupplierIn, ctx: TenantCtx, db: TenantDb, sn
     return success(resources.create_resource(db,ctx.tenant_id,body,ctx.user_id))
 
 
+@router.patch("/options/{option_id}", summary="编辑品牌分类标签包材")
+def update_option(body: resources.OptionUpdate, ctx: TenantCtx, db: TenantDb, snapshot: UpdateAccess, option_id: int=Path(gt=0)):
+    catalog_service._require_master_scope(snapshot.effective,"catalog.product.update")
+    return success(resources.update_resource(db,ctx.tenant_id,option_id,body,ctx.user_id))
+
+
+@router.patch("/suppliers/{supplier_id}", summary="编辑供应商简档")
+def update_supplier(body: resources.SupplierUpdate, ctx: TenantCtx, db: TenantDb, snapshot: UpdateAccess, supplier_id: int=Path(gt=0)):
+    catalog_service._require_master_scope(snapshot.effective,"catalog.product.update")
+    return success(resources.update_resource(db,ctx.tenant_id,supplier_id,body,ctx.user_id))
+
+
 @router.post("/media", summary="上传商品图片")
-async def upload_media(ctx: TenantCtx, db: TenantDb, snapshot: AccessSnapshotDep, file: UploadFile=File(...)):
+def upload_media(ctx: TenantCtx, db: TenantDb, center: CenterDb, snapshot: AccessSnapshotDep, file: UploadFile=File(...)):
     from app.core.errors import PermissionDeniedError, AppError, ErrorCode
     if not any("all" in snapshot.effective.granted_scope_types(p) for p in ("catalog.product.create","catalog.product.update")):
         raise PermissionDeniedError("上传商品图片需要商品创建或编辑权限")
-    data=await file.read(10*1024*1024+1)
+    data=file.file.read(10*1024*1024+1)
     if len(data)>10*1024*1024:
         raise AppError(ErrorCode.VALIDATION_ERROR,"图片不能超过10MB")
-    return success(resources.save_image(db,ctx.tenant_id,ctx.user_id,file.filename,data))
+    return success(resources.save_image(db,ctx.tenant_id,ctx.user_id,file.filename,data,center=center))
 
 
 @router.get("/media/{file_id}", summary="读取商品图片")
 def read_media(ctx: TenantCtx, db: TenantDb, snapshot: ReadAccess, file_id: int=Path(gt=0)):
     catalog_service._require_master_scope(snapshot.effective,"catalog.product.read")
+    row=resources.get_media_record(db,ctx.tenant_id,file_id)
+    if row.storage_provider!="local":
+        if not row.url or not row.url.startswith("https://"):
+            from app.core.errors import AppError,ErrorCode
+            raise AppError(ErrorCode.CONFLICT,"云文件缺少有效访问地址")
+        return RedirectResponse(row.url,status_code=307,headers={"Cache-Control":"private, no-store"})
     path,mime=resources.image_file(db,ctx.tenant_id,file_id)
     return FileResponse(path,media_type=mime,headers={"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff"})
 

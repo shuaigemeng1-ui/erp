@@ -22,6 +22,7 @@ from app.modules.channels import models_tenant as _channels_tenant  # noqa: F401
 from app.modules.sales import models_tenant as _sales_tenant  # noqa: F401,E402
 from app.modules.tasks import models_tenant as _tasks_tenant  # noqa: F401,E402
 from app.modules.audit import models_tenant as _audit_tenant  # noqa: F401,E402
+from app.modules.storage import models_center as _storage_center  # noqa: F401,E402
 
 center_metadata: MetaData = CenterBase.metadata
 tenant_metadata: MetaData = TenantBase.metadata

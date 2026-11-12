@@ -18,7 +18,7 @@ from app.modules.catalog import repository as catalog_repo
 from app.modules.catalog import history
 from app.modules.catalog.aggregates import aggregate_product
 from app.modules.catalog.identifiers import list_aliases, sync_identifiers
-from app.modules.catalog.models_tenant import Product, ProductImage, ProductSku, Supplier
+from app.modules.catalog.models_tenant import CatalogOption, Product, ProductImage, ProductSku, Supplier
 from app.modules.catalog.schemas import (
     ProductCreate, ProductDetail, ProductDetailPublic, ProductImageOut, ProductListItem,
     ProductListItemPublic, ProductSkuOut, ProductSkuPublicOut, ProductSkuUpdate, ProductUpdate,
@@ -112,6 +112,30 @@ def _supplier_allowed(db, tenant_id, supplier_id):
         raise AppError(ErrorCode.VALIDATION_ERROR, "首选供应商不存在、已停用或不属于当前租户")
 
 
+def _validate_option_changes(db, tenant_id, payload, previous=None):
+    """停用资料不可新选；历史商品保留原选择，也兼容旧版自由文本。"""
+    for field_name, kind, label in (
+        ("brand", "brand", "品牌"), ("category", "category", "分类"),
+        ("packaging_name", "packaging", "包材"), ("feature_tags", "tag", "特性标签"),
+    ):
+        if field_name not in payload.model_fields_set:
+            continue
+        value = getattr(payload, field_name)
+        old_value = getattr(previous, field_name, None)
+        if field_name == "feature_tags":
+            added = set(value or []) - set(old_value or [])
+        else:
+            added = {value} if value and value != old_value else set()
+        if not added:
+            continue
+        disabled = db.execute(select(CatalogOption.id).where(
+            CatalogOption.tenant_id == tenant_id, CatalogOption.kind == kind,
+            CatalogOption.name.in_(added), CatalogOption.status != "active",
+        ).limit(1)).first()
+        if disabled:
+            raise AppError(ErrorCode.VALIDATION_ERROR, f"所选{label}已停用，请在商品设置中启用或选择其他资料")
+
+
 def _ensure_cost_write_allowed(payload, *, include_cost: bool):
     if include_cost:
         return
@@ -139,6 +163,7 @@ def create_product(db: Session, *, tenant_id: int, effective: EffectivePermissio
     try:
         ensure_tenant_capacity(db, tenant_id, {"max_products": 1, "max_skus": len(payload.skus)})
         _supplier_allowed(db, tenant_id, payload.preferred_supplier_id)
+        _validate_option_changes(db, tenant_id, payload)
         if catalog_repo.get_product_by_code(db, tenant_id, payload.code) is not None:
             raise ConflictError("SPU编号已存在")
         values = {key: getattr(payload, key) for key in PRODUCT_FIELDS
@@ -195,8 +220,11 @@ def update_product(db: Session, *, tenant_id: int, product_id: int, effective: E
             raise ConflictError("SPU已被其他人修改，请刷新后再保存")
         before = history.snapshot(db, tenant_id, product, include_cost=include_cost)
         fields_set = payload.model_fields_set
-        if "preferred_supplier_id" in fields_set:
+        if "preferred_supplier_id" in fields_set and (
+            int(payload.preferred_supplier_id) if payload.preferred_supplier_id else None
+        ) != product.preferred_supplier_id:
             _supplier_allowed(db, tenant_id, payload.preferred_supplier_id)
+        _validate_option_changes(db, tenant_id, payload, product)
         for key in PRODUCT_FIELDS:
             if key not in fields_set:
                 continue

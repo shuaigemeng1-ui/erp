@@ -321,7 +321,7 @@ def test_product_create_rejects_invalid_image_url() -> None:
             name="商品",
             base_price=Decimal("10"),
             skus=[ProductSkuCreate(sku_code="S-1", name="规格1", price=Decimal("10"))],
-            images=["x" * 501],
+            images=["x" * 2049],
         )
 
 

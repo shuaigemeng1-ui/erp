@@ -32,11 +32,13 @@ from app.modules.sales.router import router as sales_router
 from app.modules.tasks.router import router as tasks_router
 
 from app.modules.channels.authorization import router as authorization_router
+from app.modules.storage.router import router as storage_router
 
 api_router = APIRouter()
 api_router.include_router(identity_router)
 api_router.include_router(identity_tenant_router)
 api_router.include_router(platform_router)
+api_router.include_router(storage_router)
 api_router.include_router(catalog_router)
 api_router.include_router(inventory_router)
 api_router.include_router(channels_router)

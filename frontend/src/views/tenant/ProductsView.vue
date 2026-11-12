@@ -116,7 +116,7 @@ onMounted(loadOptions)
     <PaginationBar :total="total" :page="page" :page-size="pageSize" @page-change="handlePageChange" @size-change="handleSizeChange" />
   </el-card>
   <el-dialog v-model="createVisible" title="新建 SPU" width="min(1120px, 96vw)" :close-on-click-modal="false" destroy-on-close>
-    <div class="create-body"><SpuBasicFields :model="form" :options="options" @refresh-options="loadOptions" />
+    <div class="create-body"><SpuBasicFields :model="form" :options="options" />
       <div class="sku-heading"><strong>销售信息</strong><el-button type="primary" plain @click="editSku()">新增 SKU</el-button></div>
       <el-table :data="skus" border><el-table-column prop="sku_code" label="SKU" /><el-table-column label="别名"><template #default="{ row }">{{ row.aliases?.join('、') || '—' }}</template></el-table-column><el-table-column label="规格"><template #default="{ row }">{{ Object.entries(row.specs || {}).map(([k, v]) => `${k}：${v}`).join(' / ') || '—' }}</template></el-table-column><el-table-column label="状态"><template #default="{ row }">{{ statusLabel(row.sales_status) }}</template></el-table-column><el-table-column label="操作" width="130"><template #default="{ $index }"><el-button text @click="editSku($index)">编辑</el-button><el-button text type="danger" @click="skus.splice($index, 1)">移除</el-button></template></el-table-column></el-table>
     </div><template #footer><el-button @click="createVisible = false">取消</el-button><el-button type="primary" :loading="creating" @click="create">创建</el-button></template>

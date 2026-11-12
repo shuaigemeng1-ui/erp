@@ -9,7 +9,7 @@ import type {
   ProductUpdatePayload,
   QueryParams,
 } from '@/types'
-import type { CatalogOptions, CatalogOption, SupplierOption, ProductLog, ProductSkuPayload } from '@/types/catalog'
+import type { CatalogOptions, CatalogOption, SupplierOption, SupplierPayload, CatalogOptionKind, ProductLog, ProductSkuPayload } from '@/types/catalog'
 
 export interface ProductQuery extends PageParams {
   q?: string
@@ -33,11 +33,17 @@ export const catalogApi = {
   options(tenantId: EntityId): Promise<CatalogOptions> {
     return http.get<CatalogOptions>(tenantPath(tenantId, '/products/options'))
   },
-  createOption(tenantId: EntityId, payload: { kind: string; name: string; parent_id?: string }): Promise<CatalogOption> {
+  createOption(tenantId: EntityId, payload: { kind: CatalogOptionKind; name: string; parent_id?: string }): Promise<CatalogOption> {
     return http.post<CatalogOption>(tenantPath(tenantId, '/products/options'), payload)
   },
-  createSupplier(tenantId: EntityId, payload: { code: string; name: string }): Promise<SupplierOption> {
+  updateOption(tenantId: EntityId, optionId: EntityId, payload: { name?: string; parent_id?: string | null; status?: 'active' | 'disabled' }): Promise<CatalogOption> {
+    return http.patch<CatalogOption>(tenantPath(tenantId, `/products/options/${segment(optionId)}`), payload)
+  },
+  createSupplier(tenantId: EntityId, payload: SupplierPayload): Promise<SupplierOption> {
     return http.post<SupplierOption>(tenantPath(tenantId, '/products/suppliers'), payload)
+  },
+  updateSupplier(tenantId: EntityId, supplierId: EntityId, payload: Partial<SupplierPayload>): Promise<SupplierOption> {
+    return http.patch<SupplierOption>(tenantPath(tenantId, `/products/suppliers/${segment(supplierId)}`), payload)
   },
   uploadImage(tenantId: EntityId, file: File): Promise<{ url: string }> {
     const body = new FormData()

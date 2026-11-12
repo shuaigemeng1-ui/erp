@@ -42,6 +42,19 @@
 | GET | `/platform/channel-apps/{channel}/{environment}` | 返回 `{partner_id, has_partner_key, has_partner_secret, redirect_url, status}`（密钥不回显） |
 | PUT | `/platform/channel-apps/{channel}/{environment}` | `{partner_id, partner_key?, partner_secret?, redirect_url}` 加密保存 |
 | GET | `/platform/audit-logs?page` | 平台管理审计 |
+| GET | `/platform/system-settings` | 返回{default_storage_profile_id,version,profiles,providers:[{code,name}]}；profiles不含明文或密文凭据 |
+| POST | `/platform/storage-profiles` | 新增存储账号；提交非敏感配置及access_key_id/secret_access_key，返回StorageProfile |
+| PUT | `/platform/storage-profiles/{profile_id}` | 提交完整非敏感配置与version；同厂商空凭据保留旧值，换厂商须重填两项 |
+| PUT | `/platform/system-settings/default-storage` | {profile_id,version}；选择已启用且凭据完整的账号，返回完整system-settings结构 |
+| POST | `/platform/storage-profiles/{profile_id}/test` | 对已保存账号执行HeadBucket检查，成功返回{ok:true,message}；不上传测试图片、不修改桶读权限 |
+
+### 平台系统配置与对象存储
+
+所有系统配置接口都要求平台管理员及平台管理会话，租户会话不能调用。账号字段为 `name/provider/endpoint/bucket/region/public_base_url/key_prefix/addressing_style/enabled`；provider为 `oss/cos/obs/s3/s3_compatible`，addressing_style为 `auto/virtual/path`。Endpoint使用根HTTPS服务地址，不包含桶名、对象路径、查询参数或凭据；public_base_url允许CDN路径，但不能包含查询参数或临时签名。
+
+StorageProfile响应为上述非敏感字段，加 `id/version/has_access_key/has_secret_key`。访问密钥ID及Secret都不回显；保存只接收写入值，审计不记录凭据。版本冲突返回409，默认账号不能直接停用。切换默认不改写已有文件URL。
+
+平台管理员需要在云厂商配置图片公开读取或CDN长期访问地址。连接测试只检查桶访问能力，不等于已验证外部匿名读取。未设置默认账号返回422；云端上传或测试失败返回明确错误，不能返回成功URL，也不回落本地保存。实际云账号与权限仍需真实验收。
 
 ## 租户内
 
@@ -78,11 +91,13 @@
 | GET | `/tenants/{tenant_id}/products/{product_id}` | `catalog.product.read` + 全部范围 | SPU资料、SKU销售信息、别名、图片、成本/重量/状态汇总 |
 | PATCH | `/tenants/{tenant_id}/products/{product_id}` | `catalog.product.update` + 全部范围 | 局部更新；支持version与嵌套SKU更新；三类SKU成本需catalog.cost.read；SPU cost_amount直接修改返回422 |
 | POST | `/tenants/{tenant_id}/products/{product_id}/archive` | `catalog.product.update` | 归档（不物理删除） |
-| GET | `/tenants/{tenant_id}/products/options` | `catalog.product.read` + 全部范围 | 返回本租户供应商、人员、品牌/分类/标签/包材选项；人员ID为租户成员ID |
+| GET | `/tenants/{tenant_id}/products/options` | `catalog.product.read` + 全部范围 | 返回本租户供应商、人员、品牌/分类/标签/包材选项及can_manage_options；人员ID为租户成员ID |
 | POST | `/tenants/{tenant_id}/products/options` | `catalog.product.update` + 全部范围 | `{kind, name, parent_id?}`；kind为brand/category/tag/packaging；父级仅分类可用 |
-| POST | `/tenants/{tenant_id}/products/suppliers` | `catalog.product.update` + 全部范围 | `{code,name}`，创建供应商简档 |
-| POST | `/tenants/{tenant_id}/products/media` | `catalog.product.create`或`catalog.product.update` + 全部范围 | multipart file上传商品图片，PNG/JPEG/WebP，最大10MB；返回{id,url} |
-| GET | `/tenants/{tenant_id}/products/media/{file_id}` | `catalog.product.read` + 全部范围 | 鉴权读取本租户图片；私有、不缓存 |
+| PATCH | `/tenants/{tenant_id}/products/options/{option_id}` | `catalog.product.update` + 全部范围 | 更新name/parent_id/status；已被商品引用的资料不可改名，分类禁止循环父级 |
+| POST | `/tenants/{tenant_id}/products/suppliers` | `catalog.product.update` + 全部范围 | 必填code/name；contact_name/contact_details/remark选填 |
+| PATCH | `/tenants/{tenant_id}/products/suppliers/{supplier_id}` | `catalog.product.update` + 全部范围 | 更新code/name/contact_name/contact_details/remark/status，停用保留历史关联 |
+| POST | `/tenants/{tenant_id}/products/media` | `catalog.product.create`或`catalog.product.update` + 全部范围 | multipart file上传商品图片至平台默认对象存储，PNG/JPEG/WebP，最大10MB；成功保存厂商、对象键和长期URL，返回{id,url} |
+| GET | `/tenants/{tenant_id}/products/media/{file_id}` | `catalog.product.read` + 全部范围 | 鉴权读取本租户历史本地图片，私有、不缓存；云文件307重定向至记录中已保存的长期URL |
 | POST | `/tenants/{tenant_id}/products/{product_id}/skus` | `catalog.product.update` + 全部范围 | 创建SKU并受套餐额度限制；{sku_code,aliases?,specs?,cost_amount?,guidance_cost?,average_cost?,weight_g?,sales_status?,image_url?} |
 | PATCH | `/tenants/{tenant_id}/products/{product_id}/skus/{sku_id}` | `catalog.product.update` + 全部范围 | 修改SKU/规格/状态/成本和完整有效别名集合；可带SKU version，成本另需catalog.cost.read |
 | GET | `/tenants/{tenant_id}/products/{product_id}/logs` | `catalog.product.read` + 全部范围 | 分页返回{id,summary,actor_name,created_at,changes:[{entity,sku_id,field,label,old,new}]}，成本差异按权限过滤 |
@@ -95,8 +110,10 @@
 ### SPU—SKU 商品中心字段与规则
 
 - SPU基本信息：`code/name/name_en`、`preferred_supplier_id`、`purchaser_id/developer_id/inquiry_buyer_id`、`hs_code/material_zh/material_en/usage`、`brand/category/feature_tags/packaging_name`、商品和包装后的`length_cm/width_cm/height_cm`、`sales_type/remark/features`、图片与系统时间。包装后尺寸分别为`package_length_cm/package_width_cm/package_height_cm`。
-- `sales_type`固定为`normal/variation/bundle/assembly`；捆绑/组装本轮为分类标记。人员必须是当前租户有效成员，供应商必须属于本租户且有效。
+- `sales_type`固定为`normal/variation/bundle/assembly`；捆绑/组装本轮为分类标记。人员必须是当前租户有效成员，新选供应商必须属于本租户且有效；原供应商停用后可保留原选择并修改商品其他字段。
+- 租户页面`/settings/products`集中维护供应商、品牌、分类、特性标签和包材，操作需要全租户商品编辑权限。供应商字段`contact_name/contact_details/remark`分别为联系人(100字符)、联系方式(255字符)、备注(2000字符)，均可省略或清空。资料使用`active/disabled`状态，停用不删除历史数据；已停用字典值不可新选，历史商品原值可保留。品牌/分类/标签/包材名称被商品引用时改名返回409，避免静默变更商品及其操作记录。
 - SKU的`specs`为字符串键值JSON，`aliases`写入为字符串数组；响应别名为`[{id,identifier,is_active}]`，含停用历史。别名与所有SKU主编号共用租户内唯一空间。编号变更会将旧编号保留为别名，别名停用不删除历史映射。
+- 图片`images[]`与SKU `image_url`支持最多2048字符的长期URL，新图片须先上传登记并校验租户归属；图片切换默认厂商后仍使用原保存URL。
 - SKU支持`image_url/cost_amount/guidance_cost/average_cost/weight_g/sales_status/version`。销售状态为`on_sale/discontinued/trial/clearance`；旧`status=active/archived`只表示归档生命周期。
 - SPU的`sales_status`按未归档SKU汇总：一致则原状态；混合依次优先`partial_clearance`、`partial_discontinued`，在售+试卖为`on_sale`。正常SPU至少一个未归档SKU。
 - `weight_summary`及`cost_summary.{current,guidance,average}`返回`{state,value,has_missing}`；state为`uniform/multiple/missing/partial_missing`。只有uniform有统一value，部分缺失不能当作所有SKU相同。金额/重量JSON值为字符串。

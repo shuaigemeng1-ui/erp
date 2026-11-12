@@ -145,3 +145,48 @@ def test_spu_image_replacement_preserves_sku_images(data):
         payload=ProductUpdate(images=["/second.png"]), audit=audit)
     images = list(db.execute(select(ProductImage).order_by(ProductImage.id)).scalars())
     assert sorted(i.url for i in images) == ["/second.png", "/sku.png"]
+
+
+def test_disabled_supplier_can_be_preserved_but_not_newly_selected(data):
+    from app.modules.catalog.models_tenant import Supplier
+    db, actor, audit = data
+    supplier = Supplier(tenant_id=1, code="OLD", name="历史供应商", status="active")
+    db.add(supplier)
+    db.commit()
+    product = create(data, preferred_supplier_id=supplier.id)
+    supplier.status = "disabled"
+    db.commit()
+    updated = service.update_product(db, tenant_id=1, product_id=int(product.id), effective=actor,
+        payload=ProductUpdate(preferred_supplier_id=supplier.id, remark="修改其他资料"), audit=audit)
+    assert updated.preferred_supplier_id == str(supplier.id)
+    assert updated.remark == "修改其他资料"
+    with pytest.raises(AppError, match="供应商"):
+        create(data, "P2", preferred_supplier_id=supplier.id)
+    other = create(data, "P3")
+    with pytest.raises(AppError, match="供应商"):
+        service.update_product(db, tenant_id=1, product_id=int(other.id), effective=actor,
+            payload=ProductUpdate(preferred_supplier_id=supplier.id), audit=audit)
+
+
+def test_disabled_dictionary_selections_preserve_history_and_reject_new_usage(data):
+    from app.modules.catalog.models_tenant import CatalogOption
+    db, actor, audit = data
+    values = dict(brand="旧品牌", category="旧分类", packaging_name="旧包材", feature_tags=["新品"])
+    product = create(data, **values)
+    for field_name, kind in (("brand", "brand"), ("category", "category"),
+                              ("packaging_name", "packaging"), ("feature_tags", "tag")):
+        name = values[field_name][0] if kind == "tag" else values[field_name]
+        db.add(CatalogOption(tenant_id=1, kind=kind, name=name, status="disabled"))
+    db.commit()
+    updated = service.update_product(db, tenant_id=1, product_id=int(product.id), effective=actor,
+        payload=ProductUpdate(**values, remark="历史值仍可保存"), audit=audit)
+    assert updated.remark == "历史值仍可保存"
+    for index, (field_name, value) in enumerate(values.items()):
+        with pytest.raises(AppError, match="已停用"):
+            create(data, f"NEW-{index}", **{field_name: value})
+    # 增加其他标签不能因保留历史停用标签而失败；另一租户同名停用项不影响本租户。
+    db.add(CatalogOption(tenant_id=2, kind="tag", name="新增标签", status="disabled"))
+    db.commit()
+    updated = service.update_product(db, tenant_id=1, product_id=int(product.id), effective=actor,
+        payload=ProductUpdate(feature_tags=["新品", "新增标签"]), audit=audit)
+    assert updated.feature_tags == ["新品", "新增标签"]

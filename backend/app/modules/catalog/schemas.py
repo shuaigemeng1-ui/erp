@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 STATUS_PATTERN = "^(active|archived)$"
 SALES_STATUS_PATTERN = "^(on_sale|discontinued|trial|clearance)$"
-MAX_IMAGE_URL_LENGTH = 500
+MAX_IMAGE_URL_LENGTH = 2048
 
 
 def _validate_image_urls(urls: list[str]) -> list[str]:
@@ -17,7 +17,7 @@ def _validate_image_urls(urls: list[str]) -> list[str]:
     for url in urls:
         value = (url or "").strip()
         if not value or len(value) > MAX_IMAGE_URL_LENGTH:
-            raise ValueError("图片地址不能为空且长度不能超过 500")
+            raise ValueError("图片地址不能为空且长度不能超过 2048")
         result.append(value)
     return result
 
@@ -67,7 +67,7 @@ class ProductBusinessFields(CatalogModel):
 
 
 class SkuBusinessFields(CatalogModel):
-    image_url: str | None = Field(default=None, max_length=500)
+    image_url: str | None = Field(default=None, max_length=2048)
     guidance_cost: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)
     average_cost: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)
     weight_g: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)

@@ -1,5 +1,6 @@
 import { http, requestPage } from './http'
 import { segment } from './paths'
+import type { PlatformSystemSettings, StorageConnectionResult, StorageProfile, StorageProfilePayload } from '@/types/storage'
 import type {
   AcceptedTask,
   ChannelApp,
@@ -36,6 +37,26 @@ function toList<T>(raw: T[] | { items?: T[] } | null): T[] {
 }
 
 export const platformApi = {
+  systemSettings(): Promise<PlatformSystemSettings> {
+    return http.get<PlatformSystemSettings>('/platform/system-settings')
+  },
+
+  createStorageProfile(payload: StorageProfilePayload): Promise<StorageProfile> {
+    return http.post<StorageProfile>('/platform/storage-profiles', payload)
+  },
+
+  updateStorageProfile(id: EntityId, payload: StorageProfilePayload): Promise<StorageProfile> {
+    return http.put<StorageProfile>(`/platform/storage-profiles/${segment(id)}`, payload)
+  },
+
+  setDefaultStorage(profileId: EntityId, version: number): Promise<PlatformSystemSettings> {
+    return http.put<PlatformSystemSettings>('/platform/system-settings/default-storage', { profile_id: profileId, version })
+  },
+
+  testStorageProfile(id: EntityId): Promise<StorageConnectionResult> {
+    return http.post<StorageConnectionResult>(`/platform/storage-profiles/${segment(id)}/test`)
+  },
+
   tenants(query: PlatformTenantQuery = {}): Promise<PagedData<PlatformTenant>> {
     return requestPage<PlatformTenant>('/platform/tenants', query as QueryParams)
   },

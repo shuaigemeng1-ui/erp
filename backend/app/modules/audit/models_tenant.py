@@ -127,6 +127,9 @@ class FileRecord(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
         default="active",
         comment="文件状态：active=可用，deleted=已删除",
     )
+    storage_profile_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="上传时使用的平台存储配置ID（无外键）")
+    storage_provider: Mapped[str] = mapped_column(String(32), nullable=False, default="local", server_default="local", comment="文件存储厂商（历史文件为本地）")
+    url: Mapped[str | None] = mapped_column(String(2048), nullable=True, comment="上传成功后保存的长期访问URL")
 
 
 class IdempotencyRecord(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):

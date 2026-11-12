@@ -20,6 +20,7 @@ export interface MenuItem {
   icon: Component
   permission?: string
   permissions?: string[]
+  children?: MenuItem[]
 }
 
 /** 租户内菜单：按 bootstrap 返回的有效权限过滤。 */
@@ -30,6 +31,10 @@ export const tenantMenuItems: MenuItem[] = [
   { path: '/listings', title: '平台商品映射', icon: Link, permission: 'channel.listing.read' },
   { path: '/orders', title: '订单', icon: Tickets, permission: 'order.read' },
   { path: '/sync-runs', title: '任务记录', icon: Timer, permission: 'task.read' },
+  {
+    path: '/settings', title: '基础设置', icon: SetUp,
+    children: [{ path: '/settings/products', title: '商品设置', icon: Goods, permission: 'catalog.product.read' }],
+  },
   { path: '/members', title: '成员', icon: User, permission: 'member.read' },
   { path: '/roles', title: '角色权限', icon: Key, permission: 'role.manage' },
   { path: '/audit-logs', title: '审计日志', icon: Document, permission: 'audit.read' },
@@ -40,5 +45,6 @@ export const platformMenuItems: MenuItem[] = [
   { path: '/platform/tenants', title: '租户管理', icon: OfficeBuilding },
   { path: '/platform/plans', title: '套餐管理', icon: Coin },
   { path: '/platform/channel-apps', title: '渠道应用', icon: SetUp },
+  { path: '/platform/system-settings', title: '系统配置', icon: SetUp },
   { path: '/platform/audit-logs', title: '平台审计', icon: Document },
 ]

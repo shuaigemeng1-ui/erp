@@ -59,6 +59,12 @@ export const routes: RouteRecordRaw[] = [
         meta: { tenant: true, permission: 'catalog.product.read', title: 'SPU 详情' },
       },
       {
+        path: 'settings/products',
+        name: 'product-settings',
+        component: () => import('@/views/tenant/ProductSettingsView.vue'),
+        meta: { tenant: true, permission: 'catalog.product.read', title: '商品设置' },
+      },
+      {
         path: 'inventory',
         name: 'inventory',
         component: () => import('@/views/tenant/InventoryView.vue'),
@@ -129,6 +135,12 @@ export const routes: RouteRecordRaw[] = [
         name: 'platform-channel-apps',
         component: () => import('@/views/platform/PlatformChannelAppsView.vue'),
         meta: { platform: true, title: '渠道应用' },
+      },
+      {
+        path: 'platform/system-settings',
+        name: 'platform-system-settings',
+        component: () => import('@/views/platform/PlatformSystemSettingsView.vue'),
+        meta: { platform: true, title: '系统配置' },
       },
       {
         path: 'platform/audit-logs',

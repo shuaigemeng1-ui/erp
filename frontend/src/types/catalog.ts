@@ -124,7 +124,9 @@ export interface ProductUpdatePayload {
 }
 export interface ProductCreatePayload extends ProductUpdatePayload { code: string; name: string; skus: ProductSkuPayload[] }
 export interface CatalogOption { id: EntityId; name: string; parent_id?: EntityId | null; status?: string }
-export interface SupplierOption extends CatalogOption { code: string }
-export interface CatalogOptions { can_read_cost?: boolean; suppliers: SupplierOption[]; members: CatalogOption[]; brand: CatalogOption[]; category: CatalogOption[]; tag: CatalogOption[]; packaging: CatalogOption[] }
+export interface SupplierOption extends CatalogOption { code: string; contact_name?: string | null; contact_details?: string | null; remark?: string | null }
+export type CatalogOptionKind = 'brand' | 'category' | 'tag' | 'packaging'
+export interface SupplierPayload { code: string; name: string; contact_name?: string | null; contact_details?: string | null; remark?: string | null; status?: 'active' | 'disabled' }
+export interface CatalogOptions { can_read_cost?: boolean; can_manage_options?: boolean; suppliers: SupplierOption[]; members: CatalogOption[]; brand: CatalogOption[]; category: CatalogOption[]; tag: CatalogOption[]; packaging: CatalogOption[] }
 export interface ProductChange { entity: string; sku_id?: EntityId | null; sku_code?: string; field: string; label: string; old: unknown; new: unknown; sensitive?: boolean }
 export interface ProductLog { id: EntityId; summary: string; actor_name: string; created_at: string; changes: ProductChange[] }

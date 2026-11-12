@@ -130,7 +130,7 @@ class ProductSku(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
         server_default="active",
         comment="SKU 状态：active 启用 / archived 已归档",
     )
-    image_url: Mapped[str | None] = mapped_column(String(500), nullable=True, comment="SKU 独立图片地址")
+    image_url: Mapped[str | None] = mapped_column(String(2048), nullable=True, comment="SKU 独立图片地址")
     guidance_cost: Mapped[Decimal | None] = mapped_column(Money, nullable=True, comment="SKU 指导成本")
     average_cost: Mapped[Decimal | None] = mapped_column(Money, nullable=True, comment="SKU 平均成本（本轮人工维护）")
     weight_g: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True, comment="SKU 重量（克）")
@@ -154,7 +154,7 @@ class ProductImage(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
     sku_id: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, comment="SKU ID（关联 product_skus.id，无外键；为空表示商品主图）"
     )
-    url: Mapped[str] = mapped_column(String(500), nullable=False, comment="图片地址")
+    url: Mapped[str] = mapped_column(String(2048), nullable=False, comment="图片地址")
     sort_order: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -193,6 +193,9 @@ class Supplier(IdMixin, TenantIdMixin, TimestampMixin, TenantBase):
     )
     code: Mapped[str] = mapped_column(String(64), nullable=False, comment="供应商编码（租户内唯一）")
     name: Mapped[str] = mapped_column(String(200), nullable=False, comment="供应商名称")
+    contact_name: Mapped[str | None] = mapped_column(String(100), nullable=True, comment="供应商联系人（选填）")
+    contact_details: Mapped[str | None] = mapped_column(String(255), nullable=True, comment="供应商联系方式（选填）")
+    remark: Mapped[str | None] = mapped_column(Text, nullable=True, comment="供应商备注（选填）")
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active", comment="供应商状态：启用或停用")
 
 

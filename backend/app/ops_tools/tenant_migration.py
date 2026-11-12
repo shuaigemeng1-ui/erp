@@ -26,13 +26,8 @@ from sqlalchemy import inspect, select, text
 
 from app.db.base import utcnow
 from app.db.session import center_session, tenant_session
-from app.modules.identity.models_center import (
-    Plan,
-    Subscription,
-    Tenant,
-    TenantMembership,
-    User,
-)
+from app.modules.identity.models_center import Tenant, TenantMembership, User
+from app.modules.platform.models_center import Plan, Subscription
 from app.modules.tasks.tenancy import load_tenant_route
 
 

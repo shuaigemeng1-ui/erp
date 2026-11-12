@@ -393,3 +393,27 @@ caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl re
 本次证据目录为`/opt/backups/releases/erp-3658871/`，包含`database/`、迁移前后结构及业务指纹、构建和迁移日志、鉴权及公开访问检查、部署脚本和回退脚本。鉴权检查仅创建临时Redis会话并在finally中清理，没有修改商品或供应商业务数据。
 
 回退镜像为`ventasync-backend:rollback-3658871`和`ventasync-frontend:rollback-3658871`。回退脚本只切换应用镜像；数据库恢复应独立评估，不能因镜像可回退而直接执行降级或恢复旧备份。真实云上传、真实店铺调价及库存写入未纳入本次生产验证。
+
+## 15. OBS连接检查故障修复（2026-11-12）
+
+业务提交`90f8ced`已发布到同一ERP服务器。用户配置的OBS账号连接检查失败，真实诊断确认：中文地域名称不是SDK要求的区域编码，SDK尚未发出请求即抛InvalidRegionError；仅在内存修正区域后，原auto模式发向区域Endpoint的桶路径返回403，同套密钥使用桶域名发起HeadBucket返回200。
+
+已在备份中心库后通过原配置服务保存正确区域编码及virtual寻址，保留原加密密钥、增加版本并记录审计。代码同时将OBS auto设为virtual，继续使用S3 V4与TLS证书验证；保存时拒绝中文Region、OBS path和带点桶名，前端区域标签及提示同步修改。已识别的错误使用固定中文消息和白名单provider_code，未知异常保持通用提示。
+
+本次无依赖或数据库结构变更；复用上次已校验的Linux wheels完成后端构建，前端本地`npm run build`后打包，更新API/Worker/scheduler/nginx，MySQL/Redis及现有数据卷未重建。
+
+| 检查 | 结果 |
+| --- | --- |
+| 本地 | 50项存储相关回归、npm run build及diff检查通过，未启动本地服务 |
+| 真实桶连接 | 修正配置后的HeadBucket 200；新代码auto模式真实HeadBucket 200 |
+| 平台接口 | 使用临时平台管理员会话与CSRF调用页面同一路径`POST /platform/storage-profiles/{profile_id}/test`返回200、ok=true；临时会话已清理 |
+| 真实图片写入 | 68字节PNG上传成功，诊断目录及真实catalog目录的测试对象均已删除，删除返回204 |
+| 匿名图片读取 | 常规商品目录图片URL匿名GET返回403、XML错误码AccessDenied；Bucket ACL包含AllUsers READ，不能据此认定对象可读 |
+| 服务与产物 | 应用容器正常，readyz 200；公开页面、主JS/CSS和设置页面资源SHA-256与发布产物一致 |
+| 备份及回退 | 中心库备份校验通过，环境配置备份权限600；旧镜像保留为backend/frontend的rollback-90f8ced标签 |
+
+本次证据目录为`/opt/backups/releases/erp-90f8ced/`，包含配置纠正前的中心库备份、真实云诊断、代码发布后的接口检查、构建日志及公开资源检查。密钥仅在服务进程内解密使用，没有打印或写入Git。本次未修改桶或对象的公开访问策略；图片外链读取仍需配置相应对象权限或CDN回源访问。
+
+OBS访问方式及兼容性依据：[华为OBS访问规则](https://support.huaweicloud.com/usermanual-obs/obs_41_0003.html)、[Boto3使用说明](https://support.huaweicloud.com/obs_faq/obs_faq_0274.html)。
+
+桶ACL的匿名READ属于桶级权限，不能据此认定对象内容可读；对象外链可使用限定图片目录的GetObject桶策略或单独对象public-read ACL，不能直接扩大为整个桶公开。参考[官方ACL权限定义](https://support.huaweicloud.com/perms-cfg-obs/obs_40_0005.html)与[指定对象只读策略](https://support.huaweicloud.com/perms-cfg-obs/obs_40_0004.html)。

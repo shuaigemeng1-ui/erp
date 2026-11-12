@@ -135,8 +135,13 @@ def upgrade():
     elif identifiers:
         table = sa.table("sku_identifiers", sa.column("tenant_id"), sa.column("sku_id"), sa.column("identifier"), sa.column("normalized_identifier"), sa.column("kind"), sa.column("is_active"))
         op.get_bind().execute(table.insert(), identifiers)
-    op.execute("""INSERT INTO audit_logs (tenant_id,product_id,action,resource_type,resource_id,summary,payload)
-        SELECT p.tenant_id,p.id,'catalog.migration','product',p.id,'迁移SPU资料与SKU标识；旧主商品成本仅补齐空SKU成本',NULL FROM products p""")
+    _record_migration_audit()
+
+
+def _record_migration_audit():
+    # 历史表的 ip/request_id 只有 ORM 默认值，直接执行 SQL 必须显式填写。
+    op.execute("""INSERT INTO audit_logs (tenant_id,product_id,action,resource_type,resource_id,summary,payload,ip,request_id)
+        SELECT p.tenant_id,p.id,'catalog.migration','product',p.id,'迁移SPU资料与SKU标识；旧主商品成本仅补齐空SKU成本',NULL,'','' FROM products p""")
 
 
 def downgrade():

@@ -137,6 +137,7 @@ class ChannelAppConfig:
     status: str
     updated_at: datetime | None = None
     # TikTok Shop 使用 App Key / App Secret；Shopee 使用 partner_* 字段
+    app_id: str = ""
     app_key: str = ""
     app_secret: str = ""
 
@@ -319,6 +320,7 @@ def _config_from_row(row: PlatformChannelApp) -> ChannelAppConfig:
         redirect_url=row.redirect_url or "",
         status=row.status or "active",
         updated_at=row.updated_at,
+        app_id=row.app_id or "",
         app_key=row.app_key or "",
         app_secret=app_secret,
     )
@@ -346,6 +348,7 @@ def channel_app_public_view(
             "channel": channel,
             "environment": "",
             "partner_id": None,
+            "app_id": "",
             "app_key": "",
             "has_partner_key": False,
             "has_partner_secret": False,
@@ -359,6 +362,7 @@ def channel_app_public_view(
         "channel": config.channel,
         "environment": config.environment,
         "partner_id": str(config.partner_id) if config.partner_id is not None else None,
+        "app_id": config.app_id,
         "app_key": config.app_key,
         "has_partner_key": bool(config.partner_key),
         "has_partner_secret": bool(config.partner_secret),
@@ -378,6 +382,7 @@ def save_channel_app(
     partner_id: int | None = None,
     partner_key: str | None = None,
     partner_secret: str | None = None,
+    app_id: str | None = None,
     app_key: str | None = None,
     app_secret: str | None = None,
     redirect_url: str | None = None,
@@ -402,6 +407,8 @@ def save_channel_app(
         center.add(row)
 
     if channel_value == CHANNEL_TIKTOK:
+        if app_id is not None:
+            row.app_id = app_id.strip() or None
         next_app_key = (app_key if app_key is not None else (row.app_key or "")).strip()
         if not next_app_key:
             raise AppError(ErrorCode.VALIDATION_ERROR, "TikTok App Key 不能为空")

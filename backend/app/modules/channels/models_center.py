@@ -41,6 +41,9 @@ class PlatformChannelApp(IdMixin, TimestampMixin, CenterBase):
     partner_id: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, comment="平台合作方ID（Shopee Partner ID）"
     )
+    app_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment="应用 ID（TikTok Shop Partner Center 的 App ID）"
+    )
     app_key: Mapped[str | None] = mapped_column(
         String(128), nullable=True, comment="应用 Key（TikTok Shop App Key；Shopee 用 partner_id）"
     )

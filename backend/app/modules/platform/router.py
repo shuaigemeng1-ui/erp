@@ -322,6 +322,7 @@ def put_channel_app(
         partner_id=payload.partner_id,
         partner_key=payload.partner_key,
         partner_secret=payload.partner_secret,
+        app_id=payload.app_id,
         app_key=payload.app_key,
         app_secret=payload.app_secret,
         redirect_url=payload.redirect_url,

@@ -78,6 +78,7 @@ class ChannelAppPutRequest(BaseModel):
     partner_id: int | None = Field(default=None, gt=0, description="Shopee Partner ID")
     partner_key: str | None = Field(default=None, max_length=255, description="Shopee Partner Key（不回显）")
     partner_secret: str | None = Field(default=None, max_length=255, description="Shopee Partner Secret（不回显）")
+    app_id: str | None = Field(default=None, max_length=64, description="TikTok Shop App ID")
     app_key: str | None = Field(default=None, max_length=128, description="TikTok Shop App Key")
     app_secret: str | None = Field(default=None, max_length=255, description="TikTok Shop App Secret（不回显）")
     redirect_url: str | None = Field(default=None, max_length=512, description="授权回调地址")

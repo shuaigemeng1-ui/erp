@@ -332,6 +332,7 @@ def save_channel_app(
     partner_secret: str | None,
     redirect_url: str | None,
     actor_user_id: int | None,
+    app_id: str | None = None,
     app_key: str | None = None,
     app_secret: str | None = None,
 ) -> dict[str, Any]:
@@ -350,6 +351,7 @@ def save_channel_app(
         partner_id=partner_id,
         partner_key=partner_key,
         partner_secret=partner_secret,
+        app_id=app_id,
         app_key=app_key,
         app_secret=app_secret,
         redirect_url=redirect_url,
@@ -366,6 +368,7 @@ def save_channel_app(
             "channel": normalized_channel,
             "environment": normalized_environment,
             "partner_id": partner_id,
+            "app_id": config.app_id or None,
             "app_key": config.app_key or None,
             "redirect_url": redirect_url,
             "partner_key_changed": partner_key is not None,

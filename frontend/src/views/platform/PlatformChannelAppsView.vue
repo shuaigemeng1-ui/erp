@@ -23,6 +23,7 @@ const channelForm = reactive({
   partner_id: '',
   partner_key: '',
   partner_secret: '',
+  app_id: '',
   app_key: '',
   app_secret: '',
   redirect_url: '',
@@ -36,6 +37,7 @@ async function load(): Promise<void> {
   try {
     app.value = await platformApi.channelApp(channel.value, environment.value)
     channelForm.partner_id = app.value.partner_id ?? ''
+    channelForm.app_id = app.value.app_id ?? ''
     channelForm.app_key = app.value.app_key ?? ''
     channelForm.redirect_url = app.value.redirect_url || redirectPlaceholder.value
     channelForm.partner_key = ''
@@ -44,6 +46,7 @@ async function load(): Promise<void> {
   } catch {
     app.value = null
     channelForm.partner_id = ''
+    channelForm.app_id = ''
     channelForm.app_key = ''
     channelForm.redirect_url = redirectPlaceholder.value
   } finally {
@@ -68,6 +71,7 @@ async function save(): Promise<void> {
   try {
     const payload: ChannelAppPayload = { redirect_url: channelForm.redirect_url.trim() }
     if (isTikTok.value) {
+      payload.app_id = channelForm.app_id.trim()
       payload.app_key = channelForm.app_key.trim()
       // 密钥不回显：只有填写时才提交
       if (channelForm.app_secret.trim()) payload.app_secret = channelForm.app_secret.trim()
@@ -114,7 +118,10 @@ onMounted(load)
         <StatusTag :status="app?.status ?? 'inactive'" />
       </el-descriptions-item>
       <template v-if="isTikTok">
-        <el-descriptions-item label="App Key（App ID）">
+        <el-descriptions-item label="App ID">
+          <span class="mono">{{ textOrDash(app?.app_id) }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="应用密钥（App Key）">
           <span class="mono">{{ textOrDash(app?.app_key) }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="App Secret">
@@ -140,14 +147,14 @@ onMounted(load)
 
     <el-form ref="formRef" v-loading="loading" :model="channelForm" :rules="rules" label-width="130px" style="max-width: 720px">
       <template v-if="isTikTok">
-        <el-form-item label="App Key（App ID）">
-          <el-input
-            v-model="channelForm.app_key"
-            placeholder="填 TikTok Shop 开发者后台的 App Key（即 App ID）"
-          />
-          <div class="form-tip">TikTok Shop Open API 里叫 App Key，授权参数是 app_key；它就是你应用的 App ID。</div>
+        <el-form-item label="App ID">
+          <el-input v-model="channelForm.app_id" placeholder="TikTok Shop Partner Center 的 App ID（数字）" />
         </el-form-item>
-        <el-form-item label="App Secret">
+        <el-form-item label="应用密钥（App Key）">
+          <el-input v-model="channelForm.app_key" placeholder="TikTok Shop 的 App Key（应用密钥）" />
+          <div class="form-tip">对应 TikTok 后台「应用密钥」，OAuth 参数为 app_key。</div>
+        </el-form-item>
+        <el-form-item label="应用密码（App Secret）">
           <el-input v-model="channelForm.app_secret" type="password" show-password placeholder="不填写则保持原值" />
         </el-form-item>
       </template>
@@ -172,7 +179,7 @@ onMounted(load)
     </el-form>
 
     <el-alert v-if="isTikTok" type="info" :closable="false" show-icon style="max-width: 720px">
-      <p>把上面的回调地址加入 TikTok Shop 应用的白名单；保存 App Key（App ID）/ App Secret 后，租户即可在「店铺连接」发起 TikTok Shop 授权。</p>
+      <p>把上面的回调地址加入 TikTok Shop 应用的白名单；保存 App ID / 应用密钥 / 应用密码后，租户即可在「店铺连接」发起 TikTok Shop 授权。</p>
     </el-alert>
   </el-card>
 </template>

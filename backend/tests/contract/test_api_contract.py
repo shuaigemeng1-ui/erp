@@ -261,6 +261,14 @@ def test_request_payload_accepts_string_ids(openapi_schema: dict) -> None:
         assert _is_string_schema(field_schema), f"{schema_name}.{field} 应为字符串 ID"
 
 
+def test_shopee_authorize_body_is_optional(openapi_schema: dict) -> None:
+    """发起授权允许不传请求体（默认环境），避免前端空 POST 被 422。"""
+    path = f"{API_PREFIX}/tenants/{{tenant_id}}/stores/shopee/authorize"
+    operation = openapi_schema["paths"][path]["post"]
+    request_body = operation.get("requestBody")
+    assert request_body is None or request_body.get("required", False) is False
+
+
 def test_id_string_helper_contract() -> None:
     from app.modules.channels.schemas import id_string
 

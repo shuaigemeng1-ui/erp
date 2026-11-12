@@ -29,8 +29,12 @@ export const channelsApi = {
     return toList(raw)
   },
 
-  authorizeShopee(tenantId: EntityId): Promise<AuthorizeResult> {
-    return http.post<AuthorizeResult>(tenantPath(tenantId, '/stores/shopee/authorize'))
+  authorizeShopee(
+    tenantId: EntityId,
+    payload: { environment?: 'production' | 'test'; redirect_path?: string } = {},
+  ): Promise<AuthorizeResult> {
+    // 总是发送 JSON 对象：旧后端要求请求体，新后端 body 可选，保持双向兼容
+    return http.post<AuthorizeResult>(tenantPath(tenantId, '/stores/shopee/authorize'), payload)
   },
 
   disconnectStore(tenantId: EntityId, storeId: EntityId): Promise<void> {

@@ -92,21 +92,24 @@ def list_stores(
 @router.post("/tenants/{tenant_id}/stores/shopee/authorize")
 def authorize_shopee_store(
     request: Request,
-    body: schemas.ShopeeAuthorizeIn,
+    body: schemas.ShopeeAuthorizeIn | None = None,
     tenant_id: int = Path(ge=1),
     ctx: TenantContext = Depends(tenant_context),
     db: Session = Depends(get_tenant_db),
     center: Session = Depends(get_center_db),
     _: AccessSnapshot = Depends(require_permission(Permission.STORE_CONNECT.value)),
 ) -> dict[str, Any]:
-    """发起 Shopee 店铺授权：生成一次性授权会话并返回 auth_url。"""
+    """发起 Shopee 店铺授权：生成一次性授权会话并返回 auth_url。
+
+    ``body`` 可选：前端只需默认环境时可以不传请求体（兼容旧客户端）。
+    """
     result = service.start_shopee_authorization(
         center,
         db,
         tenant_id=tenant_id,
         member_id=ctx.member_id,
-        environment=body.environment,
-        redirect_path=body.redirect_path,
+        environment=body.environment if body else None,
+        redirect_path=body.redirect_path if body else None,
         actor_id=ctx.user_id,
         request_id=ctx.request_id,
         ip=_client_ip(request),

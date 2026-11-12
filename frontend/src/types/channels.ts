@@ -50,6 +50,7 @@ export interface Listing {
 export interface AuthorizeResult {
   auth_url: string
   expires_at: string
+  environment?: string
 }
 
 export interface ListingLinkPayload {

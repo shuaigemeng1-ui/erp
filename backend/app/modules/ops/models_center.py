@@ -145,6 +145,7 @@ class NodeCheck(IdMixin, CenterBase):
     ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, comment="是否可用")
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="HTTP状态码")
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="总耗时毫秒")
+    cert_days_left: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="HTTPS证书剩余天数")
     error: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="", comment="错误摘要")
 
 

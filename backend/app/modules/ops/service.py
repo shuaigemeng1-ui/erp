@@ -37,6 +37,8 @@ ALERT_MEMORY = "memory_high"
 ALERT_DISK = "disk_high"
 ALERT_AGENT = "agent_offline"
 ALERT_PUBLIC = "public_unreachable"
+ALERT_CERT = "cert_expiring"
+ALERT_BACKUP = "backup_overdue"
 
 TARGETS = (("root", "/"), ("healthz", "/healthz"))
 
@@ -574,11 +576,32 @@ def mark_stale_nodes_offline(center) -> int:
     return len(rows)
 
 
+def _cert_days_left(domain: str) -> int | None:
+    import ssl
+    import socket
+
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((domain, 443), timeout=6) as sock:
+            with context.wrap_socket(sock, server_hostname=domain) as tls:
+                cert = tls.getpeercert()
+        not_after = cert.get("notAfter")
+        if not not_after:
+            return None
+        import time as _time
+
+        expires = ssl.cert_time_to_seconds(not_after)
+        return int((expires - _time.time()) // 86400)
+    except (OSError, ssl.SSLError, ValueError):
+        return None
+
+
 def probe_node(center, node_id: int) -> dict[str, Any]:
     node = center.get(ServerNode, int(node_id))
     if node is None:
         raise AppError(ErrorCode.NOT_FOUND, "节点不存在")
     instance = get_instance(center, node.instance_id)
+    cert_days = _cert_days_left(instance.domain)
     checks: list[NodeCheck] = []
     for target, path in TARGETS:
         url = f"https://{instance.domain}{path}"
@@ -603,10 +626,16 @@ def probe_node(center, node_id: int) -> dict[str, Any]:
             ok=ok,
             status_code=status_code,
             latency_ms=latency,
+            cert_days_left=cert_days,
             error=error,
         )
         center.add(row)
         checks.append(row)
+    if cert_days is not None and cert_days < 14:
+        _upsert_alert(center, node, ALERT_CERT, "critical" if cert_days < 7 else "warning",
+                      f"HTTPS 证书剩余 {cert_days} 天", str(cert_days), "14天", _now())
+    elif cert_days is not None:
+        _resolve_alerts(center, node, (ALERT_CERT,), _now())
     if all(item.ok for item in checks):
         _resolve_alerts(center, node, (ALERT_PUBLIC,), _now())
     else:
@@ -758,6 +787,7 @@ def run_center_maintenance(center, *, probe_interval_seconds: int = 60) -> dict[
             except Exception:  # noqa: BLE001 - 单节点探测失败不影响其他节点
                 failed += 1
         _last_probe_at = now
+    notifications = check_backup_alerts(center)
     notified = notify_open_alerts(center)
     cleaned = cleanup_old_monitoring_data(center)
     return {
@@ -765,6 +795,7 @@ def run_center_maintenance(center, *, probe_interval_seconds: int = 60) -> dict[
         "probed": probed,
         "probe_failed": failed,
         "notified": notified,
+        "backup_alerts": notifications,
         "metrics_cleaned": cleaned["metrics"],
         "checks_cleaned": cleaned["checks"],
     }
@@ -1101,3 +1132,38 @@ def delete_maintenance_window(center, window_id: int) -> dict[str, Any]:
         raise AppError(ErrorCode.NOT_FOUND, "维护窗口不存在")
     center.delete(row); center.commit()
     return {"deleted": True}
+
+
+def check_backup_alerts(center) -> int:
+    """最近一次成功备份超过 26 小时或从未备份时告警。"""
+    from app.modules.ops.models_center import BackupRecord
+
+    now = _now()
+    created = 0
+    instances = center.execute(select(TenantInstance)).scalars().all()
+    for instance in instances:
+        nodes = center.execute(
+            select(ServerNode).where(ServerNode.instance_id == instance.id)
+        ).scalars().all()
+        latest = center.execute(
+            select(BackupRecord)
+            .where(BackupRecord.instance_id == instance.id, BackupRecord.status == "succeeded")
+            .order_by(BackupRecord.finished_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        overdue = latest is None or latest.finished_at is None or (now - latest.finished_at) > timedelta(hours=26)
+        for node in nodes:
+            if overdue:
+                _upsert_alert(
+                    center, node, ALERT_BACKUP, "warning",
+                    "备份超过 26 小时未成功" if latest else "尚未完成首次备份",
+                    "overdue", "26h", now,
+                )
+                created += 1
+            else:
+                _resolve_alerts(center, node, (ALERT_BACKUP,), now)
+    if created:
+        center.commit()
+    else:
+        center.commit()
+    return created

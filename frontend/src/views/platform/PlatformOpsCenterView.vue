@@ -273,6 +273,12 @@ const operationPayloadTip = computed(
   () => JOB_PAYLOAD_TIPS[operationForm.job_type] ?? '请输入 JSON 对象，留空表示无参数。',
 )
 
+async function retryOperation(row: OpsOperation): Promise<void> {
+  await opsApi.retryOperation(row.id)
+  ElMessage.success('已创建重试任务')
+  await searchOperations()
+}
+
 function openOperationCreate(): void {
   operationForm.instance_id = operationQuery.instance_id
   operationForm.job_type = 'restart'
@@ -469,6 +475,18 @@ onMounted(() => {
               <template #default="{ row }">
                 <div>开始 {{ formatDateTime(row.started_at) }}</div>
                 <div class="text-muted">完成 {{ formatDateTime(row.finished_at) }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="90" fixed="right">
+              <template #default="{ row }">
+                <el-button
+                  v-if="row.status === 'failed' || row.status === 'unknown'"
+                  text
+                  type="primary"
+                  size="small"
+                  @click="retryOperation(row as OpsOperation)"
+                >重试</el-button>
+                <span v-else class="text-muted">-</span>
               </template>
             </el-table-column>
             <template #empty>

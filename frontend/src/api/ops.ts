@@ -192,6 +192,10 @@ export const opsApi = {
   },
 
   /** 创建运维任务：idempotency_key 留空时不传，后端自动生成。 */
+  retryOperation(operationId: EntityId): Promise<OpsOperation> {
+    return http.post<OpsOperation>(`/platform/operations/${segment(operationId)}/retry`)
+  },
+
   createOperation(instanceId: EntityId, payload: OpsOperationCreatePayload): Promise<OpsOperation> {
     const body: Record<string, unknown> = {
       job_type: payload.job_type,

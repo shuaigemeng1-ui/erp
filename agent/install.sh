@@ -20,11 +20,21 @@ python3 --version >/dev/null 2>&1 || { echo "需要 python3" >&2; exit 1; }
 install -d -m 755 "$BASE_DIR"
 install -m 755 "$(dirname "$0")/erp_agent.py" "$BASE_DIR/erp_agent.py"
 
+# Agent 以普通系统用户运行，不直接使用 root。
+if ! id -u erp-agent >/dev/null 2>&1; then
+  useradd --system --home-dir "$BASE_DIR" --shell /usr/sbin/nologin erp-agent
+fi
+if getent group docker >/dev/null 2>&1; then
+  usermod -aG docker erp-agent
+fi
+
 python3 "$BASE_DIR/erp_agent.py" enroll \
   --center "$CENTER" \
   --token "$TOKEN" \
   --instance "$INSTANCE" \
   --config "$CONFIG"
+chown -R erp-agent:erp-agent "$BASE_DIR"
+chmod 600 "$CONFIG"
 
 cat > "$SERVICE" <<'UNIT'
 [Unit]
@@ -37,7 +47,8 @@ Type=simple
 ExecStart=/usr/bin/python3 /opt/erp-agent/erp_agent.py run --config /opt/erp-agent/config.json
 Restart=always
 RestartSec=5
-User=root
+User=erp-agent
+Group=erp-agent
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true

@@ -739,4 +739,99 @@ def run_center_maintenance(center, *, probe_interval_seconds: int = 60) -> dict[
             except Exception:  # noqa: BLE001 - 单节点探测失败不影响其他节点
                 failed += 1
         _last_probe_at = now
-    return {"offline": offline, "probed": probed, "probe_failed": failed}
+    notified = notify_open_alerts(center)
+    cleaned = cleanup_old_monitoring_data(center)
+    return {
+        "offline": offline,
+        "probed": probed,
+        "probe_failed": failed,
+        "notified": notified,
+        "metrics_cleaned": cleaned["metrics"],
+        "checks_cleaned": cleaned["checks"],
+    }
+
+
+_last_alert_email_at: datetime | None = None
+_last_cleanup_at: datetime | None = None
+
+
+def _platform_admin_emails(center) -> list[str]:
+    from app.modules.identity.models_center import PlatformRole, PlatformUserRole, User
+
+    rows = center.execute(
+        select(User.email)
+        .join(PlatformUserRole, PlatformUserRole.user_id == User.id)
+        .join(PlatformRole, PlatformRole.id == PlatformUserRole.role_id)
+        .where(PlatformRole.code == "platform_admin", User.status == "active")
+        .distinct()
+    ).all()
+    return [str(row[0]) for row in rows if row[0]]
+
+
+def notify_open_alerts(center) -> int:
+    """对未通知或超过 30 分钟的未恢复告警发送邮件（尽力而为）。"""
+    global _last_alert_email_at
+    now = _now()
+    if _last_alert_email_at is not None and (now - _last_alert_email_at).total_seconds() < 60:
+        return 0
+    _last_alert_email_at = now
+    recipients = _platform_admin_emails(center)
+    if not recipients:
+        return 0
+    rows = center.execute(
+        select(AlertEvent).where(
+            AlertEvent.status.in_(("open", "acknowledged")),
+            or_(
+                AlertEvent.last_notified_at.is_(None),
+                AlertEvent.last_notified_at < now - timedelta(seconds=ALERT_REMIND_SECONDS),
+            ),
+        ).limit(20)
+    ).scalars().all()
+    if not rows:
+        return 0
+    from app.modules.email import service as email_service
+
+    sent = 0
+    for row in rows:
+        try:
+            email_service.send_default(
+                center,
+                to=recipients,
+                subject=f"[ERP 运维告警][{row.severity}] {row.message[:80]}",
+                text=(
+                    f"告警类型：{row.alert_type}\n"
+                    f"节点 ID：{row.node_id}\n"
+                    f"当前值：{row.metric_value}\n"
+                    f"阈值：{row.threshold}\n"
+                    f"首次触发：{_iso(row.first_seen_at)}\n"
+                    f"最近触发：{_iso(row.last_seen_at)}\n\n"
+                    "请登录统一 ERP 管理中心 → 服务器与实例 → 告警中心处理。"
+                ),
+            )
+        except Exception:  # noqa: BLE001 - 邮件服务未配置或临时失败不阻塞监控
+            continue
+        row.notify_count = int(row.notify_count or 0) + 1
+        row.last_notified_at = now
+        row.updated_at = now
+        sent += 1
+    if sent:
+        center.commit()
+    return sent
+
+
+def cleanup_old_monitoring_data(center) -> dict[str, int]:
+    """原始指标保留 7 天、探测保留 7 天；每天最多执行一次。"""
+    global _last_cleanup_at
+    now = _now()
+    if _last_cleanup_at is not None and (now - _last_cleanup_at).total_seconds() < 86400:
+        return {"metrics": 0, "checks": 0}
+    cutoff = now - timedelta(days=METRIC_RETENTION_DAYS)
+    metrics = center.query(NodeMetricSample).filter(NodeMetricSample.received_at < cutoff).delete(
+        synchronize_session=False
+    )
+    checks = center.query(NodeCheck).filter(NodeCheck.checked_at < cutoff).delete(
+        synchronize_session=False
+    )
+    center.commit()
+    _last_cleanup_at = now
+    return {"metrics": int(metrics or 0), "checks": int(checks or 0)}

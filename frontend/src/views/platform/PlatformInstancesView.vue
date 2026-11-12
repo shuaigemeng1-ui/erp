@@ -13,6 +13,7 @@ import type {
   OpsEnvironment,
   OpsInstance,
   OpsInstanceStatus,
+  OpsNodeAggregates,
   OpsNodeEnrollment,
   OpsNodeMetric,
   OpsNodeMetrics,
@@ -33,6 +34,69 @@ const ALERT_TYPE_LABELS: Record<string, string> = {
   agent_offline: 'Agent 离线',
   public_unreachable: '公网不可达',
 }
+
+type TrendRangeKey = '1h' | '24h' | '7d' | '30d'
+type TrendAxisAnchor = 'start' | 'middle' | 'end'
+
+interface TrendRangeOption {
+  key: TrendRangeKey
+  label: string
+  resolution: '5m' | '1h'
+  hours: number
+}
+
+interface TrendPoint {
+  timestamp: number
+  iso: string
+  cpu: number
+  memory: number
+  samples: number
+}
+
+interface TrendYAxisTick {
+  value: number
+  y: number
+}
+
+interface TrendXAxisTick {
+  x: number
+  y: number
+  label: string
+  anchor: TrendAxisAnchor
+}
+
+interface TrendChartDot {
+  timestamp: number
+  x: number
+  cpuY: number
+  memoryY: number
+}
+
+interface TrendChartGeometry {
+  cpuPath: string
+  memoryPath: string
+  yTicks: TrendYAxisTick[]
+  xTicks: TrendXAxisTick[]
+  dots: TrendChartDot[]
+}
+
+const TREND_RANGES: TrendRangeOption[] = [
+  { key: '1h', label: '近 1 小时', resolution: '5m', hours: 1 },
+  { key: '24h', label: '近 24 小时', resolution: '5m', hours: 24 },
+  { key: '7d', label: '近 7 天', resolution: '1h', hours: 168 },
+  { key: '30d', label: '近 30 天', resolution: '1h', hours: 720 },
+]
+
+const CHART_WIDTH = 760
+const CHART_HEIGHT = 250
+const CHART_LEFT = 42
+const CHART_RIGHT = 16
+const CHART_TOP = 18
+const CHART_BOTTOM = 30
+const CHART_PLOT_WIDTH = CHART_WIDTH - CHART_LEFT - CHART_RIGHT
+const CHART_PLOT_HEIGHT = CHART_HEIGHT - CHART_TOP - CHART_BOTTOM
+const CHART_VIEW_BOX = `0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`
+const CHART_Y_TICKS = [100, 75, 50, 25, 0]
 
 function instanceTagType(status?: string | null): TagType {
   if (status === 'active') return 'success'
@@ -144,6 +208,12 @@ function diskSummary(metric?: OpsNodeMetric | null): string {
 
 function normalizeDomain(value: string): string {
   return value.trim().toLowerCase().replace(/\.$/, '')
+}
+
+/** 图表横轴标签仍基于 formatDateTime，短周期显示到时:分，长周期只显示日期。 */
+function formatTrendAxisTime(timestamp: number, rangeKey: TrendRangeKey): string {
+  const formatted = formatDateTime(new Date(timestamp).toISOString())
+  return rangeKey === '1h' || rangeKey === '24h' ? formatted.slice(5, 16) : formatted.slice(5, 10)
 }
 
 function environmentText(environment?: string | null): string {
@@ -441,6 +511,14 @@ const metricsLoading = ref(false)
 const metricsMinutes = 60
 let metricsRequestSeq = 0
 
+const trendRangeKey = ref<TrendRangeKey>('1h')
+const activeTrendRange = computed(
+  () => TREND_RANGES.find((range) => range.key === trendRangeKey.value) ?? TREND_RANGES[0],
+)
+const aggregatesData = ref<OpsNodeAggregates | null>(null)
+const aggregatesLoading = ref(false)
+let aggregatesRequestSeq = 0
+
 const latestMetric = computed<OpsNodeMetric | null>(
   () => metricsData.value?.latest ?? selectedNode.value?.latest_metric ?? null,
 )
@@ -450,11 +528,150 @@ const metricRows = computed<OpsNodeMetric[]>(() => {
   return items.slice().reverse().slice(0, 30)
 })
 
+const trendPoints = computed<TrendPoint[]>(() => {
+  const items = aggregatesData.value?.items ?? []
+  return items
+    .map((item): TrendPoint | null => {
+      if (!item.bucket_start) return null
+      const timestamp = Date.parse(item.bucket_start)
+      if (!Number.isFinite(timestamp)) return null
+      return {
+        timestamp,
+        iso: item.bucket_start,
+        cpu: Number(item.cpu_avg) || 0,
+        memory: Number(item.memory_avg) || 0,
+        samples: Number(item.sample_count) || 0,
+      }
+    })
+    .filter((point): point is TrendPoint => point !== null)
+    .sort((left, right) => left.timestamp - right.timestamp)
+})
+
+const trendTotalSamples = computed(() =>
+  trendPoints.value.reduce((total, point) => total + point.samples, 0),
+)
+const trendExpectedBuckets = computed(() => {
+  const range = activeTrendRange.value
+  const bucketMinutes = range.resolution === '5m' ? 5 : 60
+  return Math.max(1, Math.ceil((range.hours * 60) / bucketMinutes))
+})
+const trendRangeText = computed(() => {
+  const points = trendPoints.value
+  if (!points.length) return ''
+  return `${formatDateTime(points[0].iso)} — ${formatDateTime(points[points.length - 1].iso)}`
+})
+const trendNotice = computed(() => {
+  const count = trendPoints.value.length
+  if (!count) return ''
+  if (count < 2) {
+    return `样本不足：当前只有 ${count} 个聚合桶，趋势线可能不完整。`
+  }
+  const expected = trendExpectedBuckets.value
+  if (count < expected * 0.5) {
+    return `样本覆盖较少：当前 ${count} / ${expected} 个聚合桶，趋势仅供参考。`
+  }
+  return ''
+})
+const trendGranularityText = computed(() =>
+  activeTrendRange.value.resolution === '5m' ? '5 分钟' : '1 小时',
+)
+
+const trendChart = computed<TrendChartGeometry>(() => {
+  const points = trendPoints.value
+  const yTicks = CHART_Y_TICKS.map((value) => ({
+    value,
+    y: CHART_TOP + (1 - value / 100) * CHART_PLOT_HEIGHT,
+  }))
+  if (!points.length) {
+    return { cpuPath: '', memoryPath: '', yTicks, xTicks: [], dots: [] }
+  }
+
+  const first = points[0]
+  const last = points[points.length - 1]
+  const timeSpan = Math.max(1, last.timestamp - first.timestamp)
+  const centerX = CHART_LEFT + CHART_PLOT_WIDTH / 2
+  const toX = (timestamp: number): number =>
+    points.length === 1
+      ? centerX
+      : CHART_LEFT + ((timestamp - first.timestamp) / timeSpan) * CHART_PLOT_WIDTH
+  const toY = (value: number): number =>
+    CHART_TOP + (1 - Math.min(100, Math.max(0, Number(value) || 0)) / 100) * CHART_PLOT_HEIGHT
+  const pathFor = (field: 'cpu' | 'memory'): string =>
+    points
+      .map(
+        (point, index) =>
+          `${index === 0 ? 'M' : 'L'} ${toX(point.timestamp).toFixed(2)} ${toY(point[field]).toFixed(2)}`,
+      )
+      .join(' ')
+
+  const labelY = CHART_TOP + CHART_PLOT_HEIGHT + 18
+  const xTicks: TrendXAxisTick[] =
+    points.length === 1
+      ? [
+          {
+            x: centerX,
+            y: labelY,
+            label: formatTrendAxisTime(first.timestamp, activeTrendRange.value.key),
+            anchor: 'middle',
+          },
+        ]
+      : [0, 0.25, 0.5, 0.75, 1].map((ratio, index) => ({
+          x: CHART_LEFT + CHART_PLOT_WIDTH * ratio,
+          y: labelY,
+          label: formatTrendAxisTime(
+            first.timestamp + timeSpan * ratio,
+            activeTrendRange.value.key,
+          ),
+          anchor: index === 0 ? 'start' : index === 4 ? 'end' : 'middle',
+        }))
+
+  const dotSource = points.length <= 48 ? points : [last]
+  const dots = dotSource.map((point) => ({
+    timestamp: point.timestamp,
+    x: toX(point.timestamp),
+    cpuY: toY(point.cpu),
+    memoryY: toY(point.memory),
+  }))
+
+  return {
+    cpuPath: pathFor('cpu'),
+    memoryPath: pathFor('memory'),
+    yTicks,
+    xTicks,
+    dots,
+  }
+})
+
+async function loadAggregates(node: OpsServerNode): Promise<void> {
+  const seq = ++aggregatesRequestSeq
+  const range = activeTrendRange.value
+  aggregatesLoading.value = true
+  aggregatesData.value = null
+  try {
+    const data = await opsApi.nodeAggregates(node.id, range.resolution, range.hours)
+    if (seq !== aggregatesRequestSeq) return
+    aggregatesData.value = data
+  } catch {
+    if (seq === aggregatesRequestSeq) aggregatesData.value = null
+  } finally {
+    if (seq === aggregatesRequestSeq) aggregatesLoading.value = false
+  }
+}
+
+function handleTrendRangeChange(value?: string | number | boolean): void {
+  const key = String(value)
+  if (!TREND_RANGES.some((range) => range.key === key)) return
+  if (key === trendRangeKey.value) return
+  trendRangeKey.value = key as TrendRangeKey
+  if (selectedNode.value) void loadAggregates(selectedNode.value)
+}
+
 async function loadNodeMetrics(node: OpsServerNode): Promise<void> {
   const seq = ++metricsRequestSeq
   selectedNode.value = node
   metricsLoading.value = true
   metricsData.value = null
+  void loadAggregates(node)
   try {
     const data = await opsApi.nodeMetrics(node.id, metricsMinutes)
     if (seq !== metricsRequestSeq) return
@@ -952,6 +1169,138 @@ async function copyText(value: string | null | undefined, label: string): Promis
               <span v-if="latestMetric.public_ip"> · 公网 IP {{ latestMetric.public_ip }}</span>
             </div>
 
+            <div class="trend-panel">
+              <div class="trend-head">
+                <div>
+                  <div class="trend-title">CPU / 内存平均趋势</div>
+                  <div class="trend-subtitle">
+                    {{ trendGranularityText }}聚合 · {{ activeTrendRange.label }}
+                  </div>
+                </div>
+                <el-radio-group
+                  :model-value="trendRangeKey"
+                  size="small"
+                  class="trend-range-switch"
+                  @change="handleTrendRangeChange"
+                >
+                  <el-radio-button
+                    v-for="range in TREND_RANGES"
+                    :key="range.key"
+                    :value="range.key"
+                  >
+                    {{ range.label }}
+                  </el-radio-button>
+                </el-radio-group>
+              </div>
+
+              <div class="trend-legend">
+                <span class="trend-legend-item">
+                  <span class="trend-swatch trend-swatch-cpu"></span>
+                  CPU 平均
+                </span>
+                <span class="trend-legend-item">
+                  <span class="trend-swatch trend-swatch-memory"></span>
+                  内存平均
+                </span>
+              </div>
+
+              <div v-loading="aggregatesLoading" class="trend-chart-wrap">
+                <el-empty
+                  v-if="!aggregatesLoading && !trendPoints.length"
+                  :description="`${activeTrendRange.label}暂无聚合数据`"
+                  :image-size="60"
+                />
+                <template v-else-if="trendPoints.length">
+                  <el-alert
+                    v-if="trendNotice"
+                    class="trend-notice"
+                    type="warning"
+                    :title="trendNotice"
+                    :closable="false"
+                    show-icon
+                  />
+                  <svg
+                    class="trend-svg"
+                    :viewBox="CHART_VIEW_BOX"
+                    role="img"
+                    :aria-label="'CPU 与内存平均使用率趋势，' + activeTrendRange.label"
+                    preserveAspectRatio="xMidYMid meet"
+                  >
+                    <title>CPU 与内存平均使用率趋势，{{ activeTrendRange.label }}</title>
+                    <g class="trend-grid">
+                      <line
+                        v-for="tick in trendChart.yTicks"
+                        :key="`grid-${tick.value}`"
+                        :x1="CHART_LEFT"
+                        :x2="CHART_WIDTH - CHART_RIGHT"
+                        :y1="tick.y"
+                        :y2="tick.y"
+                      />
+                    </g>
+                    <g class="trend-y-axis">
+                      <text
+                        v-for="tick in trendChart.yTicks"
+                        :key="`y-${tick.value}`"
+                        :x="CHART_LEFT - 6"
+                        :y="tick.y + 3"
+                        text-anchor="end"
+                      >
+                        {{ tick.value }}%
+                      </text>
+                    </g>
+                    <g class="trend-x-axis">
+                      <text
+                        v-for="tick in trendChart.xTicks"
+                        :key="`x-${tick.x}-${tick.label}`"
+                        :x="tick.x"
+                        :y="tick.y"
+                        :text-anchor="tick.anchor"
+                      >
+                        {{ tick.label }}
+                      </text>
+                    </g>
+                    <path
+                      v-if="trendPoints.length > 1"
+                      class="trend-line trend-cpu-line"
+                      :d="trendChart.cpuPath"
+                    />
+                    <path
+                      v-if="trendPoints.length > 1"
+                      class="trend-line trend-memory-line"
+                      :d="trendChart.memoryPath"
+                    />
+                    <g class="trend-dots">
+                      <circle
+                        v-for="dot in trendChart.dots"
+                        :key="`cpu-dot-${dot.timestamp}`"
+                        class="trend-dot trend-cpu-dot"
+                        :cx="dot.x"
+                        :cy="dot.cpuY"
+                        r="2.5"
+                      />
+                      <circle
+                        v-for="dot in trendChart.dots"
+                        :key="`memory-dot-${dot.timestamp}`"
+                        class="trend-dot trend-memory-dot"
+                        :cx="dot.x"
+                        :cy="dot.memoryY"
+                        r="2.5"
+                      />
+                    </g>
+                  </svg>
+                  <div class="trend-foot">
+                    <span>{{ trendRangeText }}</span>
+                    <span>
+                      共 {{ trendPoints.length }} 个聚合桶 / {{ trendTotalSamples }} 个样本
+                      <span v-if="trendPoints.length < trendExpectedBuckets" class="text-muted">
+                        （预期 {{ trendExpectedBuckets }} 桶）
+                      </span>
+                    </span>
+                  </div>
+                </template>
+              </div>
+            </div>
+
             <template v-if="metricRows.length">
               <div class="metric-list-head">最近样本（新 → 旧，最多 30 条）</div>
               <el-table :data="metricRows" border size="small" max-height="280">
@@ -1231,6 +1580,126 @@ async function copyText(value: string | null | undefined, label: string): Promis
   font-size: 12px;
 }
 
+.trend-panel {
+  margin: 12px 0 16px;
+  padding: 12px;
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+}
+
+.trend-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.trend-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.trend-subtitle {
+  margin-top: 4px;
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+}
+
+.trend-legend {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 10px 0 4px;
+  color: var(--el-text-color-regular);
+  font-size: 12px;
+}
+
+.trend-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.trend-swatch {
+  display: inline-block;
+  width: 18px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+.trend-swatch-cpu {
+  background: var(--el-color-primary);
+}
+
+.trend-swatch-memory {
+  background: var(--el-color-warning);
+}
+
+.trend-chart-wrap {
+  min-height: 150px;
+}
+
+.trend-notice {
+  margin-bottom: 8px;
+}
+
+.trend-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.trend-grid line {
+  stroke: var(--el-border-color-lighter);
+  stroke-width: 1;
+}
+
+.trend-y-axis text,
+.trend-x-axis text {
+  fill: var(--el-text-color-secondary);
+  font-size: 10px;
+}
+
+.trend-line {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
+.trend-cpu-line {
+  stroke: var(--el-color-primary);
+}
+
+.trend-memory-line {
+  stroke: var(--el-color-warning);
+}
+
+.trend-dot {
+  stroke: var(--el-bg-color);
+  stroke-width: 1;
+}
+
+.trend-cpu-dot {
+  fill: var(--el-color-primary);
+}
+
+.trend-memory-dot {
+  fill: var(--el-color-warning);
+}
+
+.trend-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
 .metric-list-head {
   margin: 4px 0 8px;
   font-size: 12px;
@@ -1277,6 +1746,10 @@ async function copyText(value: string | null | undefined, label: string): Promis
 
   .metric-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .trend-head {
+    flex-direction: column;
   }
 }
 </style>

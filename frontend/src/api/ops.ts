@@ -2,11 +2,13 @@ import { http, requestPage } from './http'
 import { segment } from './paths'
 import type { EntityId, PageParams, PagedData, QueryParams } from '@/types'
 import type {
+  OpsAggregateResolution,
   OpsAlert,
   OpsAlertAckResult,
   OpsInstance,
   OpsInstanceCreatePayload,
   OpsInstanceUpdatePayload,
+  OpsNodeAggregates,
   OpsNodeEnrollment,
   OpsNodeMetrics,
   OpsProbeResult,
@@ -135,6 +137,18 @@ export const opsApi = {
 
   nodeMetrics(nodeId: EntityId, minutes = 60): Promise<OpsNodeMetrics> {
     return http.get<OpsNodeMetrics>(`/platform/nodes/${segment(nodeId)}/metrics`, { minutes })
+  },
+
+  /** 节点指标聚合趋势：5m 适合 1/24 小时，1h 适合 7/30 天。 */
+  nodeAggregates(
+    nodeId: EntityId,
+    resolution: OpsAggregateResolution = '5m',
+    hours = 24,
+  ): Promise<OpsNodeAggregates> {
+    return http.get<OpsNodeAggregates>(`/platform/nodes/${segment(nodeId)}/aggregates`, {
+      resolution,
+      hours,
+    })
   },
 
   alerts(query: OpsAlertQuery = {}): Promise<PagedData<OpsAlert>> {

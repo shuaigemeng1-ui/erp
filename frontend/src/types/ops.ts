@@ -112,6 +112,27 @@ export interface OpsNodeMetrics {
   latest: OpsNodeMetric | null
 }
 
+/** 聚合粒度：5 分钟 / 1 小时 */
+export type OpsAggregateResolution = '5m' | '1h'
+
+/** 节点指标聚合桶 */
+export interface OpsNodeAggregate {
+  bucket_start: string | null
+  sample_count: number
+  cpu_avg: number
+  cpu_max: number
+  memory_avg: number
+  memory_max: number
+  load_avg: number
+  disk_max: number
+}
+
+export interface OpsNodeAggregates {
+  node_id: EntityId
+  resolution: OpsAggregateResolution | string
+  items: OpsNodeAggregate[]
+}
+
 export interface OpsNodeEnrollment {
   node: OpsServerNode
   node_uuid: string

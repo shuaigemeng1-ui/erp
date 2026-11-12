@@ -464,6 +464,10 @@ def ingest_telemetry(center, node: ServerNode, payload: TelemetryPayload) -> dic
     node.last_seen_at = now
     node.last_metrics_at = now
     node.updated_at = now
+    instance = center.get(TenantInstance, node.instance_id)
+    if instance is not None and instance.status == "pending":
+        instance.status = "active"
+        instance.updated_at = now
     sample = NodeMetricSample(
         node_id=node.id,
         sampled_at=sampled_at,

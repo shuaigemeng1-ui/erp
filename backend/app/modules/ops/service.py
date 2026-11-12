@@ -445,6 +445,15 @@ def _resolve_alerts(center, node: ServerNode, alert_types: Iterable[str], now: d
         row.updated_at = now
 
 
+def _sustained(center, node_id: int, column, threshold: float, seconds: int, minimum: int) -> bool:
+    since = _now() - timedelta(seconds=seconds)
+    values = center.execute(
+        select(column).where(NodeMetricSample.node_id == node_id, NodeMetricSample.sampled_at >= since)
+    ).scalars().all()
+    hits = sum(1 for value in values if float(value or 0) >= threshold)
+    return len(values) >= minimum and hits >= minimum
+
+
 def ingest_telemetry(center, node: ServerNode, payload: TelemetryPayload) -> dict[str, Any]:
     now = _now()
     sampled_at = _aware_utc(payload.sampled_at) or now
@@ -490,31 +499,32 @@ def ingest_telemetry(center, node: ServerNode, payload: TelemetryPayload) -> dic
     center.add(sample)
 
     _resolve_alerts(center, node, (ALERT_AGENT,), now)
-    if payload.cpu_percent >= 85:
+    # CPU 85% 持续 10 分钟；内存 90% 持续 5 分钟；样本不足时不告警。
+    if _sustained(center, node.id, NodeMetricSample.cpu_percent, 85, 10 * 60, 20):
         _upsert_alert(
             center,
             node,
             ALERT_CPU,
             "warning" if payload.cpu_percent < 95 else "critical",
-            f"CPU 使用率过高：{payload.cpu_percent:.1f}%",
+            f"CPU 使用率持续过高：{payload.cpu_percent:.1f}%",
             f"{payload.cpu_percent:.1f}%",
-            "85%",
+            "85% / 10分钟",
             now,
         )
-    else:
+    elif payload.cpu_percent < 85:
         _resolve_alerts(center, node, (ALERT_CPU,), now)
-    if payload.memory_percent >= 90:
+    if _sustained(center, node.id, NodeMetricSample.memory_percent, 90, 5 * 60, 10):
         _upsert_alert(
             center,
             node,
             ALERT_MEMORY,
             "critical",
-            f"内存使用率过高：{payload.memory_percent:.1f}%",
+            f"内存使用率持续过高：{payload.memory_percent:.1f}%",
             f"{payload.memory_percent:.1f}%",
-            "90%",
+            "90% / 5分钟",
             now,
         )
-    else:
+    elif payload.memory_percent < 90:
         _resolve_alerts(center, node, (ALERT_MEMORY,), now)
 
     max_disk = 0.0
@@ -600,10 +610,19 @@ def probe_node(center, node_id: int) -> dict[str, Any]:
     if all(item.ok for item in checks):
         _resolve_alerts(center, node, (ALERT_PUBLIC,), _now())
     else:
-        _upsert_alert(
-            center, node, ALERT_PUBLIC, "critical",
-            "公网访问探测失败", "failed", "HTTP 2xx/3xx", _now(),
-        )
+        recent = center.execute(
+            select(NodeCheck.ok).where(NodeCheck.node_id == node.id).order_by(NodeCheck.id.desc()).limit(24)
+        ).scalars().all()
+        failures = 0
+        for ok in recent:
+            if ok:
+                break
+            failures += 1
+        if failures >= 6:
+            _upsert_alert(
+                center, node, ALERT_PUBLIC, "critical",
+                "公网访问连续 3 次探测失败", "failed", "连续3次", _now(),
+            )
     center.commit()
     return {
         "node_id": str(node.id),
@@ -835,3 +854,30 @@ def cleanup_old_monitoring_data(center) -> dict[str, int]:
     center.commit()
     _last_cleanup_at = now
     return {"metrics": int(metrics or 0), "checks": int(checks or 0)}
+
+
+def list_checks(center, node_id: int, *, limit: int = 20) -> dict[str, Any]:
+    node = center.get(ServerNode, int(node_id))
+    if node is None:
+        raise AppError(ErrorCode.NOT_FOUND, "节点不存在")
+    rows = center.execute(
+        select(NodeCheck)
+        .where(NodeCheck.node_id == node.id)
+        .order_by(NodeCheck.id.desc())
+        .limit(max(1, min(limit, 100)))
+    ).scalars().all()
+    return {
+        "node_id": str(node.id),
+        "items": [
+            {
+                "target": row.target,
+                "url": row.url,
+                "ok": row.ok,
+                "status_code": row.status_code,
+                "latency_ms": row.latency_ms,
+                "error": row.error,
+                "checked_at": _iso(row.checked_at),
+            }
+            for row in rows
+        ],
+    }

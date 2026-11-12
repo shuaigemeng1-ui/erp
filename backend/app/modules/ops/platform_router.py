@@ -77,6 +77,16 @@ def node_metrics(
     return success(service.list_metrics(center, node_id, minutes=minutes))
 
 
+@router.get("/nodes/{node_id}/checks", summary="节点公网探测记录")
+def node_checks(
+    center: CenterDb,
+    _: PlatformAdmin,
+    node_id: int,
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict:
+    return success(service.list_checks(center, node_id, limit=limit))
+
+
 @router.get("/alerts", summary="告警列表")
 def list_alerts(
     center: CenterDb,

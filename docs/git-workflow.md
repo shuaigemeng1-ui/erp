@@ -39,7 +39,7 @@ git push origin main
 
 ```bash
 cd /opt/ventasync
-git remote -v          # origin -> https://github.com/shuaigemeng1-ui/erp.git
+git remote -v          # origin -> git@github.com:shuaigemeng1-ui/erp.git（SSH 部署密钥）
 git status             # 应为 clean；deploy/.env、frontend/dist 等按规则处理
 ```
 
@@ -72,6 +72,12 @@ git fetch --tags
 git checkout v1.0.0          # 或指定 commit
 bash deploy/scripts/git_update.sh
 ```
+
+> 服务器 remote 使用只读部署密钥（`/root/.ssh/erp_deploy`，已加入 GitHub Deploy keys）：
+> ```bash
+> git config core.sshCommand "ssh -i /root/.ssh/erp_deploy -o IdentitiesOnly=yes"
+> ```
+> HTTPS 拉取在国内网络下偶发 TLS 中断，SSH 更稳定；仓库改 private 也能继续拉取。
 
 > 注意：
 > * `deploy/.env` 不入库，`git checkout/pull` 不会覆盖服务器配置；

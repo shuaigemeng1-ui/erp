@@ -339,9 +339,20 @@ def list_platform_audit_logs(
     _: PlatformAdmin,
     pagination: PageParams = Depends(),
     action: str = Query(default="", max_length=128),
+    tenant_id: str | None = Query(default=None, description="按租户筛选"),
 ) -> dict:
+    tenant_id_value: int | None = None
+    if tenant_id:
+        try:
+            tenant_id_value = int(tenant_id)
+        except ValueError as exc:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "租户 ID 格式不正确") from exc
     data = platform_service.list_platform_audit_logs(
-        center, page=pagination.page, page_size=pagination.page_size, action=action
+        center,
+        page=pagination.page,
+        page_size=pagination.page_size,
+        action=action,
+        tenant_id=tenant_id_value,
     )
     return paged(data["items"], data["total"], data["page"], data["page_size"])
 

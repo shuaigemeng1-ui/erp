@@ -64,8 +64,11 @@ function openPayload(row: PlatformAuditLog): void {
       <el-table-column label="租户" width="110">
         <template #default="{ row }"><IdCopy :id="row.tenant_id" /></template>
       </el-table-column>
-      <el-table-column label="操作" width="110">
-        <template #default="{ row }"><IdCopy :id="row.actor_user_id" /></template>
+      <el-table-column label="操作人" width="150">
+        <template #default="{ row }">
+          <span v-if="row.actor_name">{{ row.actor_name }}</span>
+          <IdCopy v-else :id="row.actor_user_id" />
+        </template>
       </el-table-column>
       <el-table-column label="摘要" min-width="220" show-overflow-tooltip>
         <template #default="{ row }">{{ truncate(row.summary, 80) }}</template>

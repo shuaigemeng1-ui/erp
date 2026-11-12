@@ -1,7 +1,6 @@
 import type { Component } from 'vue'
 import {
   Box,
-  Coin,
   Document,
   Goods,
   Key,
@@ -43,7 +42,6 @@ export const tenantMenuItems: MenuItem[] = [
 /** 平台管理菜单：仅平台管理员可见（后端独立校验）。 */
 export const platformMenuItems: MenuItem[] = [
   { path: '/platform/tenants', title: '租户管理', icon: OfficeBuilding },
-  { path: '/platform/plans', title: '套餐管理', icon: Coin },
   { path: '/platform/system-config', title: '系统配置', icon: SetUp },
-  { path: '/platform/audit-logs', title: '平台审计', icon: Document },
+  { path: '/platform/logs', title: '日志', icon: Document },
 ]

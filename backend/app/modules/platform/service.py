@@ -66,12 +66,15 @@ def _safe_request_id() -> str:
         return ""
 
 
-def platform_audit_payload(row: PlatformAuditLog) -> dict[str, Any]:
+def platform_audit_payload(
+    row: PlatformAuditLog, *, actor_name: str | None = None
+) -> dict[str, Any]:
     from app.modules.identity.service import iso_utc
 
     return {
         "id": str(row.id),
         "actor_user_id": str(row.actor_user_id) if row.actor_user_id else None,
+        "actor_name": actor_name or "",
         "action": row.action,
         "action_label": PLATFORM_AUDIT_ACTIONS.get(row.action, ""),
         "resource_type": row.resource_type,
@@ -86,11 +89,20 @@ def platform_audit_payload(row: PlatformAuditLog) -> dict[str, Any]:
 
 
 def list_platform_audit_logs(
-    center: Session, *, page: int, page_size: int, action: str = ""
+    center: Session,
+    *,
+    page: int,
+    page_size: int,
+    action: str = "",
+    tenant_id: int | None = None,
 ) -> dict[str, Any]:
+    from app.modules.identity.models_center import User
+
     stmt = select(PlatformAuditLog)
     if action:
         stmt = stmt.where(PlatformAuditLog.action == action)
+    if tenant_id is not None:
+        stmt = stmt.where(PlatformAuditLog.tenant_id == tenant_id)
     total = int(center.execute(select(func.count()).select_from(stmt.subquery())).scalar_one())
     rows = (
         center.execute(
@@ -101,8 +113,23 @@ def list_platform_audit_logs(
         .scalars()
         .all()
     )
+    actor_ids = {row.actor_user_id for row in rows if row.actor_user_id}
+    actor_names: dict[int, str] = {}
+    if actor_ids:
+        users = center.execute(
+            select(User.id, User.display_name, User.email).where(User.id.in_(actor_ids))
+        ).all()
+        actor_names = {
+            int(user.id): (str(user.display_name or "").strip() or str(user.email or ""))
+            for user in users
+        }
     return {
-        "items": [platform_audit_payload(row) for row in rows],
+        "items": [
+            platform_audit_payload(
+                row, actor_name=actor_names.get(int(row.actor_user_id)) if row.actor_user_id else None
+            )
+            for row in rows
+        ],
         "total": total,
         "page": page,
         "page_size": page_size,

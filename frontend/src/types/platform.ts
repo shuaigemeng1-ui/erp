@@ -138,6 +138,7 @@ export interface CreateTenantResult {
 export interface PlatformAuditLog {
   id: EntityId
   actor_user_id?: EntityId | null
+  actor_name?: string | null
   action: string
   resource_type: string
   resource_id?: EntityId | null

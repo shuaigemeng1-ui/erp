@@ -131,9 +131,8 @@ export const routes: RouteRecordRaw[] = [
       },
       {
         path: 'platform/plans',
-        name: 'platform-plans',
-        component: () => import('@/views/platform/PlatformPlansView.vue'),
-        meta: { platform: true, title: '套餐管理' },
+        redirect: { name: 'platform-system-config', query: { tab: 'plans' } },
+        meta: { platform: true, title: '系统配置' },
       },
       {
         path: 'platform/system-config',
@@ -152,10 +151,15 @@ export const routes: RouteRecordRaw[] = [
         meta: { platform: true, title: '系统配置' },
       },
       {
+        path: 'platform/logs',
+        name: 'platform-logs',
+        component: () => import('@/views/platform/PlatformLogsView.vue'),
+        meta: { platform: true, title: '日志' },
+      },
+      {
         path: 'platform/audit-logs',
-        name: 'platform-audit-logs',
-        component: () => import('@/views/platform/PlatformAuditView.vue'),
-        meta: { platform: true, title: '平台审计' },
+        redirect: { name: 'platform-logs', query: { tab: 'audit' } },
+        meta: { platform: true, title: '日志' },
       },
     ],
   },

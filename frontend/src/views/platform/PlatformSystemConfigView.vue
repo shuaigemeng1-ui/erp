@@ -4,8 +4,9 @@ import { useRoute, useRouter } from 'vue-router'
 import PlatformSystemSettingsView from './PlatformSystemSettingsView.vue'
 import PlatformChannelAppsView from './PlatformChannelAppsView.vue'
 import PlatformEmailView from './PlatformEmailView.vue'
+import PlatformPlansView from './PlatformPlansView.vue'
 
-type ConfigTab = 'storage' | 'channels' | 'email'
+type ConfigTab = 'storage' | 'channels' | 'email' | 'plans'
 
 const route = useRoute()
 const router = useRouter()
@@ -13,13 +14,17 @@ const router = useRouter()
 function tabFromQuery(): ConfigTab {
   if (route.query.tab === 'channels') return 'channels'
   if (route.query.tab === 'email') return 'email'
+  if (route.query.tab === 'plans') return 'plans'
   return 'storage'
 }
 
 const activeTab = ref<ConfigTab>(tabFromQuery())
-const activeLabel = computed(() =>
-  activeTab.value === 'channels' ? '渠道应用' : activeTab.value === 'email' ? '邮件服务' : '对象存储',
-)
+const activeLabel = computed(() => {
+  if (activeTab.value === 'channels') return '渠道应用'
+  if (activeTab.value === 'email') return '邮件服务'
+  if (activeTab.value === 'plans') return '套餐管理'
+  return '对象存储'
+})
 
 watch(activeTab, (tab) => {
   if (route.query.tab === tab) return
@@ -54,6 +59,9 @@ watch(
       </el-tab-pane>
       <el-tab-pane label="邮件服务" name="email" lazy>
         <PlatformEmailView />
+      </el-tab-pane>
+      <el-tab-pane label="套餐管理" name="plans" lazy>
+        <PlatformPlansView />
       </el-tab-pane>
     </el-tabs>
   </div>

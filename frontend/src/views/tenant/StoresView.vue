@@ -20,6 +20,10 @@ const disconnectLoadingId = ref('')
 const canConnect = computed(() => tenant.has('store.connect'))
 
 const authorizeVisible = ref(false)
+const authorizeChannel = ref<'shopee' | 'tiktok'>('shopee')
+const authorizeChannelLabel = computed(() =>
+  authorizeChannel.value === 'tiktok' ? 'TikTok Shop' : 'Shopee',
+)
 
 async function load(): Promise<void> {
   loading.value = true
@@ -30,16 +34,26 @@ async function load(): Promise<void> {
   }
 }
 
-function openAuthorize(): void {
+function openAuthorize(channel: 'shopee' | 'tiktok' = 'shopee'): void {
+  authorizeChannel.value = channel
   authorizeVisible.value = true
+}
+
+function channelLabel(channel: string): string {
+  if (channel === 'tiktok') return 'TikTok Shop'
+  if (channel === 'shopee') return 'Shopee'
+  return channel
 }
 
 async function confirmAuthorize(): Promise<void> {
   authorizing.value = true
   try {
-    const result = await channelsApi.authorizeShopee(tid())
+    const result =
+      authorizeChannel.value === 'tiktok'
+        ? await channelsApi.authorizeTikTok(tid())
+        : await channelsApi.authorizeShopee(tid())
     authorizeVisible.value = false
-    ElMessage.success('授权会话已生成，即将跳转 Shopee 授权页')
+    ElMessage.success(`授权会话已生成，即将跳转 ${authorizeChannelLabel.value} 授权页`)
     // 同一标签页跳转，平台回调完成后 302 回店铺页
     window.location.href = result.auth_url
   } finally {
@@ -80,7 +94,10 @@ onMounted(load)
       <div class="toolbar-actions">
         <el-button :icon="Refresh" @click="load">刷新</el-button>
       </div>
-      <el-button v-if="canConnect" type="primary" @click="openAuthorize">授权 Shopee 店铺</el-button>
+      <el-button v-if="canConnect" type="primary" @click="openAuthorize('tiktok')">
+        授权 TikTok Shop
+      </el-button>
+      <el-button v-if="canConnect" @click="openAuthorize('shopee')">授权 Shopee 店铺</el-button>
     </div>
 
     <el-table v-loading="loading" :data="stores" border size="small" row-key="id">
@@ -89,7 +106,7 @@ onMounted(load)
       </el-table-column>
       <el-table-column prop="name" label="店铺名称" min-width="160" />
       <el-table-column label="渠道" width="100">
-        <template #default="{ row }">{{ row.channel }}</template>
+        <template #default="{ row }">{{ channelLabel(row.channel) }}</template>
       </el-table-column>
       <el-table-column label="店铺 ID" width="150">
         <template #default="{ row }"><span class="mono">{{ textOrDash(row.external_store_id) }}</span></template>
@@ -131,11 +148,21 @@ onMounted(load)
     </el-table>
   </el-card>
 
-  <el-dialog v-model="authorizeVisible" title="授权 Shopee 店铺" width="460px" destroy-on-close>
+  <el-dialog
+    v-model="authorizeVisible"
+    :title="`授权 ${authorizeChannelLabel} 店铺`"
+    width="460px"
+    destroy-on-close
+  >
     <el-alert type="info" :closable="false" show-icon>
-      <p>将跳转到 Shopee 授权页，授权完成后自动回到本页。授权会话一次性有效。</p>
+      <p>将跳转到 {{ authorizeChannelLabel }} 授权页，授权完成后自动回到本页。授权会话一次性有效。</p>
       <p class="authorize-hint">
-        若提示「平台 Shopee 应用未配置」，请先在 平台管理 → 渠道应用 填写 Partner ID / Partner Key / Secret。
+        <template v-if="authorizeChannel === 'tiktok'">
+          若提示「平台 TikTok Shop 应用未配置」，请先在 平台管理 → 渠道应用（TikTok Shop）填写 App Key / App Secret，并将回调地址加入 TikTok 应用白名单。
+        </template>
+        <template v-else>
+          若提示「平台 Shopee 应用未配置」，请先在 平台管理 → 渠道应用 填写 Partner ID / Partner Key / Secret。
+        </template>
       </p>
     </el-alert>
     <template #footer>

@@ -332,12 +332,16 @@ def save_channel_app(
     partner_secret: str | None,
     redirect_url: str | None,
     actor_user_id: int | None,
+    app_key: str | None = None,
+    app_secret: str | None = None,
 ) -> dict[str, Any]:
     """保存平台渠道应用凭据：内部使用 core.security 加密，密钥禁止回显。"""
+    from app.modules.channels.constants import CHANNEL_TIKTOK
+
     channel_service = _channel_service()
-    normalized_channel = (channel or "").strip()
+    normalized_channel = (channel or "").strip().lower()
     normalized_environment = _normalize_environment(environment)
-    if partner_id is None:
+    if normalized_channel != CHANNEL_TIKTOK and partner_id is None:
         raise AppError(ErrorCode.VALIDATION_ERROR, "partner_id 不能为空")
     config = channel_service.save_channel_app(
         center,
@@ -346,6 +350,8 @@ def save_channel_app(
         partner_id=partner_id,
         partner_key=partner_key,
         partner_secret=partner_secret,
+        app_key=app_key,
+        app_secret=app_secret,
         redirect_url=redirect_url,
         actor_id=actor_user_id,
     )
@@ -360,9 +366,11 @@ def save_channel_app(
             "channel": normalized_channel,
             "environment": normalized_environment,
             "partner_id": partner_id,
+            "app_key": config.app_key or None,
             "redirect_url": redirect_url,
             "partner_key_changed": partner_key is not None,
             "partner_secret_changed": partner_secret is not None,
+            "app_secret_changed": app_secret is not None,
         },
     )
     center.commit()

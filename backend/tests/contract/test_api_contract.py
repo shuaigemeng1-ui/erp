@@ -76,6 +76,7 @@ CRITICAL_ROUTES: tuple[tuple[str, str], ...] = (
     ("GET", "/tenants/{tenant_id}/inventory/stock-places"),
     ("GET", "/tenants/{tenant_id}/stores"),
     ("POST", "/tenants/{tenant_id}/stores/shopee/authorize"),
+    ("POST", "/tenants/{tenant_id}/stores/tiktok/authorize"),
     ("POST", "/tenants/{tenant_id}/stores/{store_id}/disconnect"),
     ("GET", "/tenants/{tenant_id}/listings"),
     ("POST", "/tenants/{tenant_id}/listings/sync"),
@@ -92,6 +93,7 @@ CRITICAL_ROUTES: tuple[tuple[str, str], ...] = (
     ("GET", "/tenants/{tenant_id}/tasks/{task_id}"),
     ("GET", "/tenants/{tenant_id}/audit-logs"),
     ("GET", "/integrations/shopee/oauth/callback"),
+    ("GET", "/integrations/tiktok/oauth/callback"),
     ("POST", "/integrations/shopee/webhook"),
 )
 

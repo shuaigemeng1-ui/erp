@@ -35,6 +35,7 @@ from app.core.security import decrypt_secret, encrypt_secret, utc_now
 from app.modules.channels import repository as repo
 from app.modules.channels.constants import (
     CHANNEL_SHOPEE,
+    CHANNEL_TIKTOK,
     CREDENTIAL_STATUS_ACTIVE,
     CREDENTIAL_STATUS_INVALID,
     CREDENTIAL_STATUS_REVOKED,
@@ -48,6 +49,7 @@ from app.modules.channels.constants import (
     MAPPING_SOURCE_MANUAL,
     NO_EXTERNAL_SKU,
     STORE_STATUS_CONNECTED,
+    SUPPORTED_CHANNELS,
     STORE_STATUS_DISCONNECTED,
     STORE_STATUS_REAUTH_REQUIRED,
     TOKEN_REFRESH_SKEW_SECONDS,
@@ -81,6 +83,7 @@ logger = logging.getLogger("ventasync.channels")
 
 # 授权回调默认路径（平台管理员未显式配置 redirect_url 时使用）
 DEFAULT_CALLBACK_PATH = f"{settings.api_prefix}/integrations/shopee/oauth/callback"
+TIKTOK_CALLBACK_PATH = f"{settings.api_prefix}/integrations/tiktok/oauth/callback"
 # 商品同步分页安全上限（防止异常平台数据造成死循环）
 MAX_ITEM_PAGES = 40
 ITEM_PAGE_SIZE = 50
@@ -127,10 +130,17 @@ class ChannelAppConfig:
     redirect_url: str
     status: str
     updated_at: datetime | None = None
+    # TikTok Shop 使用 App Key / App Secret；Shopee 使用 partner_* 字段
+    app_key: str = ""
+    app_secret: str = ""
 
     @property
     def configured(self) -> bool:
-        return bool(self.partner_id and self.partner_key and self.status == "active")
+        if self.status != "active":
+            return False
+        if self.channel == CHANNEL_TIKTOK:
+            return bool(self.app_key and self.app_secret)
+        return bool(self.partner_id and self.partner_key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,7 +277,7 @@ def ensure_tenant_active(center: Session, tenant_id: int) -> None:
 def _require_channel_environment(channel: str, environment: str) -> tuple[str, str]:
     channel_value = (channel or "").strip().lower()
     environment_value = normalize_environment(environment)
-    if channel_value != CHANNEL_SHOPEE:
+    if channel_value not in SUPPORTED_CHANNELS:
         raise AppError(ErrorCode.VALIDATION_ERROR, f"不支持的渠道：{channel}")
     if environment_value is None:
         raise AppError(ErrorCode.VALIDATION_ERROR, "环境必须是 production 或 test")
@@ -288,6 +298,12 @@ def _config_from_row(row: PlatformChannelApp) -> ChannelAppConfig:
             partner_secret = decrypt_secret(row.partner_secret_cipher)
         except Exception:  # noqa: BLE001
             logger.warning("渠道应用 partner_secret 解密失败：%s/%s", row.channel, row.environment)
+    app_secret = ""
+    if row.app_secret_cipher:
+        try:
+            app_secret = decrypt_secret(row.app_secret_cipher)
+        except Exception:  # noqa: BLE001
+            logger.warning("渠道应用 app_secret 解密失败：%s/%s", row.channel, row.environment)
     return ChannelAppConfig(
         channel=row.channel,
         environment=row.environment,
@@ -297,6 +313,8 @@ def _config_from_row(row: PlatformChannelApp) -> ChannelAppConfig:
         redirect_url=row.redirect_url or "",
         status=row.status or "active",
         updated_at=row.updated_at,
+        app_key=row.app_key or "",
+        app_secret=app_secret,
     )
 
 
@@ -313,15 +331,19 @@ def load_channel_app(
     return _config_from_row(row)
 
 
-def channel_app_public_view(config: ChannelAppConfig | None) -> dict[str, Any]:
+def channel_app_public_view(
+    config: ChannelAppConfig | None, *, channel: str = CHANNEL_SHOPEE
+) -> dict[str, Any]:
     """平台管理页展示用结构：只说明密钥是否已配置，绝不回显明文。"""
     if config is None:
         return {
-            "channel": CHANNEL_SHOPEE,
+            "channel": channel,
             "environment": "",
             "partner_id": None,
+            "app_key": "",
             "has_partner_key": False,
             "has_partner_secret": False,
+            "has_app_secret": False,
             "redirect_url": "",
             "status": "unconfigured",
             "configured": False,
@@ -331,8 +353,10 @@ def channel_app_public_view(config: ChannelAppConfig | None) -> dict[str, Any]:
         "channel": config.channel,
         "environment": config.environment,
         "partner_id": str(config.partner_id) if config.partner_id is not None else None,
+        "app_key": config.app_key,
         "has_partner_key": bool(config.partner_key),
         "has_partner_secret": bool(config.partner_secret),
+        "has_app_secret": bool(config.app_secret),
         "redirect_url": config.redirect_url,
         "status": config.status,
         "configured": config.configured,
@@ -345,19 +369,20 @@ def save_channel_app(
     channel: str,
     environment: str,
     *,
-    partner_id: int,
+    partner_id: int | None = None,
     partner_key: str | None = None,
     partner_secret: str | None = None,
+    app_key: str | None = None,
+    app_secret: str | None = None,
     redirect_url: str | None = None,
     actor_id: int | None = None,
 ) -> ChannelAppConfig:
     """保存平台渠道应用配置（密钥 AES 加密；``None`` 表示不修改，空串表示清空）。
 
-    不提交事务，由调用方（platform 路由）在中心库事务内 commit。
+    Shopee 使用 partner_id/partner_key/partner_secret；TikTok Shop 使用
+    app_key/app_secret（App Secret 加密入库）。不提交事务，由调用方 commit。
     """
     channel_value, environment_value = _require_channel_environment(channel, environment)
-    if int(partner_id) <= 0:
-        raise AppError(ErrorCode.VALIDATION_ERROR, "partner_id 必须为正整数")
     row = repo.get_channel_app(center, channel_value, environment_value)
     now = utc_now()
     if row is None:
@@ -369,33 +394,58 @@ def save_channel_app(
             updated_at=now,
         )
         center.add(row)
-    row.partner_id = int(partner_id)
+
+    if channel_value == CHANNEL_TIKTOK:
+        next_app_key = (app_key if app_key is not None else (row.app_key or "")).strip()
+        if not next_app_key:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "TikTok App Key 不能为空")
+        next_secret_set = bool(app_secret is not None and app_secret.strip()) or bool(
+            row.app_secret_cipher
+        )
+        if not next_secret_set:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "TikTok App Secret 不能为空")
+        row.app_key = next_app_key
+        if app_secret is not None:
+            row.app_secret_cipher = (
+                encrypt_secret(app_secret.strip()) if app_secret.strip() else ""
+            )
+    else:
+        if partner_id is None or int(partner_id) <= 0:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "partner_id 必须为正整数")
+        row.partner_id = int(partner_id)
+        if partner_key is not None:
+            row.partner_key_cipher = (
+                encrypt_secret(partner_key.strip()) if partner_key.strip() else ""
+            )
+        if partner_secret is not None:
+            row.partner_secret_cipher = (
+                encrypt_secret(partner_secret.strip()) if partner_secret.strip() else ""
+            )
+
     row.status = "active"
     row.updated_at = now
-    if partner_key is not None:
-        row.partner_key_cipher = encrypt_secret(partner_key.strip()) if partner_key.strip() else ""
-    if partner_secret is not None:
-        row.partner_secret_cipher = (
-            encrypt_secret(partner_secret.strip()) if partner_secret.strip() else ""
-        )
     if redirect_url is not None:
         row.redirect_url = redirect_url.strip() or None
     center.flush()
     logger.info(
-        "平台渠道应用已保存：channel=%s environment=%s partner_id=%s operator=%s",
+        "平台渠道应用已保存：channel=%s environment=%s app_key=%s operator=%s",
         channel_value,
         environment_value,
-        row.partner_id,
+        row.app_key or row.partner_id,
         actor_id,
     )
     return _config_from_row(row)
 
 
-def require_channel_app(center: Session, environment: str) -> ChannelAppConfig:
+def require_channel_app(
+    center: Session, environment: str, *, channel: str = CHANNEL_SHOPEE
+) -> ChannelAppConfig:
     """读取并校验渠道应用可用；未配置抛 ``CHANNEL_APP_NOT_CONFIGURED``。"""
-    config = load_channel_app(center, CHANNEL_SHOPEE, environment)
+    channel_value = (channel or "").strip().lower()
+    config = load_channel_app(center, channel_value, environment)
     if config is None or not config.configured:
-        raise AppError(ErrorCode.CHANNEL_APP_NOT_CONFIGURED, "平台 Shopee 应用未配置")
+        label = "TikTok Shop" if channel_value == CHANNEL_TIKTOK else "Shopee"
+        raise AppError(ErrorCode.CHANNEL_APP_NOT_CONFIGURED, f"平台 {label} 应用未配置")
     return config
 
 
@@ -474,8 +524,13 @@ def list_store_summaries(
 
 
 # --------------------------------------------------------------------------- 授权 / 断开
-def default_callback_url() -> str:
+def default_callback_url(*, channel: str = CHANNEL_SHOPEE) -> str:
     """默认授权回调地址（平台应用未显式配置 redirect_url 时使用）。"""
+    if channel == CHANNEL_TIKTOK:
+        if settings.tiktok_auth_redirect_url:
+            return settings.tiktok_auth_redirect_url
+        origin = (settings.app_origin or "").rstrip("/")
+        return f"{origin}{TIKTOK_CALLBACK_PATH}"
     if settings.shopee_auth_redirect_url:
         return settings.shopee_auth_redirect_url
     origin = (settings.app_origin or "").rstrip("/")
@@ -529,6 +584,10 @@ def start_shopee_authorization(
     }
 
 
+def _channel_label(channel: str) -> str:
+    return "TikTok Shop" if channel == CHANNEL_TIKTOK else "Shopee"
+
+
 def upsert_store_from_authorization(
     db: Session,
     *,
@@ -543,6 +602,7 @@ def upsert_store_from_authorization(
     access_token_expires_at: datetime | None,
     refresh_token_expires_at: datetime | None,
     member_id: int | None = None,
+    shop_cipher: str | None = None,
 ) -> int:
     """授权成功后写入店铺与加密凭据；重新授权更新原店铺，不重复创建。"""
     now = utc_now()
@@ -555,7 +615,7 @@ def upsert_store_from_authorization(
             tenant_id=tenant_id,
             channel=channel,
             environment=environment,
-            name=store_name or f"Shopee 店铺 {external_id}",
+            name=store_name or f"{_channel_label(channel)} 店铺 {external_id}",
             external_store_id=external_id,
             region=region,
             timezone="UTC",
@@ -592,6 +652,8 @@ def upsert_store_from_authorization(
     credential.refreshed_at = now
     credential.last_error = None
     credential.updated_at = now
+    if shop_cipher is not None:
+        credential.shop_cipher_cipher = encrypt_secret(shop_cipher or "")
     db.flush()
     logger.info(
         "店铺授权写入：tenant=%s store=%s channel=%s environment=%s operator=%s",

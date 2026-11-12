@@ -97,6 +97,13 @@ class Settings(BaseSettings):
     shopee_http_timeout_seconds: float = 20.0
     shopee_http_max_retries: int = 3
 
+    # ------------------------------------------------------------------ TikTok Shop
+    tiktok_auth_base: str = "https://auth.tiktok-shops.com"
+    tiktok_api_base: str = "https://open-api.tiktokglobalshop.com"
+    tiktok_auth_redirect_url: str = ""
+    tiktok_http_timeout_seconds: float = 20.0
+    tiktok_http_max_retries: int = 3
+
     # ------------------------------------------------------------------ 平台初始化
     # 仅由显式初始化命令使用，不开放公共管理员注册
     bootstrap_platform_admin_email: str = ""

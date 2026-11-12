@@ -75,7 +75,9 @@ class ChannelAppPutRequest(BaseModel):
     密钥只会加密入库，不会在响应中回显。
     """
 
-    partner_id: int | None = Field(default=None, gt=0, description="平台 Partner ID")
-    partner_key: str | None = Field(default=None, max_length=255, description="Partner Key（不回显）")
-    partner_secret: str | None = Field(default=None, max_length=255, description="Partner Secret（不回显）")
+    partner_id: int | None = Field(default=None, gt=0, description="Shopee Partner ID")
+    partner_key: str | None = Field(default=None, max_length=255, description="Shopee Partner Key（不回显）")
+    partner_secret: str | None = Field(default=None, max_length=255, description="Shopee Partner Secret（不回显）")
+    app_key: str | None = Field(default=None, max_length=128, description="TikTok Shop App Key")
+    app_secret: str | None = Field(default=None, max_length=255, description="TikTok Shop App Secret（不回显）")
     redirect_url: str | None = Field(default=None, max_length=512, description="授权回调地址")

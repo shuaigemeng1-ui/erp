@@ -58,13 +58,13 @@ cd "${DEPLOY_DIR}"
 log "构建镜像..."
 "${COMPOSE[@]}" build
 
-log "滚动启动服务..."
-"${COMPOSE[@]}" up -d
-
 if [[ "${SKIP_MIGRATE}" -eq 0 ]]; then
-    log "执行迁移发布任务..."
+    log "执行迁移发布任务（先升级中心库 / 租户库 schema）..."
     "${COMPOSE[@]}" --profile release run --rm migrate
 fi
+
+log "滚动启动服务..."
+"${COMPOSE[@]}" up -d
 
 log "当前状态："
 "${COMPOSE[@]}" ps

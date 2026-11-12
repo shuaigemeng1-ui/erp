@@ -8,7 +8,8 @@
 from __future__ import annotations
 
 CHANNEL_SHOPEE = "shopee"
-SUPPORTED_CHANNELS: frozenset[str] = frozenset({CHANNEL_SHOPEE})
+CHANNEL_TIKTOK = "tiktok"
+SUPPORTED_CHANNELS: frozenset[str] = frozenset({CHANNEL_SHOPEE, CHANNEL_TIKTOK})
 
 ENV_PRODUCTION = "production"
 ENV_TEST = "test"

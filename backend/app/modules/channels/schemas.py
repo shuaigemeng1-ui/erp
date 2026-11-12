@@ -228,3 +228,7 @@ def authorize_payload(item: dict[str, Any]) -> dict[str, Any]:
         "expires_at": utc_iso(item.get("expires_at")) or "",
         "environment": item.get("environment") or "",
     }
+
+
+class TikTokAuthorizeIn(ShopeeAuthorizeIn):
+    """发起 TikTok Shop 店铺授权（字段与 Shopee 一致：environment/redirect_path）。"""

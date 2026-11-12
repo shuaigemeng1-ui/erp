@@ -89,6 +89,7 @@
 | --- | --- | --- | --- |
 | GET | `/tenants/{tenant_id}/stores` | `store.read` | 店铺列表（凭据只返回状态与过期时间） |
 | POST | `/tenants/{tenant_id}/stores/shopee/authorize` | `store.connect` | 生成一次性授权会话 → `{auth_url, expires_at}` |
+| POST | `/tenants/{tenant_id}/stores/tiktok/authorize` | 登录 + `store.connect` | `{environment?, redirect_path?}`；返回 TikTok Shop 授权地址 `auth_url` |
 | POST | `/tenants/{tenant_id}/stores/{store_id}/disconnect` | `store.connect` | 断开授权（停止依赖该凭据的任务） |
 | GET | `/tenants/{tenant_id}/listings?store_id&mapping_status&page` | `channel.listing.read` | 平台商品与映射状态 |
 | POST | `/tenants/{tenant_id}/listings/sync` | `channel.listing.map` | `{store_id}` → 202 `{task_id}` |

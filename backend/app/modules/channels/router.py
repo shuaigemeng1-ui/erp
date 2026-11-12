@@ -46,6 +46,7 @@ from app.db.session import center_session, tenant_session
 from app.modules.access.service import AccessSnapshot
 from app.modules.channels import schemas, service
 from app.modules.channels.constants import (
+    CHANNEL_TIKTOK,
     LINK_STATUSES,
     LISTING_FILTER_UNMAPPED,
     STORE_STATUS_CONNECTED,
@@ -54,11 +55,13 @@ from app.modules.channels.constants import (
 from app.modules.channels.models_tenant import ChannelListing
 from app.modules.channels.shopee import oauth
 from app.modules.channels.shopee.oauth import callback_error_redirect, exchange_authorization_code
+from app.modules.channels.tiktok import oauth as tiktok_oauth
 
 logger = logging.getLogger("ventasync.channels.router")
 
 router = APIRouter(tags=["channels"])
 integration_router = APIRouter(prefix="/integrations/shopee", tags=["shopee"])
+tiktok_integration_router = APIRouter(prefix="/integrations/tiktok", tags=["tiktok"])
 
 _VALID_MAPPING_FILTERS = frozenset({LISTING_FILTER_UNMAPPED}) | LINK_STATUSES
 
@@ -456,3 +459,88 @@ def _handle_webhook(raw_body: bytes, signature: str, request_url: str) -> dict[s
             "tenant_active": tenant_status == "active",
         }
     )
+
+# --------------------------------------------------------------------------- TikTok Shop
+@router.post("/tenants/{tenant_id}/stores/tiktok/authorize")
+def authorize_tiktok_store(
+    request: Request,
+    body: schemas.TikTokAuthorizeIn | None = None,
+    tenant_id: int = Path(ge=1),
+    ctx: TenantContext = Depends(tenant_context),
+    db: Session = Depends(get_tenant_db),
+    center: Session = Depends(get_center_db),
+    _: AccessSnapshot = Depends(require_permission(Permission.STORE_CONNECT.value)),
+) -> dict[str, Any]:
+    """发起 TikTok Shop 店铺授权：生成一次性授权会话并返回 auth_url。"""
+    result = tiktok_oauth.start_authorization(
+        center,
+        db,
+        tenant_id=tenant_id,
+        member_id=ctx.member_id,
+        environment=body.environment if body else None,
+        redirect_path=body.redirect_path if body else None,
+        actor_id=ctx.user_id,
+        request_id=ctx.request_id,
+        ip=_client_ip(request),
+    )
+    return success(schemas.authorize_payload(result))
+
+
+@tiktok_integration_router.get("/oauth/callback")
+def tiktok_oauth_callback(
+    code: str | None = Query(default=None, description="TikTok 授权码"),
+    state: str | None = Query(default=None, description="一次性授权会话 state"),
+    error: str | None = Query(default=None, description="TikTok 返回的错误码"),
+) -> RedirectResponse:
+    """TikTok Shop 授权回调：校验一次性会话后换 token、读取店铺并绑定，302 回前端。"""
+    redirect_path: str | None = None
+    try:
+        session = tiktok_oauth.consume_authorization_session(state)
+        redirect_path = str(session.get("redirect_path") or "")
+        if error:
+            raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, f"平台拒绝授权：{error}")
+        code_value = (code or "").strip()
+        if not code_value:
+            raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "缺少授权码 code")
+        environment = str(session["environment"])
+        tenant_id = int(session["tenant_id"])
+        with center_session() as center:
+            config = service.require_channel_app(center, environment, channel=CHANNEL_TIKTOK)
+            service.ensure_tenant_active(center, tenant_id)
+            route = _load_tenant_route(center, tenant_id)
+            app_key = config.app_key
+            app_secret = config.app_secret
+        # 外部 HTTP 请求在数据库事务之外执行
+        exchanged = tiktok_oauth.exchange_code(app_key, app_secret, code_value)
+        with center_session() as center, tenant_session(route) as db:
+            result = tiktok_oauth.complete_authorization(
+                center,
+                db,
+                session=session,
+                token=exchanged["token"],
+                shop=exchanged["shop"],
+            )
+        return RedirectResponse(
+            tiktok_oauth.frontend_redirect_url(
+                str(result.get("redirect_path") or redirect_path),
+                params={"tiktok": "connected"},
+            ),
+            status_code=302,
+        )
+    except AppError as exc:
+        logger.warning("TikTok 授权回调失败：%s %s", exc.code.value, exc.message)
+        return RedirectResponse(
+            tiktok_oauth.callback_error_redirect(
+                redirect_path=redirect_path, reason=exc.code.value
+            ),
+            status_code=302,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("TikTok 授权回调异常")
+        return RedirectResponse(
+            tiktok_oauth.callback_error_redirect(
+                redirect_path=redirect_path, reason="internal_error"
+            ),
+            status_code=302,
+        )
+

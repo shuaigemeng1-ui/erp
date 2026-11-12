@@ -39,7 +39,13 @@ class PlatformChannelApp(IdMixin, TimestampMixin, CenterBase):
         String(16), nullable=False, comment="应用环境：production/test"
     )
     partner_id: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, comment="平台合作方ID（Partner ID）"
+        BigInteger, nullable=True, comment="平台合作方ID（Shopee Partner ID）"
+    )
+    app_key: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, comment="应用 Key（TikTok Shop App Key；Shopee 用 partner_id）"
+    )
+    app_secret_cipher: Mapped[str | None] = mapped_column(
+        String(1024), nullable=True, comment="应用 Secret 密文（TikTok Shop App Secret）"
     )
     partner_key_cipher: Mapped[str | None] = mapped_column(
         String(1024), nullable=True, comment="合作方密钥密文（用于请求签名，禁止明文）"

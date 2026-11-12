@@ -138,6 +138,13 @@ class StoreCredential(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
     refresh_token_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True, comment="刷新令牌过期时间（UTC）"
     )
+    shop_cipher_cipher: Mapped[str] = mapped_column(
+        String(2048),
+        nullable=False,
+        default="",
+        server_default=text("''"),
+        comment="店铺 cipher 密文（TikTok Shop shop_cipher；Shopee 为空）",
+    )
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,

@@ -6,48 +6,21 @@ import { tenantApi } from '@/api/tenant'
 import { useTenantStore } from '@/stores/tenant'
 import IdCopy from '@/components/IdCopy.vue'
 import { textOrDash } from '@/utils/format'
-import type { PermissionItem, Role } from '@/types'
+import type { PermissionGroup, Role } from '@/types'
 
 const tenant = useTenantStore()
 const tid = (): string => tenant.requireTenantId()
 
 const loading = ref(false)
 const roles = ref<Role[]>([])
-const permissions = ref<PermissionItem[]>([])
+const permissionGroups = ref<PermissionGroup[]>([])
+const catalogError = ref(false)
 
-const groupLabels: Record<string, string> = {
-  catalog: '商品',
-  inventory: '库存',
-  store: '店铺',
-  stores: '店铺',
-  channel: '渠道商品',
-  order: '订单',
-  orders: '订单',
-  stock: '库存推送',
-  member: '成员',
-  members: '成员',
-  role: '角色权限',
-  roles: '角色权限',
-  audit: '审计',
-  task: '任务',
-  tasks: '任务',
-  tenant: '租户设置',
-}
-
-const permissionGroups = computed(() => {
-  const grouped = new Map<string, PermissionItem[]>()
-  for (const item of permissions.value) {
-    const key = item.group ?? item.code.split('.')[0] ?? '其他'
-    const list = grouped.get(key) ?? []
-    list.push(item)
-    grouped.set(key, list)
-  }
-  return [...grouped.entries()].map(([group, items]) => ({
-    group,
-    label: groupLabels[group] ?? group,
-    items,
-  }))
-})
+const presetRoleOptions = computed(() => roles.value.filter((role) => role.is_system))
+const customRoleOptions = computed(() => roles.value.filter((role) => !role.is_system))
+const permissionTotal = computed(() =>
+  permissionGroups.value.reduce((total, group) => total + group.items.length, 0),
+)
 
 const dialogVisible = ref(false)
 const submitting = ref(false)
@@ -71,9 +44,19 @@ const rules: FormRules = {
 async function load(): Promise<void> {
   loading.value = true
   try {
-    const [roleList, permissionList] = await Promise.all([tenantApi.roles(tid()), tenantApi.permissions(tid())])
-    roles.value = roleList
-    permissions.value = permissionList
+    // 两个目录互相独立：任一请求失败都不应让另一个列表变空。
+    const [roleResult, catalogueResult] = await Promise.allSettled([
+      tenantApi.roles(tid()),
+      tenantApi.permissionGroups(tid()),
+    ])
+    if (roleResult.status === 'fulfilled') roles.value = roleResult.value
+    if (catalogueResult.status === 'fulfilled') {
+      permissionGroups.value = catalogueResult.value
+      catalogError.value = permissionGroups.value.length === 0
+    } else {
+      permissionGroups.value = []
+      catalogError.value = true
+    }
   } finally {
     loading.value = false
   }
@@ -219,29 +202,64 @@ onMounted(load)
         <el-input v-model="form.name" placeholder="如 订单运营" />
       </el-form-item>
       <el-form-item v-if="!editingRole" label="复制自">
-        <el-select v-model="form.copy_from_role_id" clearable placeholder="可选：从现有角色复制权限" style="width: 100%" @change="onCopyFromChange">
-          :label="`${role.name}（${role.code}）`"
+        <el-select
+          v-model="form.copy_from_role_id"
+          clearable
+          filterable
+          placeholder="可选：从现有角色复制权限"
+          style="width: 100%"
+          @change="onCopyFromChange"
+        >
+          <el-option-group v-if="presetRoleOptions.length > 0" label="预置角色">
+            <el-option
+              v-for="role in presetRoleOptions"
+              :key="role.id"
+              :label="`${role.name}（${role.code}）`"
+              :value="role.id"
+            />
+          </el-option-group>
+          <el-option-group v-if="customRoleOptions.length > 0" label="自定义角色">
+            <el-option
+              v-for="role in customRoleOptions"
+              :key="role.id"
+              :label="`${role.name}（${role.code}）`"
+              :value="role.id"
+            />
+          </el-option-group>
         </el-select>
+        <div class="text-muted" style="font-size: 12px; line-height: 1.6">
+          选择后会填充该角色的权限，仍可再手动调整。
+        </div>
       </el-form-item>
       <el-form-item label="描述">
         <el-input v-model="form.description" type="textarea" :rows="2" />
       </el-form-item>
       <el-form-item label="权限">
-        <div style="max-height: 46vh; overflow: auto; width: 100%">
-          <div v-for="group in permissionGroups" :key="group.group" style="margin-bottom: 10px">
-            <div style="font-weight: 600; margin-bottom: 4px">{{ group.label }}</div>
-            <el-checkbox-group v-model="form.permissions">
-              <el-checkbox
-                v-for="item in group.items"
-                :key="item.code"
-                :value="item.code"
-                style="width: 300px"
-              >
-                {{ item.name }} <span class="text-muted mono">{{ item.code }}</span>
-              </el-checkbox>
-            </el-checkbox-group>
+        <div style="width: 100%">
+          <div class="text-muted" style="font-size: 12px; margin-bottom: 6px">
+            已选 {{ form.permissions.length }} / {{ permissionTotal }} 项
           </div>
-          <span v-if="permissionGroups.length === 0" class="text-muted">未获取到权限目录</span>
+          <div style="max-height: 44vh; overflow: auto; width: 100%">
+            <div v-for="group in permissionGroups" :key="group.code" style="margin-bottom: 10px">
+              <div style="font-weight: 600; margin-bottom: 4px">
+                {{ group.name }}
+                <span class="text-muted" style="font-weight: 400; font-size: 12px">（{{ group.items.length }}）</span>
+              </div>
+              <el-checkbox-group v-model="form.permissions">
+                <el-checkbox
+                  v-for="item in group.items"
+                  :key="item.code"
+                  :value="item.code"
+                  style="width: 300px"
+                >
+                  {{ item.name }} <span class="text-muted mono">{{ item.code }}</span>
+                </el-checkbox>
+              </el-checkbox-group>
+            </div>
+            <span v-if="permissionGroups.length === 0" class="text-muted">
+              {{ catalogError ? '权限目录加载失败，请点击「刷新」重试' : '未获取到权限目录' }}
+            </span>
+          </div>
         </div>
       </el-form-item>
     </el-form>

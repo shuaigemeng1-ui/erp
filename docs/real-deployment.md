@@ -280,3 +280,22 @@ caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl re
 > 登录账号：平台管理员 `admin@ventasync.local`（密码在服务器 `/root/ventasync-credentials.txt`）；
 > 演示租户负责人 `owner.demo2@example.com`。生产使用前请按需修改密码。
 
+## 10. TikTok Shop 接入（Phase 1，2026-11-12）
+
+原 `ventasync` 项目的 TikTok Shop 扩展为 PHP/Laravel 实现，新 ERP 按其协议移植了 Phase 1：
+
+| 项 | 说明 |
+| --- | --- |
+| OAuth | `https://auth.tiktok-shops.com/oauth/authorize`，token 换取/刷新 `/api/v2/token/get`、`/api/v2/token/refresh` |
+| Open API | `https://open-api.tiktokglobalshop.com`，HMAC-SHA256 签名（app_secret + path + 排序参数 + body + app_secret） |
+| 回调地址 | `https://erp.alienyan.store/api/v1/integrations/tiktok/oauth/callback`（需加入 TikTok 应用白名单） |
+| 店铺绑定 | 授权后读取 `/authorization/202309/shops`，保存店铺、加密 access/refresh token 与 `shop_cipher` |
+| 平台配置 | 平台管理 → 渠道应用 → TikTok Shop，填写 App Key / App Secret（密文入库、不回显） |
+| 迁移 | 中心库 `center_0003`（app_key/app_secret_cipher）；租户库 `tenant_0005`（store_credentials.shop_cipher_cipher） |
+| 已验证 | 平台保存配置 200、发起授权返回 auth URL、无效 state 302 回前端错误、两租户迁移到 `tenant_0005` |
+| Phase 2 | 订单拉取/落库、库存推送、商品映射；之后再补商品发布、退货、结算 |
+
+> 新 ERP 与旧应用是两套独立系统：旧应用的 TikTok App Key/Secret/Token 存在旧库中，
+> 本地代码没有 `.env` 与数据库，无法直接复用；需要在新 ERP 渠道应用中填写 TikTok 应用凭据，
+> 或在 TikTok 后台新建应用后重新授权。
+

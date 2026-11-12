@@ -1,4 +1,5 @@
 import { http, requestPage } from './http'
+import { flattenPermissionGroups, normalizePermissionGroups } from './permissionCatalog'
 import { segment, tenantPath } from './paths'
 import type {
   AuditLog,
@@ -27,32 +28,6 @@ export interface MemberQuery extends PageParams {
 export interface AuditQuery extends PageParams {
   action?: string
   q?: string
-}
-
-interface PermissionCatalogResponse {
-  groups?: PermissionGroup[]
-  items?: PermissionItem[]
-  permissions?: PermissionItem[]
-}
-
-function normalizePermissions(raw: PermissionItem[] | PermissionGroup[] | PermissionCatalogResponse | null): PermissionItem[] {
-  if (!raw) return []
-  if (Array.isArray(raw)) {
-    // 可能是 [{group, items}] 或 [{code, name}]
-    const first = raw[0] as unknown
-    if (first && typeof first === 'object' && 'items' in (first as Record<string, unknown>)) {
-      return (raw as PermissionGroup[]).flatMap((group) =>
-        (group.items ?? []).map((item) => ({ ...item, group: item.group ?? group.group })),
-      )
-    }
-    return raw as PermissionItem[]
-  }
-  if (Array.isArray(raw.groups)) {
-    return raw.groups.flatMap((group) =>
-      (group.items ?? []).map((item) => ({ ...item, group: item.group ?? group.group })),
-    )
-  }
-  return raw.items ?? raw.permissions ?? []
 }
 
 export const tenantApi = {
@@ -94,11 +69,15 @@ export const tenantApi = {
     return http.delete<void>(tenantPath(tenantId, `/roles/${segment(roleId)}`))
   },
 
+  /** 权限目录（后端分组 + 中文名）：`GET /tenants/{tenant_id}/permissions`。 */
+  async permissionGroups(tenantId: EntityId): Promise<PermissionGroup[]> {
+    const raw = await http.get<unknown>(tenantPath(tenantId, '/permissions'))
+    return normalizePermissionGroups(raw)
+  },
+
+  /** 扁平权限项列表（保留原调用方式；需要分组展示时使用 `permissionGroups`）。 */
   async permissions(tenantId: EntityId): Promise<PermissionItem[]> {
-    const raw = await http.get<PermissionItem[] | PermissionGroup[] | PermissionCatalogResponse>(
-      tenantPath(tenantId, '/permissions'),
-    )
-    return normalizePermissions(raw)
+    return flattenPermissionGroups(await tenantApi.permissionGroups(tenantId))
   },
 
   auditLogs(tenantId: EntityId, query: AuditQuery = {}): Promise<PagedData<AuditLog>> {

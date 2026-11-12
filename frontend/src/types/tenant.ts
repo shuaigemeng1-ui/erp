@@ -106,11 +106,16 @@ export interface RolePatchPayload {
 export interface PermissionItem {
   code: string
   name: string
+  /** 所属分组编码，如 catalog */
   group?: string
 }
 
+/** 权限目录分组（`GET /tenants/{tenant_id}/permissions` 归一化后的结构）。 */
 export interface PermissionGroup {
-  group: string
+  /** 分组编码，如 catalog */
+  code: string
+  /** 分组中文名，如 商品 */
+  name: string
   items: PermissionItem[]
 }
 

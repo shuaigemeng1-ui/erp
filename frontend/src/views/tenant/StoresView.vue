@@ -34,8 +34,8 @@ async function load(): Promise<void> {
   }
 }
 
-function openAuthorize(channel: 'shopee' | 'tiktok' = 'shopee'): void {
-  authorizeChannel.value = channel
+function openAuthorize(): void {
+  authorizeChannel.value = 'tiktok'
   authorizeVisible.value = true
 }
 
@@ -94,10 +94,7 @@ onMounted(load)
       <div class="toolbar-actions">
         <el-button :icon="Refresh" @click="load">刷新</el-button>
       </div>
-      <el-button v-if="canConnect" type="primary" @click="openAuthorize('tiktok')">
-        授权 TikTok Shop
-      </el-button>
-      <el-button v-if="canConnect" @click="openAuthorize('shopee')">授权 Shopee 店铺</el-button>
+      <el-button v-if="canConnect" type="primary" @click="openAuthorize">授权店铺</el-button>
     </div>
 
     <el-table v-loading="loading" :data="stores" border size="small" row-key="id">
@@ -148,12 +145,15 @@ onMounted(load)
     </el-table>
   </el-card>
 
-  <el-dialog
-    v-model="authorizeVisible"
-    :title="`授权 ${authorizeChannelLabel} 店铺`"
-    width="460px"
-    destroy-on-close
-  >
+  <el-dialog v-model="authorizeVisible" title="授权店铺" width="480px" destroy-on-close>
+    <el-form label-width="86px" style="margin-bottom: 8px">
+      <el-form-item label="授权渠道">
+        <el-radio-group v-model="authorizeChannel">
+          <el-radio-button label="tiktok">TikTok Shop</el-radio-button>
+          <el-radio-button label="shopee">Shopee</el-radio-button>
+        </el-radio-group>
+      </el-form-item>
+    </el-form>
     <el-alert type="info" :closable="false" show-icon>
       <p>将跳转到 {{ authorizeChannelLabel }} 授权页，授权完成后自动回到本页。授权会话一次性有效。</p>
       <p class="authorize-hint">

@@ -83,7 +83,12 @@ export const platformApi = {
   },
 
   channelApp(channel: string, environment: string): Promise<ChannelApp> {
-    return http.get<ChannelApp>(`/platform/channel-apps/${segment(channel)}/${segment(environment)}`)
+    // 未配置时后端返回 404，这是正常的“空配置”状态，页面会展示空表单，不弹全局错误
+    return http.get<ChannelApp>(
+      `/platform/channel-apps/${segment(channel)}/${segment(environment)}`,
+      undefined,
+      { silent: true },
+    )
   },
 
   saveChannelApp(channel: string, environment: string, payload: ChannelAppPayload): Promise<ChannelApp> {

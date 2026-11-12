@@ -34,11 +34,15 @@ from app.modules.tasks.router import router as tasks_router
 from app.modules.channels.authorization import router as authorization_router
 from app.modules.storage.router import router as storage_router
 from app.modules.email.router import router as email_router
+from app.modules.ops.agent_router import router as agent_router
+from app.modules.ops.platform_router import router as ops_platform_router
 
 api_router = APIRouter()
 api_router.include_router(identity_router)
 api_router.include_router(identity_tenant_router)
 api_router.include_router(platform_router)
+api_router.include_router(ops_platform_router)
+api_router.include_router(agent_router)
 api_router.include_router(storage_router)
 api_router.include_router(email_router)
 api_router.include_router(catalog_router)

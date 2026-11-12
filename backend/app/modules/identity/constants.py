@@ -122,6 +122,10 @@ PLATFORM_AUDIT_ACTIONS: dict[str, str] = {
     "plan.create": "创建套餐",
     "plan.update": "调整套餐",
     "channel_app.update": "保存渠道应用",
+    "instance.create": "登记租户实例",
+    "instance.update": "更新租户实例",
+    "instance.node.enroll_token": "生成服务器接入令牌",
+    "alert.acknowledge": "确认运维告警",
 }
 
 

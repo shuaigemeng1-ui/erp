@@ -11,6 +11,7 @@ import {
   Tickets,
   Timer,
   User,
+  Monitor,
 } from '@element-plus/icons-vue'
 
 export interface MenuItem {
@@ -42,6 +43,7 @@ export const tenantMenuItems: MenuItem[] = [
 /** 平台管理菜单：仅平台管理员可见（后端独立校验）。 */
 export const platformMenuItems: MenuItem[] = [
   { path: '/platform/tenants', title: '租户管理', icon: OfficeBuilding },
+  { path: '/platform/instances', title: '服务器与实例', icon: Monitor },
   { path: '/platform/system-config', title: '系统配置', icon: SetUp },
   { path: '/platform/logs', title: '日志', icon: Document },
 ]

@@ -199,6 +199,16 @@ def main(dispatch_outbox: bool = True) -> int:
                 raise
             except Exception:  # noqa: BLE001
                 logger.exception("调度轮次失败")
+            try:
+                from app.db.session import center_session
+                from app.modules.ops import service as ops_service
+
+                with center_session() as center:
+                    ops_service.run_center_maintenance(center)
+            except KeyboardInterrupt:  # pragma: no cover
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("运维监控轮次失败")
             if dispatch_outbox:
                 try:
                     outbox.dispatch_pending()

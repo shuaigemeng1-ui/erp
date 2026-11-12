@@ -1,0 +1,107 @@
+"""平台管理员：服务器与实例运维接口。"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, Query
+
+from app.api.deps import CenterDb, PlatformAdmin
+from app.core.http import PageParams, paged, success
+from app.modules.ops import service
+from app.modules.ops.schemas import AlertAckIn, InstanceCreate, InstanceUpdate
+
+router = APIRouter(prefix="/platform", tags=["platform-ops"])
+
+
+@router.get("/instances", summary="租户实例列表")
+def list_instances(
+    center: CenterDb,
+    _: PlatformAdmin,
+    pagination: PageParams = Depends(),
+    q: str = Query(default="", max_length=100),
+    status: str = Query(default="", max_length=32),
+) -> dict:
+    data = service.list_instances(
+        center, page=pagination.page, page_size=pagination.page_size, q=q, status=status
+    )
+    return paged(data["items"], data["total"], data["page"], data["page_size"])
+
+
+@router.post("/instances", summary="登记租户实例")
+def create_instance(center: CenterDb, admin: PlatformAdmin, payload: InstanceCreate) -> dict:
+    return success(service.create_instance(center, payload, actor_user_id=admin.user_id))
+
+
+@router.get("/instances/{instance_id}", summary="租户实例详情")
+def get_instance(center: CenterDb, _: PlatformAdmin, instance_id: int) -> dict:
+    instance = service.get_instance(center, instance_id)
+    from app.modules.identity.models_center import Tenant
+
+    tenant = center.get(Tenant, instance.tenant_id)
+    return success(service.instance_payload(center, instance, tenant.name if tenant else ""))
+
+
+@router.patch("/instances/{instance_id}", summary="更新租户实例")
+def update_instance(
+    center: CenterDb,
+    admin: PlatformAdmin,
+    instance_id: int,
+    payload: InstanceUpdate,
+) -> dict:
+    return success(service.update_instance(center, instance_id, payload, actor_user_id=admin.user_id))
+
+
+@router.get("/instances/{instance_id}/nodes", summary="实例节点列表")
+def list_nodes(center: CenterDb, _: PlatformAdmin, instance_id: int) -> dict:
+    return success(service.list_nodes(center, instance_id))
+
+
+@router.post("/instances/{instance_id}/nodes", summary="生成服务器接入令牌")
+def create_node_enrollment(
+    center: CenterDb, admin: PlatformAdmin, instance_id: int
+) -> dict:
+    return success(service.create_node_enrollment(center, instance_id, actor_user_id=admin.user_id))
+
+
+@router.post("/nodes/{node_id}/probe", summary="立即探测节点公网访问")
+def probe_node(center: CenterDb, _: PlatformAdmin, node_id: int) -> dict:
+    return success(service.probe_node(center, node_id))
+
+
+@router.get("/nodes/{node_id}/metrics", summary="节点指标趋势")
+def node_metrics(
+    center: CenterDb,
+    _: PlatformAdmin,
+    node_id: int,
+    minutes: int = Query(default=60, ge=1, le=43200),
+) -> dict:
+    return success(service.list_metrics(center, node_id, minutes=minutes))
+
+
+@router.get("/alerts", summary="告警列表")
+def list_alerts(
+    center: CenterDb,
+    _: PlatformAdmin,
+    pagination: PageParams = Depends(),
+    status: str = Query(default="", max_length=16),
+    node_id: str = Query(default="", max_length=32),
+) -> dict:
+    node_id_value = int(node_id) if node_id.isdigit() else None
+    data = service.list_alerts(
+        center,
+        status=status,
+        node_id=node_id_value,
+        page=pagination.page,
+        page_size=pagination.page_size,
+    )
+    return paged(data["items"], data["total"], data["page"], data["page_size"])
+
+
+@router.post("/alerts/{alert_id}/ack", summary="确认告警")
+def acknowledge_alert(
+    center: CenterDb, admin: PlatformAdmin, alert_id: int, payload: AlertAckIn
+) -> dict:
+    return success(
+        service.acknowledge_alert(
+            center, alert_id, note=payload.note, actor_user_id=admin.user_id
+        )
+    )

@@ -325,6 +325,42 @@ def _write_cache(config_path: str, items: list[dict[str, Any]]) -> None:
         pass
 
 
+def poll_and_execute(config_path: str, base: str, token: str) -> None:
+    """领取一个运维任务并在本机受限执行。"""
+    from executor import execute  # 与 erp_agent.py 同目录
+
+    config = load_config(config_path)
+    result = http_json(f"{base}/api/v1/agent/jobs/poll", {}, token=token)
+    job = (result.get("data") or {}).get("job")
+    if not job:
+        return
+
+    def report(step_no: int, step_name: str, status: str, message: str) -> None:
+        http_json(
+            f"{base}/api/v1/agent/jobs/{job['id']}/events",
+            {
+                "status": "running",
+                "step_no": step_no,
+                "step_name": step_name,
+                "step_status": status,
+                "message": message,
+            },
+            token=token,
+        )
+
+    outcome = execute(job, config, report)
+    final_status = "succeeded" if outcome.get("ok") else "failed"
+    http_json(
+        f"{base}/api/v1/agent/jobs/{job['id']}/events",
+        {
+            "status": final_status,
+            "result": {k: v for k, v in outcome.items() if k != "output"},
+            "error": "" if outcome.get("ok") else str(outcome.get("error") or outcome.get("exit_code") or "执行失败")[:500],
+        },
+        token=token,
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     base = str(config["center"]).rstrip("/")
@@ -348,6 +384,10 @@ def run(args: argparse.Namespace) -> int:
             _write_cache(args.config, remaining)
         except Exception as exc:  # noqa: BLE001 - 采集循环不能因单次异常退出
             print(f"采集异常：{exc}")
+        try:
+            poll_and_execute(args.config, base, token)
+        except Exception as exc:  # noqa: BLE001 - 任务失败不影响指标采集
+            print(f"任务轮询异常：{exc}")
         if args.once:
             return 0
         time.sleep(REPORT_SECONDS)

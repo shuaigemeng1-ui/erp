@@ -92,6 +92,8 @@ x-app-env: &app-env
   DEFAULT_PAGE_SIZE: ${DEFAULT_PAGE_SIZE:-20}
   MAX_PAGE_SIZE: ${MAX_PAGE_SIZE:-200}
   CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:8080}
+  # 允许访问应用的 Host（生产配置为正式域名）；未设置时由后端默认不限制
+  TRUSTED_HOSTS: ${TRUSTED_HOSTS:-*}
   # 对象存储（S3 兼容；留空则文件功能不可用，不阻塞首版订单/库存闭环）
   S3_ENDPOINT: ${S3_ENDPOINT:-}
   S3_BUCKET: ${S3_BUCKET:-}

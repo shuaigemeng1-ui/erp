@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response
 
 from app.api.router import api_router
@@ -103,6 +104,10 @@ def create_app() -> FastAPI:
     )
 
     application.add_middleware(RequestContextMiddleware)
+    # 只允许通过正式域名访问；未配置 TRUSTED_HOSTS 时不限制（本地开发/测试）
+    allowed_hosts = settings.allowed_hosts
+    if allowed_hosts:
+        application.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
     if settings.cors_origins:
         application.add_middleware(
             CORSMiddleware,

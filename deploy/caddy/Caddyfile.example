@@ -3,6 +3,7 @@
 #
 # 使用场景：服务器已有 Caddy 管理 80/443，应用 nginx 仅绑定 127.0.0.1:8081。
 # 把本文件内容追加到 /etc/caddy/Caddyfile，替换域名后执行：
+#   caddy fmt --overwrite /etc/caddy/Caddyfile
 #   caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 #   systemctl reload caddy
 #
@@ -10,8 +11,19 @@
 # 多个站点可并存；修改前先备份 Caddyfile。
 # =============================================================================
 
+# 全局选项：Host 与 TLS SNI 不一致时直接返回 421，避免通过 IP / 伪造 Host 访问应用
+{
+	servers {
+		strict_sni_host
+	}
+}
+
 # 应用域名（自动 HTTPS + HSTS + 安全响应头）
 erp.example.com {
+	# 只允许正式域名：Host 不匹配时拒绝（与 strict_sni_host 形成双保险）
+	@bad_host not host erp.example.com
+	respond @bad_host 421
+
 	encode zstd gzip
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
@@ -19,10 +31,13 @@ erp.example.com {
 		X-Frame-Options "SAMEORIGIN"
 		Referrer-Policy "strict-origin-when-cross-origin"
 	}
-	reverse_proxy 127.0.0.1:8081
+	reverse_proxy 127.0.0.1:8081 {
+		# 保留原始 Host，便于 nginx / 后端做「只允许域名」校验
+		header_up Host {host}
+	}
 }
 
-# 直接用 IP 访问时跳转到域名（HTTPS 证书无法签发给公网 IP）
+# 直接用 IP 访问时跳转到域名（Let's Encrypt 不能给公网 IP 签证书）
 http://203.0.113.10 {
 	redir https://erp.example.com{uri} permanent
 }

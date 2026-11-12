@@ -248,3 +248,35 @@ caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl re
 3. 配置监控告警与日志采集（P1）；
 4. 按 `deploy/README.md` 做一次试点租户页面验收（成本权限、数据范围、任务状态）。
 
+## 9. 域名唯一入口与数据持久化（2026-11-12）
+
+### 9.1 只允许域名访问
+
+| 场景 | 结果 |
+| --- | --- |
+| `https://erp.alienyan.store/` | 200（正常） |
+| `http://121.37.45.132/` | 301 → `https://erp.alienyan.store/` |
+| `https://121.37.45.132/` | TLS 握手失败（无 IP 证书，不可用） |
+| SNI=erp + `Host: evil.example` | **421 Misdirected Request**（Caddy `strict_sni_host`） |
+| 直连容器 `Host: evil.example` | **421**（nginx host allowlist） |
+| 直连 API `Host: evil.example`（容器内） | **400**（FastAPI TrustedHostMiddleware） |
+| 既有站点 `shuren.alienyan.store` | 200，不受影响（`2fa` 站点因服务停止为 502，符合预期） |
+
+实现：Caddy 全局 `servers { strict_sni_host }` + 域名站点 Host 匹配；nginx `$host` allowlist；
+后端 `TRUSTED_HOSTS`（Compose 透传）。换域名需同步改四处配置（见 `deploy/README.md` §12.1）。
+
+### 9.2 MySQL / Redis 持久化实测
+
+| 检查 | 结果 |
+| --- | --- |
+| MySQL 数据卷 | `ventasync_mysql_data` → `/var/lib/mysql`，宿主路径 `/var/lib/docker/volumes/ventasync_mysql_data/_data` |
+| 数据量 | 225MB（中心库 + 2 个租户库） |
+| 重启测试 | `docker compose restart mysql` 后行数完全一致：tenants=2、users=3、tenant_databases=2、demo2 products=1、demo products=1 |
+| 重启后可用性 | `mysql health=healthy`、`/healthz` 200、`/api/v1/auth/csrf` 200 |
+| 队列 Redis | `ventasync_redis_queue_data` → `/data`，AOF=yes、noeviction，重启保留任务 |
+| 备份 | `/etc/cron.d/ventasync-backup` 每日 03:30；`/opt/backups` 已有中心库 + 全部租户库备份 |
+| 风险提示 | `docker compose down -v` 会删除数据卷；日常只用 `down`（不带 `-v`），并保留每日备份 |
+
+> 登录账号：平台管理员 `admin@ventasync.local`（密码在服务器 `/root/ventasync-credentials.txt`）；
+> 演示租户负责人 `owner.demo2@example.com`。生产使用前请按需修改密码。
+

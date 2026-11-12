@@ -393,3 +393,32 @@ curl -fsS http://127.0.0.1:8080/api/v1/auth/csrf
   # 3) 核对订单/库存/outbox 后重新开启推送/同步并启用租户
   ```
 
+## 12. 只允许域名访问与数据持久化（已实测）
+
+### 12.1 只允许域名访问（三层防线）
+
+1. **Caddy（入口）**：`http://<IP>` → 301 跳转到域名；HTTPS 直连 IP 无证书、握手失败；
+   全局 `servers { strict_sni_host }` → Host 与 TLS SNI 不一致直接 421；域名站点再加
+   `@bad_host not host <域名>` → 421。
+2. **nginx（静态与反代）**：`if ($host !~* ^(域名|localhost|127\.0\.0\.1)$) { return 421; }`
+   （见 `deploy/nginx/nginx.conf`，换域名时同步修改）。
+3. **FastAPI**：`TrustedHostMiddleware`，由 `TRUSTED_HOSTS` 控制；Compose 已把该变量透传到
+   api/worker/scheduler（`.env` 中设置，未设置时默认不限制，便于本地开发）。
+
+验证结果：域名 200；`http://IP` 301；`https://IP` 握手失败；`Host: evil` + SNI 域名 → 421；
+直连容器 `Host: evil` → 421；直连 API `Host: evil` → 400。
+
+> 更换域名时必须同步修改：Caddy 站点、nginx allowlist、`TRUSTED_HOSTS`、`APP_ORIGIN`、
+> `CORS_ALLOW_ORIGINS`、`SHOPEE_AUTH_REDIRECT_URL`。
+
+### 12.2 数据持久化
+
+| 组件 | 持久化方式 | 实测 |
+| --- | --- | --- |
+| MySQL 8.4 | 命名卷 `ventasync_mysql_data` → `/var/lib/mysql` | 225MB；重启容器后中心库/租户库行数完全一致 |
+| Celery 队列 Redis | 命名卷 `ventasync_redis_queue_data` → `/data`，AOF `yes` + `noeviction` | 重启保留未执行任务 |
+| 缓存/会话 Redis | 不持久化（可接受：会话重建即可） | — |
+| 业务备份 | `deploy/scripts/backup.sh` + 每日 03:30 cron，保留 14 天 | 中心库 + 全部租户库 `.sql.gz + .sha256` |
+
+> `docker compose down` 不会删除命名卷；`docker compose down -v` 会删除数据卷，**禁止**在未备份时执行。
+

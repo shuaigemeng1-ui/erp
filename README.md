@@ -46,7 +46,8 @@ npm run build     # 提交前必须通过
 
 真实服务器部署（Ubuntu 24.04 / 2C2G / Docker Compose / Caddy 反代）已完成并通过端到端验证：
 
-* 访问地址：**https://erp.alienyan.store/**（Let's Encrypt 证书自动续期；`http://121.37.45.132` 自动跳转）
+* 访问地址：**https://erp.alienyan.store/**（Let's Encrypt 证书自动续期）
+* 只允许域名访问：HTTP IP 301 跳转域名、HTTPS IP 无法握手、Host≠SNI 返回 421；`TRUSTED_HOSTS` 限制后端 Host
 * 平台管理员凭据保存在服务器 `/root/ventasync-credentials.txt`（600 权限）
 * 架构与步骤：`docs/real-deployment.md`
 * 已验证：双租户真实开通（各 29 表、0 外键）、邀请激活、权限、商品/库存、租户隔离、暂停/启用、登录限流、备份脚本

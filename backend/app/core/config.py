@@ -77,6 +77,9 @@ class Settings(BaseSettings):
     default_page_size: int = 20
     max_page_size: int = 200
     cors_allow_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
+    # 允许访问的 Host（逗号分隔；"*" 表示不限制，生产环境应配置为正式域名）。
+    # 用于只允许域名访问，拒绝 IP / 未知 Host 直接访问应用。
+    trusted_hosts: str = "*"
 
     # ------------------------------------------------------------------ 对象存储
     s3_endpoint: str = ""
@@ -120,6 +123,14 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [item.strip() for item in self.cors_allow_origins.split(",") if item.strip()]
+
+    @property
+    def allowed_hosts(self) -> list[str] | None:
+        """``None`` 表示不限制 Host；否则返回允许的 Host 列表。"""
+        value = self.trusted_hosts.strip()
+        if not value or value == "*":
+            return None
+        return [item.strip() for item in value.split(",") if item.strip()]
 
     @property
     def secret_key_bytes(self) -> bytes:

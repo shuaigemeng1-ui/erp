@@ -114,7 +114,7 @@ onMounted(load)
         <StatusTag :status="app?.status ?? 'inactive'" />
       </el-descriptions-item>
       <template v-if="isTikTok">
-        <el-descriptions-item label="App Key">
+        <el-descriptions-item label="App Key（App ID）">
           <span class="mono">{{ textOrDash(app?.app_key) }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="App Secret">
@@ -140,8 +140,12 @@ onMounted(load)
 
     <el-form ref="formRef" v-loading="loading" :model="channelForm" :rules="rules" label-width="130px" style="max-width: 720px">
       <template v-if="isTikTok">
-        <el-form-item label="App Key">
-          <el-input v-model="channelForm.app_key" placeholder="TikTok Shop 应用 App Key" />
+        <el-form-item label="App Key（App ID）">
+          <el-input
+            v-model="channelForm.app_key"
+            placeholder="填 TikTok Shop 开发者后台的 App Key（即 App ID）"
+          />
+          <div class="form-tip">TikTok Shop Open API 里叫 App Key，授权参数是 app_key；它就是你应用的 App ID。</div>
         </el-form-item>
         <el-form-item label="App Secret">
           <el-input v-model="channelForm.app_secret" type="password" show-password placeholder="不填写则保持原值" />
@@ -168,7 +172,7 @@ onMounted(load)
     </el-form>
 
     <el-alert v-if="isTikTok" type="info" :closable="false" show-icon style="max-width: 720px">
-      <p>把上面的回调地址加入 TikTok Shop 应用的白名单；保存 App Key / App Secret 后，租户即可在「店铺连接」发起 TikTok Shop 授权。</p>
+      <p>把上面的回调地址加入 TikTok Shop 应用的白名单；保存 App Key（App ID）/ App Secret 后，租户即可在「店铺连接」发起 TikTok Shop 授权。</p>
     </el-alert>
   </el-card>
 </template>

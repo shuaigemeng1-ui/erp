@@ -345,3 +345,26 @@ caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl re
 升级后所有用户需重新登录；旧永久授权链接需在店铺页面重新生成，已保存的平台凭据保留。
 本次没有执行真实平台库存写入，也没有认定 TikTok/Shopee 真实业务闭环已通过；仍按 `acceptance.md` 的独立环境清单继续验收。
 
+
+## 13. SPU—SKU 商品中心发布（2026-11-12）
+
+业务提交 `4bfe4f7`，迁移修复 `ebd211f`。服务器目录仍为 `/opt/ventasync`，使用基础 Compose 与 server override；新 API 挂载 `ventasync_catalog_media_data`，旧 MySQL/Redis 容器及其数据卷保留。
+
+发布顺序：本地生产构建和 Git 推送 → 构建镜像并保留回退镜像 → 停止 API/scheduler/Worker → 备份中心库及两个租户库 → 独立迁移 → 更新应用容器 → 数据、接口和图片卷检查。
+
+首次迁移在写入审计日志时遇到旧表的非空 `ip/request_id` 无 SQL 默认值，已修复 INSERT 并增加独立 SQL 回归。MySQL 的 DDL 已生效，而后续数据事务已回滚；因此没有直接重跑第一个库的全量 DDL。核对该库全部业务表和列、此次新增索引、空回填表及当前版本后，在迁移锁下重新执行修复后的数据部分，与版本确认同事务提交；然后通过标准 migrate 任务正常升级第二个库。
+
+| 检查 | 结果 |
+| --- | --- |
+| 版本 | 中心库 center_0006；两个租户库 tenant_0011 |
+| 结构 | 中心业务表15张，租户各32张；外键0，表及字段中文注释完整 |
+| 数据 | 原有关键商品、SKU、订单、明细、库存和映射字段指纹一致；统一主编号登记核验通过 |
+| 商品接口 | 对可用租户身份的列表、详情、SKU搜索、选项和日志 GET 请求均200；临时会话已删除 |
+| 公网 | 首页、登录页、healthz、CSRF接口200，主JS/CSS哈希与发布产物一致 |
+| 进程 | API/Worker/nginx/MySQL/Redis健康，scheduler运行，Celery ping成功 |
+| 图片卷 | UID/GID 10001目录可读写，验证临时文件已删除；图片卷备份及校验通过 |
+| 备份 | 发布前三库备份均校验通过；发布后两租户库及图片卷备份均校验通过 |
+
+本次证据与备份目录：`/opt/backups/releases/erp-4bfe4f7/`。`database/` 为发布前备份，`post-publish/` 为发布后租户与图片备份；其他文件包含前后结构、业务指纹、接口结果、恢复脚本和权限600的环境配置备份。
+
+旧镜像保留为 `ventasync-backend:rollback-4bfe4f7`、`ventasync-frontend:rollback-4bfe4f7`。页面刷新后进入新版 SPU 商品中心。本次不涉及真实平台调价或库存写入；高并发与真店闭环仍按验收清单推进。

@@ -60,7 +60,7 @@ function goTenantSelect(): void {
 }
 
 function goPlatformLogin(): void {
-  void router.push('/platform/login')
+  void router.push('/admin/login')
 }
 </script>
 

@@ -9,9 +9,14 @@ const standaloneRoutes: RouteRecordRaw[] = [
     meta: { public: true, title: '登录' },
   },
   {
-    path: '/platform/login',
+    path: '/admin/login',
     name: 'platform-login',
     component: () => import('@/views/auth/PlatformLoginView.vue'),
+    meta: { public: true, title: '平台管理登录' },
+  },
+  {
+    path: '/platform/login',
+    redirect: (to) => ({ name: 'platform-login', query: to.query }),
     meta: { public: true, title: '平台管理登录' },
   },
   {

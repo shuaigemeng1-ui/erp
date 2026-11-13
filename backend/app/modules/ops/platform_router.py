@@ -7,7 +7,16 @@ from fastapi import APIRouter, Depends, Query
 from app.api.deps import CenterDb, PlatformAdmin
 from app.core.http import PageParams, paged, success
 from app.modules.ops import service
-from app.modules.ops.schemas import AlertAckIn, InstanceCreate, InstanceUpdate, MaintenanceWindowCreate, OperationCreate, ReleaseCreate
+from app.modules.ops.schemas import (
+    AlertAckIn,
+    InstanceCreate,
+    InstanceUpdate,
+    MaintenanceWindowCreate,
+    NodeSshConfigIn,
+    NodeSshExecIn,
+    OperationCreate,
+    ReleaseCreate,
+)
 
 router = APIRouter(prefix="/platform", tags=["platform-ops"])
 

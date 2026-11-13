@@ -1,3 +1,27 @@
+# 当前仓库契约状态（批次 1 QA 基线，2026-11-13，HEAD 49794e5）
+
+> 本节对应当前仓库 HEAD 的离线基线；下方历史章节保留各次发布时点的记录，其迁移数/表数/测试数**不代表当前仓库**。
+> 基线复现细节见 `docs/batch1-baseline.md`。
+
+| 检查 | 当前结果 |
+| --- | --- |
+| 后端测试 | `cd backend; python -m pytest -q` → **410 passed**，exit 0（1 条上游 Starlette 弃用提示） |
+| 前端构建 | `npm run build` exit 0（基线用临时 `--outDir`，未修改受版本管理的 `frontend/dist`；是否更新 dist 由 Lead 决定） |
+| 迁移图 | 29 个迁移文件：中心库 `center_0015 (head)`（15 个）、租户库 `tenant_0014 (head)`（14 个）；离线 SQL 可生成、0 外键、中文注释完整 |
+| 业务表 | 中心库 **29** 张、租户库 **33** 张（均不计 `alembic_version`）；已与 `docs/data-model.md` 同步 |
+| 完整契约检查 | 基线 HEAD **30/38**：8 项失败已按批次 1 决策处理——5 项文档漂移本轮修复、2 项 ops 字段中文注释由 task-16 负责修复并最终验收、1 项追加型表时间列规则由 Lead 调整检查器（例外清单见 `docs/data-model.md` 约定） |
+| 批次 1 交付后 | 预期迁移 **30** 个（新增 `center_0016`），契约目标 **38/38**；T1/T2/T3 合并后由 task-19 重跑并更新本节数字 |
+
+补充说明：
+
+- **追加型表例外（Lead 决策）**：`node_metric_samples`、`node_checks`、`operation_job_steps`、`backup_records` 不要求
+  `created_at/updated_at`，`node_metric_aggregates` 不要求 `updated_at`；以 `sampled_at`/`checked_at`/`started_at`/`finished_at`/`bucket_start`
+  等业务时间字段作为追加时间。其余表仍要求 `id`、`created_at`、`updated_at`。
+- 本轮基线不启动容器、不连接 MySQL/Redis、不访问生产；真实环境/试点验收仍按下方历史章节与批次 1 检查清单执行。
+- 历史章节中“38/38 通过、22 个迁移、中心 18 张/租户 32 张”等数字是各自发布时点的记录，不是当前 HEAD 结论。
+
+---
+
 # 租户内成员编号验收（2026-11-12）
 
 业务提交`7cbe4b8`已推送并部署，中心库升级至`center_0009`，三个租户库保持`tenant_0013`。

@@ -1,8 +1,14 @@
-# 数据模型基线（含 SPU—SKU 与平台对象存储）
+# 数据模型基线（含 SPU—SKU、平台对象存储与统一运维中心）
 
 约定：
 
-* 每张表都有 `id BIGINT 自增主键`、`created_at`、`updated_at`（UTC）。
+* 常规表都有 `id BIGINT 自增主键`、`created_at`、`updated_at`（UTC）。
+* **追加型表例外**：只追加、不原地修改的历史/样本表不要求 `updated_at`，允许以下表缺省：
+  `node_metric_samples`、`node_checks`、`operation_job_steps`、`backup_records`（缺 `created_at`/`updated_at`），
+  `node_metric_aggregates`（缺 `updated_at`，保留 `created_at`）。
+  它们以业务时间字段作为追加时间：`sampled_at`（指标样本）、`checked_at`（公网探测）、
+  `started_at`/`finished_at`（任务步骤、备份）、`bucket_start`（指标聚合）。
+  其余表仍必须同时包含 `id`、`created_at`、`updated_at`。
 * 所有表/字段必须带中文注释；禁止外键；业务唯一性用唯一约束。
 * 租户库每张表都带 `tenant_id`（便于审计、队列、缓存定位），但跨租户隔离由数据库本身承担。
 * 金额/汇率 `DECIMAL(18,4)` / `DECIMAL(18,8)`；ID 在 JSON 中序列化为字符串。
@@ -26,11 +32,28 @@
 | `platform_audit_logs` | platform | actor_user_id, action, resource_type, resource_id, tenant_id, summary, payload(JSON), ip, request_id |
 | `platform_channel_apps` | channels | channel, environment(production/test), partner_id, partner_key_cipher, partner_secret_cipher, app_key, app_secret_cipher, app_id, region, redirect_url, status；唯一(channel,environment) |
 | `channel_account_registry` | channels | channel, environment, external_account_id, tenant_id, store_id, status(bound/released), bound_at, released_at；唯一(channel,environment,external_account_id) |
-
 | `channel_authorization_links` | channels | tenant_id, member_id, store_id, channel, token_hash(唯一), status(active/revoked/pending_save), context(JSON), result_cipher；长期链接只存摘要，跨库保存失败时暂存加密结果 |
 | `storage_profiles` | storage | name(唯一), provider(oss/cos/obs/s3/s3_compatible), endpoint, bucket, region, access_key_id_cipher, secret_access_key_cipher, public_base_url, key_prefix, addressing_style, enabled, version；平台统一配置，访问密钥ID和Secret均加密且不回显 |
 | `platform_system_settings` | storage | 固定id=1，default_storage_profile_id(逻辑关联), version；当前默认存储账号，切换时锁定单例行 |
 | `email_profiles` | email | name(唯一), provider(aliyun_directmail/tencent_ses), region, from_address, from_name, access_key_id_cipher, secret_access_key_cipher, enabled, is_default, version；AccessKey/Secret 加密保存，接口不回显明文 |
+
+### 统一运维中心（ops）
+
+中心库运维表均无外键，实例/节点/任务之间只存逻辑 ID；追加型表的例外见文首“约定”。
+
+| 表 | 归属模块 | 关键字段 |
+| --- | --- | --- |
+| `tenant_instances` | ops | tenant_id(唯一), name, domain(唯一), environment, status(pending/active/suspended), app_version, actual_version, target_version, agent_version, executor_version, db_version, upgrade_status(pending/building/maintenance/migrating/verifying/succeeded/failed/unknown), notes |
+| `server_nodes` | ops | instance_id, tenant_id, node_uuid(唯一), hostname, os_name, arch, cpu_cores, memory_total_mb, disk_total_gb, internal_ips(JSON), configured_public_ip, observed_public_ip, agent_version, executor_version, protocol_version, capabilities_json(JSON), db_version, app_version, status(pending/online/offline/unknown), enrolled_at, last_seen_at, last_heartbeat_at, last_metrics_at, token_hash(唯一), token_version, enrollment_expires_at, ssh_host, ssh_port, ssh_username_cipher, ssh_password_cipher；索引(instance_id)、(last_seen_at,status) |
+| `release_versions` | ops | version(唯一), image_tag, image_digest, status(draft/active/retired), commit_sha(完整40/64位hex，旧记录为空), build_config_summary, min_agent_protocol, center_db_version, tenant_db_version, rollback_compatible(旧应用兼容声明), build_status(built/verified/failed), notes, created_by；负责升级目标版本可信登记 |
+| `operation_jobs` | ops | instance_id, node_id(可空), job_type(deploy/upgrade/restart/backup/logs/config), status(pending/leased/running/succeeded/failed/unknown), idempotency_key(唯一), target_version, actual_version, agent_version, agent_protocol_version, db_version, upgrade_status, attempt_id, lease_token, last_heartbeat_at, event_seq, checks_json(数据库版本/服务readiness/业务只读校验结果), checks_status(passed/failed/partial/missing/空), payload_json, result_json, error, attempts, lease_expires_at, requested_by, started_at, finished_at；索引(instance_id,status)、(node_id,status) |
+| `operation_job_steps` | ops | job_id, step_no, name, status(pending/running/succeeded/failed/skipped), message, started_at, finished_at；唯一(job_id,step_no) |
+| `node_metric_samples` | ops | node_id, sampled_at, received_at, cpu_percent, load1/load5/load15, memory_total_mb, memory_used_mb, memory_available_mb, memory_percent, swap_total_mb, swap_used_mb, disks(JSON), network(JSON), services(JSON), public_ip；索引(received_at)、(node_id,sampled_at)；追加型，默认保留7天 |
+| `node_metric_aggregates` | ops | node_id, resolution(5m/1h), bucket_start, sample_count, cpu_avg/cpu_max, memory_avg/memory_max, load_avg, disk_max, created_at；唯一(bucket_start,node_id,resolution)；追加型，不要求updated_at |
+| `node_checks` | ops | node_id, checked_at, target(root/healthz/api), url, ok, status_code, latency_ms, cert_days_left, error；索引(node_id,checked_at)；追加型 |
+| `alert_events` | ops | node_id, instance_id, alert_type, severity(warning/critical), status(open/acknowledged/resolved), message, metric_value, threshold, first_seen_at, last_seen_at, acknowledged_at, resolved_at, notify_count, last_notified_at；索引(node_id,status)、(last_seen_at) |
+| `backup_records` | ops | instance_id, node_id(可空), job_id(可空), status(running/succeeded/failed), storage_key, size_bytes, started_at, finished_at, retention_until, error；索引(instance_id,started_at)；追加型 |
+| `maintenance_windows` | ops | instance_id, starts_at, ends_at, reason, created_by；索引(instance_id,starts_at,ends_at) |
 
 ## 租户库（`TenantBase`）
 
@@ -44,6 +67,7 @@
 | `role_binding_scopes` | tenant_id, member_role_id, scope_type(all/stores/stock_places), scope_id；唯一(tenant_id,member_role_id,scope_type,scope_id)；索引(member_role_id) |
 | `tenant_settings` | tenant_id(唯一), permission_version, timezone, order_sync_enabled, stock_push_enabled |
 | `feature_settings` | tenant_id, feature_code, enabled, config(JSON)；唯一(tenant_id,feature_code) |
+| `tenant_local_users` | tenant_id, source_user_id(来源中心用户ID), email, password_hash, display_name, member_no, is_owner, status, synced_at(最近同步UTC)；唯一(tenant_id,email)、(tenant_id,source_user_id)；独立实例模式下的本地登录账号，与中心账号逻辑关联、无外键 |
 
 ### 审计与支撑（audit）
 
@@ -106,6 +130,13 @@
 | 中心库 | `alembic/center/versions/0007_center_system_storage.py` | center_0007 | 平台系统配置与多个云对象存储账号，凭据密文保存，固定默认配置行，无外键。 |
 | 中心库 | `alembic/center/versions/0008_center_email_profiles.py` | center_0008 | 平台邮件服务账号：阿里云 DirectMail / 腾讯云 SES，密钥密文保存，默认账号唯一。 |
 | 中心库 | `alembic/center/versions/0009_center_tenant_member_numbers.py` | center_0009 | 按租户历史创建顺序回填member_no并初始化计数器，租户内从1递增，原内部ID与业务关联保留，无外键。 |
+| 中心库 | `alembic/center/versions/0010_center_ops.py` | center_0010 | 统一运维管理：租户实例、服务器节点、节点指标样本、公网探测与告警事件；无外键。 |
+| 中心库 | `alembic/center/versions/0011_center_ops_operations.py` | center_0011 | 发布版本、运维任务与任务步骤、备份记录；任务幂等键与租约字段；无外键。 |
+| 中心库 | `alembic/center/versions/0012_center_ops_maintenance.py` | center_0012 | 实例维护窗口：按实例配置维护开始/结束时间与原因；无外键。 |
+| 中心库 | `alembic/center/versions/0013_center_ops_cert.py` | center_0013 | 公网探测记录增加 HTTPS 证书剩余天数字段；无外键。 |
+| 中心库 | `alembic/center/versions/0014_center_ops_metrics_agg.py` | center_0014 | 节点指标 5 分钟/小时聚合表（bucket_start、样本数与 CPU/内存/负载/磁盘统计）；无外键。 |
+| 中心库 | `alembic/center/versions/0015_center_server_ssh.py` | center_0015 | 服务器节点 SSH 主机/端口及用户名、密码密文字段；无外键。 |
+| 中心库 | `alembic/center/versions/0016_center_release_upgrade.py` | center_0016 | 批次 1：发布版本清单与升级校验字段（完整 commit、构建配置摘要、最低 Agent 协议、center/tenant DB 目标版本、回退兼容、构建状态），实例/节点实际版本与升级状态，任务执行批次/租约/心跳/事件水位/升级检查结果；全部新增列可空或带默认值，无外键。center_0016 随批次 1 发布生效。 |
 | 租户库 | `alembic/tenant/versions/0001_tenant_identity.py` | tenant_0001 | 租户库基线：角色、权限、绑定范围、租户设置、功能开关、审计与支撑表（tenant_0001）。 |
 | 租户库 | `alembic/tenant/versions/0002_tenant_catalog.py` | tenant_0002 | 租户库：商品、SKU、图片、库存地点、库存余额、库存流水。 |
 | 租户库 | `alembic/tenant/versions/0003_tenant_channels.py` | tenant_0003 | 租户库迁移：店铺、店铺凭据、平台商品与 SKU 映射。 |
@@ -119,8 +150,11 @@
 | 租户库 | `alembic/tenant/versions/0011_tenant_spu_sku_catalog.py` | tenant_0011 | SPU资料、SKU成本重量与状态、统一编号别名、供应商、商品字典、字段操作日志及平台SKU编码扩容与订单原生SKU标识。 |
 | 租户库 | `alembic/tenant/versions/0012_tenant_cloud_file_urls.py` | tenant_0012 | files记录云厂商、配置ID和长期URL；商品及SKU图片URL扩至2048，旧文件保留local，无外键。 |
 | 租户库 | `alembic/tenant/versions/0013_tenant_supplier_contacts.py` | tenant_0013 | 供应商增加选填联系人、联系方式和备注，保留原供应商及商品关联，无外键。 |
+| 租户库 | `alembic/tenant/versions/0014_tenant_local_users.py` | tenant_0014 | 租户本机账号表（独立实例模式本地登录）：来源中心用户ID、邮箱、密码哈希、成员编号、负责人标记与同步时间；唯一(tenant_id,email)、(tenant_id,source_user_id)，无外键。 |
 
-模型业务表：中心库 18 张、租户库 32 张（均不计 Alembic 版本表），完整版本图共 22 个迁移文件。当前末端为中心库 `center_0009`、租户库 `tenant_0013`。
+模型业务表：中心库 29 张、租户库 33 张（均不计 Alembic 版本表），完整版本图共 30 个迁移文件（center 16 + tenant 14）。当前末端为中心库 `center_0016`（批次 1 发布后生效）、租户库 `tenant_0014`。
+
+追加型表例外：`node_metric_samples`、`node_checks`、`operation_job_steps`、`backup_records`、`node_metric_aggregates` 按文首“约定”不要求完整三时间列，以 `sampled_at`/`checked_at`/`started_at`/`bucket_start` 等业务时间字段作为追加时间；其余业务表仍必须包含 `id`、`created_at`、`updated_at`。
 
 `tenant_0008` 仅补授系统 owner/admin 的 `task.schedule.manage`，不扩张普通角色。`tenant_0010` 修复旧 MODIFY 丢失的 store_code 中文注释，适用于现有数据库的增量升级。
 

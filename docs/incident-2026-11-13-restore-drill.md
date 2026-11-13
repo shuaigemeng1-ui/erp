@@ -3,7 +3,7 @@
 - 日期：2026-11-13
 - 环境：租户服务器 `8.163.80.17`，Compose 项目 `ventasync`
 - 严重级别：高（主租户中心库表被清空、主业务容器停止）
-- 当前状态（2026-11-13 17:30 CST）：隔离导入已修复，修正配置的恢复候选包通过 28 项检查。两个原始包仍不能标记 verified；生产仅中心库存在，详见第 8 节。
+- 当前状态（2026-11-13 17:45 CST）：恢复脚本已修复；生产业务库已从 075322Z 备份恢复并修正 TENANT_ID=3；新备份 093801Z 的隔离演练 **passed=true / failed=0 / 28 项检查**。遗留 `backup_records` 关联缺陷（`--record-latest` 无法匹配、restore_status 未写 verified），详见第 9 节。
 - 关联：批次3 task-31（备份加密异地与恢复演练），脚本 `deploy/scripts/restore_drill.sh`
 
 ## 1. 事件经过
@@ -128,7 +128,7 @@ Lead 在 8.163.80.17 用修复版脚本重跑（独立卷/安全断言已生效�
 4. **报告增强**：`drill-report.json` 增加 `target`（drill 项目、datadir、数据卷、主项目、就绪判据）
    与 `import_table_counts` 检查项；只有全部检查（含表数一致）通过才会 `passed=true`。
 
-修复后验证（本机）：`bash -n`、`--self-test`、真实 compose `--dry-run` 均通过；服务器重跑待 Lead 执行。
+修复后验证（本机）：`bash -n`、`--self-test`、真实 compose `--dry-run` 均通过；服务器实际重跑结果见第 9 节（新备份 passed=true/28 checks）。
 
 ## 6. 安全重跑步骤（8.163.80.17，必须先 dry-run）
 
@@ -157,14 +157,14 @@ docker ps -a | grep ventasync-drill          # 应为空
 - [x] 本机 `--dry-run`（真实 deploy compose 文件）解析卷名全部为 drill 专属、`mysql ports: []`、退出码 0
 - [x] Lead 在 8.163.80.17 完成第一次修复后重跑：独立卷/安全断言通过、主卷与 center 30 表未受损
 - [x] 定位并修复第二轮失败（ERROR 2002：socket 未就绪）——双探针就绪等待 + 导入前后校验 + 报告 target
-- [ ] 8.163.80.17 再次 `--dry-run` 通过（只读，留存卷名输出）
-- [ ] 8.163.80.17 临时卷 actual 演练通过：`drill-report.json` passed=true、`import_table_counts` 一致，
-      主卷 CreatedAt/Mountpoint 不变、主容器/center 30 表不变、无 drill 残留
-- [ ] Lead 批准后中心库 `backup_records.restore_status=verified` 写入
+- [x] 8.163.80.17 再次 `--dry-run` 通过（只读，留存卷名输出）
+- [x] 8.163.80.17 临时卷 actual 演练通过：新备份 093801Z 的 `drill-report.json` passed=true / failed=0 / 28 项检查，
+      主卷 CreatedAt/Mountpoint 不变、主容器未重启、主 center 30 表/业务 34 表不变、无 drill 残留
+- [ ] Lead 批准后中心库 `backup_records.restore_status=verified` 写入（当前 `--record-latest` 关联缺陷未修复，见第 9.3 节）
 
 ## 8. 文件导入修复及实际演练结果（2026-11-13 17:30 CST）
 
-第 5–7 节是此前修复过程记录；当前实现与证据以本节为准。
+第 5–7 节是此前修复过程记录；当前实现与证据以本节及第 9 节为准。
 
 ### 根因与修复
 
@@ -213,9 +213,67 @@ bash /opt/ventasync/deploy/scripts/restore_drill.sh \
 
 生产当前仅有 ventasync_center，但路由仍指向 mysql:3306/vs_tenant_kangkang_shop；API 实际 TENANT_ID=1，中心库租户 ID=3。这些在本轮开始时已存在，HTTP 200 不能证明商品业务正常。后续需单独恢复生产业务库并修正绑定，再完善备份覆盖检查。本轮只修正隔离候选配置，未触碰主 MySQL 卷。
 
+> 上述生产业务库缺失与 TENANT_ID 不一致已由第 9.1 节恢复修正；新备份隔离演练结果见第 9.2 节。
+
 ### 验证与部署
 
 - Linux 服务器 --self-test、原始包及候选包 --dry-run 通过。
 - 21 项针对性回归通过：dump/schema、卷隔离、查询失败、孤儿关联、合法空商品、密钥算法、绑定冲突。
 - npm run build 通过，构建输出到仓库外临时目录；未启动本地前后端。
 - 仅部署恢复脚本及 helper；未发布其它 agent 的 gateway/onboarding 应用变更，未执行生产 Compose up/down。
+
+## 9. 生产业务库恢复与新备份演练（2026-11-13 17:40 CST）
+
+### 9.1 生产业务库缺失与 TENANT_ID 修正
+
+演练事故后进一步核对发现：`8.163.80.17` 仅有 `ventasync_center`，**业务库 `vs_tenant_kangkang_shop` 缺失**；
+API 配置 `TENANT_ID=1`，而中心库该租户实际 `tenant_id=3`，路由与绑定不一致，HTTP 200 不能证明商品业务可用。
+
+已执行的生产恢复（由试点流程执行，QA 仅记录）：
+
+| 步骤 | 实际结果 |
+| --- | --- |
+| 业务库恢复 | 从 `/var/lib/ventasync-backups/releases/20261113T075322Z/vs_tenant_kangkang_shop.sql.gz` 恢复到 `vs_tenant_kangkang_shop` |
+| schema/表数 | **34 张表**，`alembic_version=tenant_0014` |
+| 数据库账号 | 创建/授权 `vs_t_3`（租户 3 业务账号） |
+| 配置修正 | `.env` 改为 `TENANT_ID=3`、`ERP_WORKER_TENANT_ID=3` |
+| 服务重启 | 重启 `api` / `worker` / `scheduler` |
+| 业务验证 | 登录 **200**、`products` **200**、租户站点 HTTP **200** |
+| 恢复后备份 | `/var/lib/ventasync-backups/releases/20261113T093925Z` |
+
+> 原批次 2 记录中的 `TENANT_ID=1` 为错误绑定，已用本轮生产恢复修正为 `3`；批次 2 历史记录中该值仅代表当时配置。
+
+### 9.2 新备份隔离恢复演练（实际通过）
+
+使用 9.1 恢复后的新备份做隔离演练（修复版脚本、独立项目/独立卷）：
+
+- 备份包：`/var/lib/ventasync-backups/releases/20261113T093801Z/bundle.tar.gz.enc`；
+- 命令：`bash deploy/scripts/restore_drill.sh --bundle <上述包> --yes`；
+- 报告：`/var/lib/ventasync-backups/drill-reports/ventasync-drill-20261113093839-6570/drill-report.json`；
+- 结果：**passed=true、failed=0、28 项检查通过**；
+- 主库/容器核对：主 `ventasync_center` **30 表**、业务 `vs_tenant_kangkang_shop` **34 表**，主容器**未重启**；
+- 清理：drill 容器/卷已清理，无 drill 残留。
+
+这说明第 4.1/5.1 节的隔离修复与安全断言已在实际演练中生效；本轮演练只使用 drill 专属项目/卷，不触碰主卷。
+
+### 9.3 遗留问题：backup_records 关联缺陷
+
+`restore_drill.sh --record-latest` 仍报：
+
+```text
+未找到唯一匹配本地 run_id/校验值的备份记录
+```
+
+核对结果：
+
+- `backup_records` 当前只有 `id=1`，且 `local_path`/`checksum` 为空；
+- 新演练的 `restore_status` **未写入 verified**；
+- 根因在备份记录与本地 run_id/checksum 的关联/回写逻辑，需要 backend-sales 修复；
+- 修复前：**可执行显式 `--bundle` 演练并保留报告，但不得宣称 `restore_status=verified` 或验收记录链闭合**。
+
+### 9.4 验收口径更新
+
+- 旧版脚本在 15:53 造成的事故记录仍有效（第 1–8 节）；
+- 修复版脚本在新备份上**演练执行通过**（passed=true/28 checks），主数据与主容器未受影响；
+- 但 `backup_records` 关联未闭合，**批次 3 恢复演练验收状态 = 执行通过、记录回写待修复**；
+- 后续正式演练：先 `--dry-run`，再用显式 `--bundle <包>` + `--yes`，保存报告；`--record-latest` 待修复后再用。

@@ -1,17 +1,18 @@
 # 备份加密、异地存储与恢复演练（批次3）
 
-> ## ⛔ STOP：恢复演练脚本安全冻结（2026-11-13 事故后）
+> ## ⚠️ 运行限制：事故已修复并实测通过，记录关联待修复（2026-11-13）
 >
-> 当前 `deploy/scripts/restore_drill.sh` **禁止在任何生产机运行任何模式**
-> （`--latest`、`--bundle`、`--record-latest`、`--self-test` 均暂停用于生产环境）。
+> - 2026-11-13 15:53 旧版 `restore_drill.sh` 误清主 MySQL `ventasync_center`（0 表）并停止主容器；
+>   已恢复中心库 **30 表**、业务库 **34 表**（`tenant_0014`），并修正 `TENANT_ID=3`/`ERP_WORKER_TENANT_ID=3`。
+> - 修复版脚本（独立项目/独立卷/启动前安全断言/双探针就绪/导入表数校验）已在新备份
+>   `093801Z` 上完成隔离演练：**passed=true / failed=0 / 28 项检查**，主中心 30/业务 34 表未变、
+>   主容器未重启、drill 容器/卷已清理。
+> - 遗留：`backup_records` 关联缺陷导致 `--record-latest` 报“未找到唯一匹配本地 run_id/校验值的备份记录”；
+>   当前只有 `id=1`，`local_path`/`checksum` 为空，`restore_status` 未写 `verified`。
+> - **修复前规则**：先 `--bundle <包> --dry-run`，再 `--bundle <包> --yes`；不要用 `--latest`/`--record-latest`
+>   声明记录闭合，不得写 `restore_status=verified`；生产恢复仍走“备份 + 人工核对 + Lead 审批”流程。
 >
-> 2026-11-13 约 15:53 CST，在 8.163.80.17 执行恢复演练时误清空主 MySQL 的 `ventasync_center`（0 表）
-> 并停止主业务容器；已从备份恢复（中心库 30 表、租户 HTTP 200），事故与恢复证据见
-> `docs/batch3-acceptance.md`“恢复演练事故与处置”。
->
-> 根因：脚本未真正隔离独立卷/安全断言不足，旧版本“独立项目、独立卷、不碰生产卷、无需停生产”的断言**不成立**。
-> 修复（独立卷 + 启动前安全断言）并重新验收前，**恢复演练状态 = 阻断/未通过**；
-> 生产恢复只能走“备份 + 人工核对 + Lead 审批”的应急流程，不得使用当前 `restore_drill.sh`。
+> 详细证据见 `docs/incident-2026-11-13-restore-drill.md` 第 9 节与 `docs/batch3-acceptance.md` 第 4 节。
 
 本文是批次3「备份加密异地与恢复演练」的实现说明与验收依据。目标：
 
@@ -20,8 +21,8 @@
 3. 默认**租户时区 03:30** 执行、保留 **30 天**；升级前额外备份由 Agent 步骤触发、后端登记；
 4. **加密上传独立私有备份存储**，不复用商品图片公开目录；完整记录
    本地生成 / 完整性校验 / 异地上传 / 恢复验证四类状态；
-5. 提供**隔离环境恢复脚本**与演练清单（⚠️ 当前脚本因事故安全冻结，修复前不可用于任何生产环境，
-   见本页顶部 STOP 与第 8 节）。
+5. 提供**隔离环境恢复脚本**与演练清单（修复版已在 2026-11-13 实测通过 28 项检查；
+   `--record-latest` 记录回写待 backend-sales 修复，见本页顶部运行限制与第 8 节）。
 
 相关文件：
 
@@ -30,7 +31,7 @@
 | `deploy/scripts/backup.sh` | 备份主脚本：导出数据库/配置/本地文件 → 清单校验 → 加密 → 异地 → 记录中心库 → 清理过期 |
 | `deploy/backup.sh` | Agent/手工入口（兼容旧路径，默认 `scheduled`，可用 `BACKUP_TRIGGER` 覆盖） |
 | `deploy/systemd/ventasync-backup.{service,timer}` | 每日 03:30（服务器本地时区）执行，保留 30 天 |
-| `deploy/scripts/restore_drill.sh` | ⛔ **安全冻结（2026-11-13 事故），禁止生产运行**；待修复独立卷/安全断言后重新验收 |
+| `deploy/scripts/restore_drill.sh` | 修复版：独立项目/独立卷/安全断言/就绪探针/导入表数校验；新备份 093801Z 实测 28 checks 通过；`--record-latest` 关联待修 |
 | `deploy/scripts/restore.sh` | 旧版单库应急恢复（保留，用于单库手工恢复） |
 | `backend/app/modules/ops/backup_cli.py` | 容器内 CLI：上报备份清单 / 恢复演练结果 / 查询最新记录 |
 | `backend/alembic/center/versions/0018_center_backup_recovery.py` | `backup_records` 状态字段扩展 |
@@ -182,8 +183,8 @@ journalctl -u ventasync-backup.service -n 50     # 最近一次结果
 * 备份脚本结束调用容器内 CLI：`python -m app.modules.ops.backup_cli apply`（清单 JSON 经环境变量传入，幂等按 `local_path` 去重）；
 * Agent `backup` 任务终态：`agent_job_event` 更新同一条记录（按 `storage_key` 去重）；
 * 升级成功：`_record_pre_upgrade_backup` 登记 `pre_upgrade`；
-* 恢复演练：**当前安全冻结，禁止生产执行**；旧 `restore_drill.sh --record-id/--record-latest` 回写流程暂停，
-  待独立卷/安全断言修复并重新验收后恢复；
+* 恢复演练：修复版脚本已通过隔离演练（28 checks）；`--record-latest` 因 `backup_records` 关联缺陷不可用，
+  待 backend-sales 修复后再恢复记录回写；
 * 平台接口：`GET /api/v1/platform/backups`、`GET /api/v1/platform/backups/{id}`、
   `POST /api/v1/platform/backups/{id}/restore-check`（平台管理员）。
 
@@ -205,49 +206,60 @@ bash deploy/scripts/backup.sh --trigger manual --center-only
 # dry-run：只打印计划
 bash deploy/scripts/backup.sh --dry-run --trigger pre_upgrade
 
-# ⛔ 恢复演练：当前 restore_drill.sh 已安全冻结（2026-11-13 事故），禁止在生产机执行任何模式；
-#    修复独立卷/安全断言并重新验收后，再由 Lead 发布新的演练命令说明。
-#    原 `--self-test` / `--latest --record-latest` / `--bundle ... --record-id` 命令暂时撤回。
+# 恢复演练（修复版；必须显式 --bundle，先 dry-run）
+bash deploy/scripts/restore_drill.sh --bundle /var/lib/ventasync-backups/releases/<ts>/bundle.tar.gz.enc --dry-run
+bash deploy/scripts/restore_drill.sh --bundle /var/lib/ventasync-backups/releases/<ts>/bundle.tar.gz.enc --yes
+
+# ⛔ `--latest`/`--record-latest` 在 backup_records 关联修复前不可用于回写；
+#    不得用它们声明 restore_status=verified 或验收记录闭环。
 ```
 
 `backup_cli.py` 支持：`apply`（上报清单）、`restore-check`（恢复演练结果）、`latest`（查询最新记录）。
 
-## 8. 恢复演练（已安全冻结，禁止生产执行）
+## 8. 恢复演练（修复版；记录回写待修复）
 
-> **STOP**：2026-11-13 约 15:53 CST，在 8.163.80.17 执行旧版 `restore_drill.sh` 时误清空主 MySQL
-> `ventasync_center`（0 表）并停止主业务容器；随后从备份恢复（中心库 30 表、租户 HTTP 200）。
-> 当前脚本“独立项目/独立卷/不碰生产卷/无需停生产”的断言已证伪，**禁止在任何生产机运行任何模式**。
-> 详细事故与恢复证据见 `docs/batch3-acceptance.md`。
+> **背景**：2026-11-13 约 15:53 CST，旧版 `restore_drill.sh` 在 8.163.80.17 误清空主 MySQL
+> `ventasync_center`（0 表）并停止主业务容器；已从 075322Z 备份恢复中心库 30 表/业务库 34 表，
+> 事故与根因见 `docs/incident-2026-11-13-restore-drill.md`。
 
-### 8.1 当前状态与禁用范围
+### 8.1 修复版实际结果（2026-11-13 17:xx CST）
 
-- 状态：**恢复演练 = 阻断/未通过**（不得记录 `restore_status=verified`，不得写“恢复演练通过”）；
-- 禁用：`restore_drill.sh` 的全部运行模式（`--latest`/`--bundle`/`--record-latest`/`--self-test`）用于生产环境；
-- 旧版本节“真实机执行前提”“执行命令”“隔离规则”“通过标准”已整体撤回，不能再按旧文档执行；
-- 生产数据库恢复：仅允许 Lead 审批的应急流程（停写 → 备份最新状态 → 用已验证备份人工恢复中心/租户库
-  → 校验 → 恢复服务），不得使用当前 `restore_drill.sh`。
+- 修复内容：独立项目/独立卷、启动前安全断言、双探针就绪等待、导入前后表数校验、清理保护；
+- 新备份：`/var/lib/ventasync-backups/releases/20261113T093801Z/bundle.tar.gz.enc`；
+- 命令：`bash deploy/scripts/restore_drill.sh --bundle <上述包> --yes`；
+- 报告：`/var/lib/ventasync-backups/drill-reports/ventasync-drill-20261113093839-6570/drill-report.json`；
+- 结果：**passed=true / failed=0 / 28 项检查**；主 center **30 表**、业务 **34 表**，主容器未重启，
+  drill 容器/卷已清理、无残留。
 
-### 8.2 修复要求（backend-sales 修复后重新验收）
+### 8.2 当前限制（记录关联待修复）
 
-1. **独立卷**：演练使用显式独立的 compose 项目名与命名卷；启动前断言项目名/卷名/容器名/数据目录与生产不重合；
-2. **安全断言**：校验 `.env`/compose 输入不指向生产、目标 MySQL 不发布生产端口、演练库名/卷名白名单；
-3. **危险操作防护**：禁止 down/volume 删除生产资源；失败自动清理演练资源并保留报告；
-4. **dry-run/确认**：默认 dry-run，真实执行需显式确认令牌与隔离主机标记；
-5. 修复后重新编写“隔离主机演练”清单，先在非生产主机验证通过，再由 Lead 审批恢复演练流程。
+- `--record-latest` 报 `未找到唯一匹配本地 run_id/校验值的备份记录`；
+- `backup_records` 当前只有 `id=1`，`local_path`/`checksum` 为空，`restore_status` 未写 `verified`；
+- 需要 backend-sales 修复备份记录与本地 run_id/校验值的关联/回写；
+- 修复前：可执行显式 `--bundle` 演练并保留报告，但**不得写 `restore_status=verified`、不得宣称记录链闭合**。
+
+### 8.3 安全执行规则
+
+1. 先 `--dry-run` 确认卷名全部为 drill 专属、mysql 无生产端口发布；
+2. 使用**显式 `--bundle <包>`**（不要用 `--latest` 盲选），且确认该包包含主中心库 + 全部租户业务库；
+3. 演练前后核对主中心/业务表数、主容器启动时间、主卷 Mountpoint 不变；
+4. 保存 `drill-report.json`、卷名列表、`docker inspect` 证据；
+5. `--record-latest` 修复后重跑一次并补写 `restore_status=verified`，才算验收记录闭环；
+6. 生产数据库恢复仍走“备份 + 人工核对 + Lead 审批”，不要把演练通过当作生产恢复完成。
 
 ## 9. 验收证据记录模板
 
-> 当前 `restore_drill.sh` 安全冻结：**禁止产生 `restore_status=verified` 或“恢复演练通过”记录**；
-> 以下模板仅在修复并重新验收后使用。
+> 修复版演练 `passed=true` 可记录，但 `restore_status` 在 `backup_records` 关联修复前**不得写 verified**；
+> 记录链是否闭环以平台备份记录为准。
 
 ```text
 日期：YYYY-MM-DD
 环境：实例 ID / 域名 / 版本
 备份：run_id=...  trigger=scheduled/pre_upgrade  local_status=verified
        checksum=sha256:...  offsite_status=uploaded (s3://bucket/key)
-记录：backup_records.id=...  local_path=...  restore_status=<冻结期间不得写 verified>
-演练：<冻结期间不得写 passed=true>；修复后按新验收流程记录报告路径与明细
-异常：无 / 失败项与跟进人
+记录：backup_records.id=...  local_path=...  restore_status=<关联修复前不得写 verified>
+演练：drill-report.json 路径=...  passed=true/failed=0/检查项=...；记录关联修复后补 verified
+异常：无 / 失败项与跟进人（含 backup_records 关联缺陷）
 ```
 
 ## 10. 故障处理
@@ -258,7 +270,7 @@ bash deploy/scripts/backup.sh --dry-run --trigger pre_upgrade
 | 异地失败（退出码 2） | 本地包保留；检查 `BACKUP_OFFSITE_*`/桶权限/网络；修复后重跑或手工补传；`offsite_status=failed` 记录原因 |
 | 中心库不可达导致记录失败 | 备份有效，仅告警；恢复中心库后按清单手工补录（`backup_cli apply`） |
 | 密钥文件丢失 | 异地包无法解密；改用保留期内的本地明文库导出恢复；立即重建密钥并重做异地备份 |
-| 恢复演练异常/事故 | 立即停止演练并上报 Lead；**禁止运行当前 restore_drill.sh**，按“备份 + 人工核对”的应急恢复流程处置；恢复后重新备份并核对服务健康；修复独立卷/安全断言后重新验收 |
+| 恢复演练异常/事故 | 立即停止并上报 Lead；修复版也必须先 `--dry-run` + 显式 `--bundle`；禁止用 `--record-latest` 写 verified；按“备份 + 人工核对”应急恢复后重新备份并核对服务健康 |
 | 磁盘空间不足 | 调低 `BACKUP_RETENTION_DAYS`、清理旧 releases、把 `BACKUP_ROOT` 挂到独立数据盘 |
 
 ## 11. center_0018 迁移、验证与回滚（中心服务器 121.37.45.132）

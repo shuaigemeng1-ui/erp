@@ -77,6 +77,11 @@
 | 再次 GET 节点 SSH 指纹 | `fingerprint_status=verified`（与首次记录一致） |
 | 说明 | 首次连接为 TOFU 记录；当前实现指纹匹配为 verified，不一致会拒绝并告警；本次未做真实 mismatch 演练（由单测覆盖） |
 
+> **后续更正（2026-11-13 生产恢复）**：`8.163.80.17` 实际租户为 `tenant_id=3`，原 `TENANT_ID=1` 为错误绑定；
+> 生产恢复时已改为 `TENANT_ID=3`/`ERP_WORKER_TENANT_ID=3`，并恢复业务库 `vs_tenant_kangkang_shop`（34 表）。
+> 本节 `TENANT_ID=1` 仅代表当时配置，详见 `docs/batch3-acceptance.md` 第 4 节与
+> `docs/incident-2026-11-13-restore-drill.md` 第 9 节。
+
 ### 3.5 试点结论
 
 - 中心 `1da80c2` + `center_0017` 部署完成，发布版本自动登记字段正确（verified / 协议 2 / center_0017 / tenant_0014）。
@@ -93,8 +98,8 @@
 
 ## 5. 批次 2 剩余风险与待完成项
 
-1. **tenant 模式部署参数**：本次试点已用 `TENANT_ID=1`/`INSTANCE_ID=1` 实测通过；第二租户/第二台实例仍需按实例显式配置
-   （含别名环境变量），未配置/不一致会拒绝平台和跨租户访问，部署清单需逐实例补充。
+1. **tenant 模式部署参数**：本次试点已用 `TENANT_ID=1`/`INSTANCE_ID=1` 实测通过（后更正为 `TENANT_ID=3`）；
+   第二租户/第二台实例仍需按实例显式配置（含别名环境变量），未配置/不一致会拒绝平台和跨租户访问，部署清单需逐实例补充。
 2. **SSH TOFU 首次指纹**：本次已真实记录 `SHA256:T2cB1vQn5bvCsJ9BPqmui5IIb+7vR/n1tuseQFY8LYE`（ssh-ed25519）并在再次查询时为
    `verified`；仍需把“首指纹人工核对”纳入运维流程，真实 mismatch/重置演练待补（单测已覆盖）。
 3. **SSH 审计标签**：新增 `ssh.*` 平台审计动作（connect/command/fingerprint reset/mismatch 等）需要核对

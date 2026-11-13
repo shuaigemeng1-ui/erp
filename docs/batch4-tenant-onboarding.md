@@ -8,7 +8,8 @@
 
 > 本文件是“第二个独立租户”的可复制接入手册。真实域名切换、OAuth 回调重登记、店铺凭据迁移、
 > Agent2 安装与 SSH 首指纹确认**尚未在第二租户真实执行**；执行前必须经 Lead 审批并完成第 4/5 节停写与对账。
-> 禁止在任何生产机运行当前 `restore_drill.sh`（事故后冻结，恢复演练=阻断/未通过）。
+> 恢复演练脚本旧版曾造成事故，修复版已在新备份通过 28 项检查；但 `backup_records` 记录关联待修复，
+> 不得写 `restore_status=verified`（详见 `docs/incident-2026-11-13-restore-drill.md` 第 9 节）。
 
 ## 1. 目标与边界
 
@@ -159,7 +160,7 @@ sudo bash deploy/scripts/tenant-onboarding/migrate.sh --apply --stop-write \
 4. `migrate.sh --plan` 确认迁移清单；需要停写时按 4.5 执行 `reconcile.sh --stop-write`；
 5. 拉取/切换镜像并滚动启动 API/Worker/Scheduler（`docker compose ... up -d`），外部 TLS 由 Caddy 保持；
 6. 验证：`/api/v1/runtime` mode=tenant、`/healthz` 200、租户登录/商品/订单冒烟、版本=目标 tag；
-7. 失败：停止发布、回退镜像；数据库回退只能从升级前备份恢复（Lead 审批），**禁止用冻结的 restore_drill**；
+7. 失败：停止发布、回退镜像；数据库回退只能从升级前备份恢复（Lead 审批），演练操作必须先 `--dry-run` 且不得写 `restore_status=verified`；
 8. 记录发布 job/审计/备份 ID 与验证结果；旧实例在确认无回切前保持停机/只读。
 
 ## 5. 迁移白名单与保留标识
@@ -251,7 +252,8 @@ python backend/scripts/tenant_migration_whitelist.py compare-tsv \
 1. 选择最近备份（记录 `backup_records.id`/路径/校验和），确认本地/异地状态；
 2. 在隔离环境/人工核对下恢复；恢复后校验中心/租户表数、账号/权限/商品/订单数量与备份一致；
 3. 依次启动 API/Worker/Scheduler，做登录/商品/订单冒烟；确认唯一写实例后再放流量；
-4. 结论只写“恢复验证通过/失败”，**不得写“恢复演练通过”**（当前演练脚本不安全）。
+4. 结论只写“恢复验证通过/失败”；演练执行通过不等于记录闭环，`restore_status=verified` 在 `backup_records`
+   关联修复前不得写入。
 
 ## 8. 验收证据模板
 
@@ -279,7 +281,13 @@ python backend/scripts/tenant_migration_whitelist.py compare-tsv \
 
 未执行/待 Lead 决策：
 
-- 第二租户真实开通、域名切换、OAuth 回调重登记、店铺凭据迁移；
+- 第二租户真实开通、域名切换、OAuth 回调重登记、店铺凭据迁移；**第二租户仍未部署**；
 - `copy_data.sh --apply`、`migrate.sh --apply`、stop-write/resume 真机演练；
 - 中心断网、Agent 重启、发布失败、恢复验证的真实演练；
-- 独立网关（task-35）与恢复演练修复（task-34）仍进行中，不纳入本模板链路。
+- 独立网关（task-35）代码已合入但**未部署**，且不纳入本模板链路；恢复演练记录关联修复（backend-sales）待完成。
+
+生产现状补充（2026-11-13 17:40 CST）：
+
+- `8.163.80.17` 已恢复业务库 `vs_tenant_kangkang_shop`（34 表、schema `tenant_0014`）、创建/授权 `vs_t_3`；
+- `.env` 已修正 `TENANT_ID=3`/`ERP_WORKER_TENANT_ID=3`，登录 200 / products 200 / tenant 200；
+- 新备份 `093925Z`；新备份隔离演练 passed=true/28 checks，但 `--record-latest` 关联缺陷未修复。

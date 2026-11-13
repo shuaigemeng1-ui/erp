@@ -52,7 +52,7 @@
 | `node_metric_aggregates` | ops | node_id, resolution(5m/1h), bucket_start, sample_count, cpu_avg/cpu_max, memory_avg/memory_max, load_avg, disk_max, created_at；唯一(bucket_start,node_id,resolution)；追加型，不要求updated_at |
 | `node_checks` | ops | node_id, checked_at, target(root/healthz/api), url, ok, status_code, latency_ms, cert_days_left, error；索引(node_id,checked_at)；追加型 |
 | `alert_events` | ops | node_id, instance_id, alert_type, severity(warning/critical), status(open/acknowledged/resolved), message, metric_value, threshold, first_seen_at, last_seen_at, acknowledged_at, resolved_at, notify_count, last_notified_at；索引(node_id,status)、(last_seen_at) |
-| `backup_records` | ops | instance_id, node_id(可空), job_id(可空), status(running/succeeded/failed), storage_key, size_bytes, started_at, finished_at, retention_until, error；索引(instance_id,started_at)；追加型 |
+| `backup_records` | ops | instance_id, node_id(可空), job_id(可空), status(running/succeeded/failed), trigger(manual/scheduled/pre_upgrade), local_status(pending/generated/verified/failed), local_path(工作目录外), verified_at, checksum_status(pending/verified/failed), checksum(sha256), offsite_status(pending/uploaded/failed/skipped), offsite_key, offsite_bucket(私有存储，不复用图片目录), encryption(aes-256-cbc/pbkdf2), restore_status(not_tested/verified/failed；当前演练冻结，禁止写 verified), restore_verified_at, restore_notes, failure_reason, stages(JSON 生成/校验/上传/恢复), manifest_json(JSON 清单), storage_key, size_bytes, started_at, finished_at, retention_until, error；索引(instance_id,started_at)、(trigger,status)；追加型 |
 | `maintenance_windows` | ops | instance_id, starts_at, ends_at, reason, created_by；索引(instance_id,starts_at,ends_at) |
 
 ## 租户库（`TenantBase`）
@@ -138,6 +138,7 @@
 | 中心库 | `alembic/center/versions/0015_center_server_ssh.py` | center_0015 | 服务器节点 SSH 主机/端口及用户名、密码密文字段；无外键。 |
 | 中心库 | `alembic/center/versions/0016_center_release_upgrade.py` | center_0016 | 批次 1：发布版本清单与升级校验字段（完整 commit、构建配置摘要、最低 Agent 协议、center/tenant DB 目标版本、回退兼容、构建状态），实例/节点实际版本与升级状态，任务执行批次/租约/心跳/事件水位/升级检查结果；全部新增列可空或带默认值，无外键。 |
 | 中心库 | `alembic/center/versions/0017_center_tenant_mode.py` | center_0017 | 批次 2：实例隔离与租户模式边界——`tenant_instances` 增加 `deployment_mode`（shared/independent）与 `migration_status`（registered/migrating/migrated/rollback）及索引；`server_nodes` 增加 SSH 主机指纹 `ssh_host_fingerprint`、首次确认时间 `ssh_host_fingerprint_verified_at`、算法 `ssh_fingerprint_algorithm`（当前固定 SHA256）；新增列可空或带默认值，无外键。 |
+| 中心库 | `alembic/center/versions/0018_center_backup_recovery.py` | center_0018 | 批次 3：`backup_records` 增加触发来源、本地生成/校验、异地上传/加密、恢复验证与阶段流水/清单等状态列，支持“本地生成→完整性校验→加密上传私有存储→隔离恢复验证”四阶段追踪；备份产物移出 Git 工作目录（`/var/lib/ventasync-backups`，目录 700/文件 600）；全部新列可空或带默认值，无外键、中文字段注释。恢复演练脚本当前安全冻结（见 `docs/batch3-acceptance.md` 事故记录），禁止生产运行。 |
 | 租户库 | `alembic/tenant/versions/0001_tenant_identity.py` | tenant_0001 | 租户库基线：角色、权限、绑定范围、租户设置、功能开关、审计与支撑表（tenant_0001）。 |
 | 租户库 | `alembic/tenant/versions/0002_tenant_catalog.py` | tenant_0002 | 租户库：商品、SKU、图片、库存地点、库存余额、库存流水。 |
 | 租户库 | `alembic/tenant/versions/0003_tenant_channels.py` | tenant_0003 | 租户库迁移：店铺、店铺凭据、平台商品与 SKU 映射。 |
@@ -153,7 +154,7 @@
 | 租户库 | `alembic/tenant/versions/0013_tenant_supplier_contacts.py` | tenant_0013 | 供应商增加选填联系人、联系方式和备注，保留原供应商及商品关联，无外键。 |
 | 租户库 | `alembic/tenant/versions/0014_tenant_local_users.py` | tenant_0014 | 租户本机账号表（独立实例模式本地登录）：来源中心用户ID、邮箱、密码哈希、成员编号、负责人标记与同步时间；唯一(tenant_id,email)、(tenant_id,source_user_id)，无外键。 |
 
-模型业务表：中心库 29 张、租户库 33 张（均不计 Alembic 版本表），完整版本图共 31 个迁移文件（center 17 + tenant 14）。当前末端为中心库 `center_0017`、租户库 `tenant_0014`。
+模型业务表：中心库 29 张、租户库 33 张（均不计 Alembic 版本表），完整版本图共 32 个迁移文件（center 18 + tenant 14）。当前末端为中心库 `center_0018`、租户库 `tenant_0014`。
 
 批次 2 部署形态说明：运行模式 `deployment_mode` 取 `center`（统一管理中心）/`tenant`（租户独立实例，固定绑定 `TENANT_ID`/`INSTANCE_ID`，拒绝 `/platform`、`/agent` 接口并返回统一 404）/`gateway`（独立集成网关，仅网关接口与健康检查）。实例迁移状态为 `migrating`/`migrated` 的租户不参与旧中心业务调度，也不能用普通“启用租户”恢复写入。详见 `docs/batch2-acceptance.md`。
 

@@ -1,6 +1,32 @@
-# 当前仓库契约状态（批次 2，2026-11-13，离线 02846cf / 试点 1da80c2）
+# 当前仓库契约状态（批次 3，2026-11-13，离线 3ae757e / 生产试点 3ae757e）
 
-> 本节为批次 2 离线验收 + 生产试点结论；批次 1 试点记录保留在下节（历史）。批次 2 详细证据见 `docs/batch2-acceptance.md`。
+> 本节为批次 3 离线验收 + 生产试点 + 恢复演练事故结论；批次 2/1 记录保留为历史。
+> 批次 3 详细证据见 `docs/batch3-acceptance.md`；备份/恢复约束见 `docs/backup-restore.md` 顶部 STOP。
+
+| 检查 | 当前结果 |
+| --- | --- |
+| 后端测试 | `cd backend; python -m pytest -q` → **591 passed**，exit 0（1 条上游 Starlette 弃用提示） |
+| Agent 测试 | `cd agent; python -m pytest -q` → **22 passed**，exit 0 |
+| 前端构建 | `npm run build` exit 0（验收用临时 `--outDir`，未修改受版本管理的 `frontend/dist`；是否更新 dist 由 Lead 决定） |
+| 迁移图 | 32 个迁移文件：中心库 `center_0018 (head)`（18 个）、租户库 `tenant_0014 (head)`（14 个）；离线 SQL 0 外键、中文注释完整 |
+| 业务表 | 中心库 **29** 张、租户库 **33** 张（均不计 `alembic_version`）；`backup_records` 四阶段状态字段已写入 `docs/data-model.md` |
+| 完整契约检查 | **38/38 通过**，0 失败 0 警告（补齐 `center_0018` 迁移基线后） |
+| 批次 3 交付 | 备份加密/异地存储与 `backup_records` 状态（`center_0018`）、监控/请求性能/告警/watchdog、前端监控总览与备份阶段/维护窗口展示 |
+| 生产试点 | `3ae757e` 中心/租户已部署；job 43 `succeeded`/`checks passed`，tenant HTTP 200；监控/性能/备份 UI 上线 |
+| ⛔ 恢复演练（事故） | **阻断/未通过，禁止写“通过”**：2026-11-13 约 15:53 CST 在 8.163.80.17 执行旧版 `restore_drill.sh` 清空主 `ventasync_center`（0 表）并停止主容器；用 `/var/lib/ventasync-backups/releases/20261113T075322Z/ventasync_center.sql.gz`（138866 字节，UTC 07:53:22，`--no-record` 无 backup_records ID）恢复后中心库 30 表；compose up 后 api healthy、nginx started、租户 HTTP 200；随后备份 `20261113T075459Z` exit 0。当前脚本不安全，禁止任何生产机再运行，待 backend-sales 修复独立卷/安全断言后重新验收 |
+| 剩余风险 | 恢复演练修复与隔离主机重新验收；生产恢复需 Lead 审批且备份记录可追溯；监控/告警真实环境持续观察；第二租户/网关/维护状态等仍在后续批次 |
+
+补充说明：
+
+- **恢复演练结论固定为阻断/未通过**：事故恢复成功不等于恢复演练通过；`restore_status=verified` 不得写入。
+- `docs/backup-restore.md` 已加 STOP 警告、撤回旧版生产执行命令与“独立卷不碰生产”的错误断言，改列修复要求。
+- 批次 2 试点（`1da80c2`）与批次 1 试点（`2e34e6b`）记录见下节历史及各自验收文档。
+
+---
+
+# 批次 2 验收状态（历史，2026-11-13，离线 02846cf / 试点 1da80c2）
+
+> 本节为批次 2 历史结论；批次 2 详细证据见 `docs/batch2-acceptance.md`。
 
 | 检查 | 当前结果 |
 | --- | --- |

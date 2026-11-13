@@ -45,6 +45,28 @@ class TenantInstance(IdMixin, TimestampMixin, CenterBase):
     app_version: Mapped[str] = mapped_column(
         String(64), nullable=False, default="", server_default="", comment="当前部署版本"
     )
+    actual_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="", comment="实际运行版本（Agent上报）"
+    )
+    target_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="", comment="升级目标版本（空表示无进行中的目标）"
+    )
+    agent_version: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="", server_default="", comment="Agent版本"
+    )
+    executor_version: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="", server_default="", comment="运维执行器版本"
+    )
+    db_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="", comment="当前数据库版本（Alembic revision）"
+    )
+    upgrade_status: Mapped[str] = mapped_column(
+        String(24),
+        nullable=False,
+        default="unknown",
+        server_default="unknown",
+        comment="升级状态：pending/building/maintenance/migrating/verifying/succeeded/failed/unknown",
+    )
     notes: Mapped[str] = mapped_column(
         String(500), nullable=False, default="", server_default="", comment="备注"
     )
@@ -83,6 +105,22 @@ class ServerNode(IdMixin, TimestampMixin, CenterBase):
     agent_version: Mapped[str] = mapped_column(
         String(32), nullable=False, default="", server_default="", comment="Agent版本"
     )
+    executor_version: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="", server_default="", comment="运维执行器版本"
+    )
+    protocol_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+        comment="Agent协议版本（整数，用于与发布版本最低协议比对）",
+    )
+    capabilities_json: Mapped[list[str] | None] = mapped_column(
+        JSON, nullable=True, comment="Agent能力列表（心跳上报）"
+    )
+    db_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="", comment="节点上报的数据库版本"
+    )
     app_version: Mapped[str] = mapped_column(
         String(64), nullable=False, default="", server_default="", comment="应用版本"
     )
@@ -91,6 +129,9 @@ class ServerNode(IdMixin, TimestampMixin, CenterBase):
     )
     enrolled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="注册完成时间UTC")
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="最后心跳UTC")
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, comment="最后任务执行心跳UTC"
+    )
     last_metrics_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="最后指标UTC")
     token_hash: Mapped[str] = mapped_column(String(128), nullable=False, comment="节点访问令牌摘要")
     token_version: Mapped[int] = mapped_column(
@@ -172,8 +213,8 @@ class AlertEvent(IdMixin, TimestampMixin, CenterBase):
     node_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="节点ID")
     instance_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="实例ID")
     alert_type: Mapped[str] = mapped_column(String(64), nullable=False, comment="告警类型")
-    severity: Mapped[str] = mapped_column(String(16), nullable=False, default="warning", comment="warning/critical")
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open", comment="open/acknowledged/resolved")
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default="warning", comment="告警级别：warning=警告，critical=严重")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open", comment="告警状态：open=待处理，acknowledged=已确认，resolved=已恢复")
     message: Mapped[str] = mapped_column(String(500), nullable=False, default="", comment="告警说明")
     metric_value: Mapped[str] = mapped_column(String(64), nullable=False, default="", comment="触发值")
     threshold: Mapped[str] = mapped_column(String(64), nullable=False, default="", comment="阈值")
@@ -195,7 +236,56 @@ class ReleaseVersion(IdMixin, TimestampMixin, CenterBase):
     version: Mapped[str] = mapped_column(String(64), nullable=False, comment="版本号")
     image_tag: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="", comment="镜像标签")
     image_digest: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="", comment="镜像摘要")
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active", comment="draft/active/retired")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active", comment="发布状态：draft=草稿，active=可用，retired=已退役")
+    commit_sha: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="",
+        server_default="",
+        comment="完整Git提交号（40或64位十六进制，旧记录为空）",
+    )
+    build_config_summary: Mapped[str] = mapped_column(
+        String(500),
+        nullable=False,
+        default="",
+        server_default="",
+        comment="构建配置摘要（构建参数/依赖锁摘要）",
+    )
+    min_agent_protocol: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+        comment="最低Agent协议版本（整数）",
+    )
+    center_db_version: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="",
+        server_default="",
+        comment="运行模式center的数据库目标版本（Alembic revision）",
+    )
+    tenant_db_version: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="",
+        server_default="",
+        comment="运行模式tenant的数据库目标版本（Alembic revision）",
+    )
+    rollback_compatible: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("0"),
+        comment="是否允许旧应用兼容新库（回退兼容声明）",
+    )
+    build_status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="built",
+        server_default="built",
+        comment="构建状态：built/verified/failed",
+    )
     notes: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="", comment="发布说明")
     created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="创建人用户ID")
 
@@ -211,10 +301,59 @@ class OperationJob(IdMixin, TimestampMixin, CenterBase):
 
     instance_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="实例ID")
     node_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="节点ID")
-    job_type: Mapped[str] = mapped_column(String(32), nullable=False, comment="deploy/upgrade/restart/backup/logs/config")
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending", comment="pending/leased/running/succeeded/failed/unknown")
+    job_type: Mapped[str] = mapped_column(String(32), nullable=False, comment="任务类型：deploy=部署，upgrade=升级，restart=重启，backup=备份，logs=日志，config=配置")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending", comment="任务状态：pending=待领取，leased=已领取，running=执行中，succeeded=成功，failed=失败，unknown=结果待核对")
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, comment="幂等键")
     target_version: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default="", comment="目标版本")
+    actual_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="", comment="执行后实际版本"
+    )
+    agent_version: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="", server_default="", comment="执行该任务的Agent版本"
+    )
+    agent_protocol_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+        comment="执行该任务的Agent协议版本（整数）",
+    )
+    db_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="", comment="执行后实际数据库版本"
+    )
+    upgrade_status: Mapped[str] = mapped_column(
+        String(24),
+        nullable=False,
+        default="",
+        server_default="",
+        comment="升级状态：pending/building/maintenance/migrating/verifying/succeeded/failed/unknown",
+    )
+    attempt_id: Mapped[str] = mapped_column(
+        String(36), nullable=False, default="", server_default="", comment="当前执行批次ID（每次领取重新生成）"
+    )
+    lease_token: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="", comment="执行租约令牌（事件需回传，防旧租约写入）"
+    )
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, comment="Agent执行心跳UTC"
+    )
+    event_seq: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+        comment="已接收事件序号水位（去重与断线重放）",
+    )
+    checks_json: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSON, nullable=True, comment="升级校验结果（数据库版本/服务就绪/业务只读）"
+    )
+    checks_status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="",
+        server_default="",
+        comment="校验结论：passed/failed/partial/missing/空",
+    )
     payload_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, comment="任务参数")
     result_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, comment="执行结果")
     error: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="", comment="失败原因")
@@ -236,7 +375,7 @@ class OperationJobStep(IdMixin, CenterBase):
     job_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="任务ID")
     step_no: Mapped[int] = mapped_column(Integer, nullable=False, comment="步骤序号")
     name: Mapped[str] = mapped_column(String(64), nullable=False, comment="步骤名称")
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending", comment="pending/running/succeeded/failed/skipped")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending", comment="步骤状态：pending=待执行，running=执行中，succeeded=成功，failed=失败，skipped=跳过")
     message: Mapped[str] = mapped_column(String(1000), nullable=False, default="", server_default="", comment="脱敏消息")
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="开始UTC")
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="完成UTC")
@@ -252,7 +391,7 @@ class BackupRecord(IdMixin, CenterBase):
     instance_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="实例ID")
     node_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="节点ID")
     job_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="运维任务ID")
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running", server_default="running", comment="running/succeeded/failed")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running", server_default="running", comment="备份状态：running=执行中，succeeded=成功，failed=失败")
     storage_key: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="", comment="备份存储键")
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0", comment="备份大小字节")
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, comment="开始UTC")

@@ -10,6 +10,29 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 DOMAIN_RE = re.compile(r"^(?=.{1,255}$)(?!-)[a-zA-Z0-9-]{1,63}(?<!-)(\.(?!-)[a-zA-Z0-9-]{1,63}(?<!-))+$")
+# 完整 Git 提交号：40 位（SHA-1）或 64 位（SHA-256）十六进制
+COMMIT_SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+
+BUILD_STATUSES = ("built", "verified", "failed")
+RELEASE_STATUSES = ("draft", "active", "retired")
+UPGRADE_STATUSES = (
+    "pending",
+    "building",
+    "maintenance",
+    "migrating",
+    "verifying",
+    "succeeded",
+    "failed",
+    "unknown",
+)
+
+
+def normalize_commit_sha(value: str) -> str:
+    """校验并规范化完整 Git commit（只接受 40/64 位十六进制），返回小写。"""
+    normalized = (value or "").strip().lower()
+    if not COMMIT_SHA_RE.fullmatch(normalized):
+        raise ValueError("commit_sha 必须是完整的 40 或 64 位十六进制 Git 提交号")
+    return normalized
 
 
 class InstanceCreate(BaseModel):
@@ -63,6 +86,9 @@ class NodeEnrollIn(BaseModel):
     internal_ips: list[str] = Field(default_factory=list, max_length=32)
     public_ip: str = Field(default="", max_length=64)
     agent_version: str = Field(default="", max_length=32)
+    executor_version: str = Field(default="", max_length=32)
+    protocol_version: int = Field(default=0, ge=0, le=10000)
+    capabilities: list[str] = Field(default_factory=list, max_length=64)
     app_version: str = Field(default="", max_length=64)
     metadata: dict[str, Any] | None = None
 
@@ -93,6 +119,10 @@ class TelemetryPayload(BaseModel):
     internal_ips: list[str] = Field(default_factory=list, max_length=32)
     public_ip: str = Field(default="", max_length=64)
     agent_version: str = Field(default="", max_length=32)
+    executor_version: str = Field(default="", max_length=32)
+    protocol_version: int = Field(default=0, ge=0, le=10000)
+    capabilities: list[str] = Field(default_factory=list, max_length=64)
+    db_version: str = Field(default="", max_length=64)
     app_version: str = Field(default="", max_length=64)
 
     cpu_percent: float = Field(default=0, ge=0, le=100)
@@ -116,11 +146,26 @@ class AlertAckIn(BaseModel):
 
 
 class ReleaseCreate(BaseModel):
+    """登记发布版本：必须携带完整 Git commit，构建/数据库目标版本可空。"""
+
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     version: str = Field(min_length=1, max_length=64)
     image_tag: str = Field(default="", max_length=255)
     image_digest: str = Field(default="", max_length=255)
+    commit_sha: str = Field(min_length=40, max_length=64, description="完整 Git 提交号（40/64 位十六进制）")
+    build_config_summary: str = Field(default="", max_length=500)
+    min_agent_protocol: int = Field(default=0, ge=0, le=10000)
+    center_db_version: str = Field(default="", max_length=64)
+    tenant_db_version: str = Field(default="", max_length=64)
+    rollback_compatible: bool = Field(default=False)
+    build_status: Literal["built", "verified", "failed"] = "built"
+    status: Literal["draft", "active", "retired"] = "active"
     notes: str = Field(default="", max_length=500)
+
+    @field_validator("commit_sha")
+    @classmethod
+    def validate_commit_sha(cls, value: str) -> str:
+        return normalize_commit_sha(value)
 
 
 class OperationCreate(BaseModel):
@@ -140,6 +185,29 @@ class AgentJobEvent(BaseModel):
     message: str = Field(default="", max_length=1000)
     result: dict[str, Any] | None = None
     error: str = Field(default="", max_length=500)
+    # 执行批次与租约（新 Agent 携带；旧 Agent 为空时按兼容模式处理）
+    attempt_id: str = Field(default="", max_length=36)
+    lease_token: str = Field(default="", max_length=128)
+    event_seq: int = Field(default=0, ge=0, le=1_000_000)
+    agent_protocol_version: int = Field(default=0, ge=0, le=10000)
+    # 升级校验结果：{"db_version": {"ok": true, "value": "...", "message": ""}, ...}
+    checks: dict[str, Any] | None = None
+
+
+class AgentHeartbeatIn(BaseModel):
+    """Agent 心跳（任务执行期或空闲期）：协议/版本/能力/数据库版本。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    agent_version: str = Field(default="", max_length=32)
+    executor_version: str = Field(default="", max_length=32)
+    protocol_version: int = Field(default=0, ge=0, le=10000)
+    db_version: str = Field(default="", max_length=64)
+    app_version: str = Field(default="", max_length=64)
+    capabilities: list[str] = Field(default_factory=list, max_length=64)
+    job_id: int | None = Field(default=None, ge=1)
+    attempt_id: str = Field(default="", max_length=36)
+    lease_token: str = Field(default="", max_length=128)
+    event_seq: int = Field(default=0, ge=0, le=1_000_000)
 
 
 class MaintenanceWindowCreate(BaseModel):

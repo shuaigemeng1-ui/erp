@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import httpx
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import func, or_, select
 
 from app.core.errors import AppError, ConflictError, ErrorCode
 from app.db.base import utcnow
@@ -21,6 +21,9 @@ from app.modules.ops.models_center import (
     TenantInstance,
 )
 from app.modules.ops.schemas import (
+    COMMIT_SHA_RE,
+    UPGRADE_STATUSES,
+    AgentHeartbeatIn,
     InstanceCreate,
     InstanceUpdate,
     NodeEnrollIn,
@@ -31,6 +34,12 @@ ENROLL_TOKEN_TTL_MINUTES = 30
 OFFLINE_AFTER_SECONDS = 90
 METRIC_RETENTION_DAYS = 7
 ALERT_REMIND_SECONDS = 30 * 60
+# Agent 任务租约：领取/心跳后 10 分钟内有效，过期失联标记 unknown，不自动重跑
+AGENT_LEASE_MINUTES = 10
+# 升级类任务：创建时校验目标版本已登记且 commit 合法，执行后按校验结果判定成功
+UPGRADE_JOB_TYPES = ("deploy", "upgrade")
+# 升级校验项：数据库版本 / 服务就绪 / 业务只读
+UPGRADE_CHECK_NAMES = ("db_version", "readiness", "business_readonly")
 
 ALERT_CPU = "cpu_high"
 ALERT_MEMORY = "memory_high"
@@ -55,6 +64,117 @@ def _iso(value: datetime | None) -> str | None:
 
 def hash_token(token: str) -> str:
     return hashlib.sha256((token or "").strip().encode("utf-8")).hexdigest()
+
+
+def is_full_commit(value: str | None) -> bool:
+    """是否为完整 Git 提交号（40 或 64 位十六进制）。"""
+    return bool(COMMIT_SHA_RE.fullmatch((value or "").strip()))
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _upgrade_status(value: str | None, default: str = "unknown") -> str:
+    normalized = (value or "").strip()
+    return normalized if normalized in UPGRADE_STATUSES else default
+
+
+def _check_ok(value: Any) -> bool:
+    """校验项布尔值归一化：兼容 true/false、"succeeded"/"failed" 等写法。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"failed", "fail", "false", "error", "err", "0", "no", "down"}:
+            return False
+        if normalized in {"succeeded", "success", "ok", "passed", "pass", "true", "1", "yes", "up"}:
+            return True
+        return bool(normalized)
+    return bool(value)
+
+
+def normalize_upgrade_checks(raw: Any) -> list[dict[str, Any]]:
+    """把 Agent 上报的校验结果规范化为 [{name, ok, value, message}]。
+
+    支持两种形态：
+    ``{"db_version": {"ok": true, "value": "tenant_0011"}, "readiness": {"ok": true}}``
+    或 ``[{"name": "db_version", "ok": true, "value": "..."}]``；
+    也兼容旧 Agent 的 ``{"commit_verified": true, "build": "succeeded"}``。
+    """
+    items: list[dict[str, Any]] = []
+    if isinstance(raw, dict):
+        for name, value in raw.items():
+            if isinstance(value, dict):
+                ok = _check_ok(value.get("ok", value.get("passed", False)))
+                item_value = str(value.get("value", "") or "")[:64]
+                message = str(value.get("message", "") or "")[:200]
+            else:
+                ok = _check_ok(value)
+                item_value = str(value)[:64] if not isinstance(value, bool) else ""
+                message = ""
+            items.append({"name": str(name)[:32], "ok": ok, "value": item_value, "message": message})
+    elif isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or entry.get("key") or "").strip()
+            if not name:
+                continue
+            items.append(
+                {
+                    "name": name[:32],
+                    "ok": _check_ok(entry.get("ok", False)),
+                    "value": str(entry.get("value", "") or "")[:64],
+                    "message": str(entry.get("message", "") or "")[:200],
+                }
+            )
+    return items
+
+
+def evaluate_upgrade_checks(checks: list[dict[str, Any]] | None) -> str:
+    """校验结论：passed / failed / partial / missing。
+
+    * 三项标准校验（db_version / readiness / business_readonly）齐全且全部通过 → passed；
+    * 标准校验缺项 → partial；任一项失败 → failed；
+    * 只有旧式校验项（如 commit_verified/build/services_ready）全部通过 → partial；
+    * 完全没有校验结果 → missing（旧 Agent 兼容，任务仍可成功但标记未完整校验）。
+    """
+    items = checks or []
+    if not items:
+        return "missing"
+    required = [item for item in items if item["name"] in UPGRADE_CHECK_NAMES]
+    if not required:
+        return "failed" if any(not item["ok"] for item in items) else "partial"
+    if any(not item["ok"] for item in required):
+        return "failed"
+    missing = [name for name in UPGRADE_CHECK_NAMES if not any(item["name"] == name for item in required)]
+    return "partial" if missing else "passed"
+
+
+def failed_check_names(checks: list[dict[str, Any]] | None) -> list[str]:
+    return [item["name"] for item in (checks or []) if not item["ok"]]
+
+
+def upgrade_phase_from_step(step_name: str) -> str | None:
+    """把 Agent 步骤名映射为升级阶段（新协议英文阶段名 + 旧 Agent 中文步骤名）。"""
+    name = (step_name or "").strip()
+    if name in UPGRADE_STATUSES:
+        return name if name not in TERMINAL_JOB_STATUSES else None
+    if any(keyword in name for keyword in ("构建", "准备版本")):
+        return "building"
+    if "启动服务" in name:
+        return "maintenance"
+    if any(keyword in name for keyword in ("就绪", "切换当前版本", "数据库迁移")):
+        return "verifying"
+    if "迁移" in name:
+        return "migrating"
+    return None
 
 
 def _aware_utc(value: datetime | None) -> datetime | None:
@@ -124,11 +244,17 @@ def node_payload(node: ServerNode, *, metric: NodeMetricSample | None = None) ->
         "internal_ips": node.internal_ips or [],
         "configured_public_ip": node.configured_public_ip,
         "observed_public_ip": node.observed_public_ip,
-        "agent_version": node.agent_version,
-        "app_version": node.app_version,
+        "agent_version": node.agent_version or "",
+        "executor_version": node.executor_version or "",
+        "protocol_version": _safe_int(node.protocol_version),
+        "capabilities": node.capabilities_json or [],
+        "app_version": node.app_version or "",
+        "actual_version": node.app_version or "",
+        "db_version": node.db_version or "",
         "status": effective_node_status(node),
         "enrolled_at": _iso(node.enrolled_at),
         "last_seen_at": _iso(node.last_seen_at),
+        "last_heartbeat_at": _iso(node.last_heartbeat_at),
         "last_metrics_at": _iso(node.last_metrics_at),
         "latest_metric": _metric_payload(latest),
     }
@@ -147,6 +273,14 @@ def instance_payload(center, instance: TenantInstance, tenant_name: str = "") ->
             .where(AlertEvent.instance_id == instance.id, AlertEvent.status == "open")
         ).scalar_one()
     )
+    primary_node = next((node for node in nodes if node.app_version), nodes[0] if nodes else None)
+    app_version = instance.app_version or (primary_node.app_version if primary_node else "")
+    actual_version = instance.actual_version or app_version
+    agent_version = instance.agent_version or (primary_node.agent_version if primary_node else "")
+    executor_version = instance.executor_version or (
+        primary_node.executor_version if primary_node else ""
+    )
+    db_version = instance.db_version or (primary_node.db_version if primary_node else "")
     return {
         "id": str(instance.id),
         "tenant_id": str(instance.tenant_id),
@@ -155,7 +289,13 @@ def instance_payload(center, instance: TenantInstance, tenant_name: str = "") ->
         "domain": instance.domain,
         "environment": instance.environment,
         "status": instance.status,
-        "app_version": instance.app_version or next((n.app_version for n in nodes if n.app_version), ""),
+        "app_version": app_version,
+        "actual_version": actual_version,
+        "target_version": instance.target_version or "",
+        "agent_version": agent_version,
+        "executor_version": executor_version,
+        "db_version": db_version,
+        "upgrade_status": _upgrade_status(instance.upgrade_status),
         "notes": instance.notes,
         "created_at": _iso(instance.created_at),
         "node_count": len(nodes),
@@ -371,6 +511,9 @@ def enroll_node(center, payload: NodeEnrollIn) -> dict[str, Any]:
     node.internal_ips = payload.internal_ips
     node.observed_public_ip = payload.public_ip
     node.agent_version = payload.agent_version
+    node.executor_version = payload.executor_version
+    node.protocol_version = _safe_int(payload.protocol_version)
+    node.capabilities_json = payload.capabilities or None
     node.app_version = payload.app_version
     node.metadata_json = payload.metadata
     node.status = "online"
@@ -470,11 +613,26 @@ def ingest_telemetry(center, node: ServerNode, payload: TelemetryPayload) -> dic
     if payload.public_ip:
         node.observed_public_ip = payload.public_ip
     node.agent_version = payload.agent_version or node.agent_version
+    node.executor_version = payload.executor_version or node.executor_version
+    if payload.protocol_version:
+        node.protocol_version = _safe_int(payload.protocol_version)
+    if payload.capabilities:
+        node.capabilities_json = payload.capabilities
+    node.db_version = payload.db_version or node.db_version
     node.app_version = payload.app_version or node.app_version
-    if payload.app_version:
+    if payload.app_version or payload.db_version or payload.protocol_version:
         instance = center.get(TenantInstance, node.instance_id)
-        if instance is not None and instance.app_version != payload.app_version:
-            instance.app_version = payload.app_version
+        if instance is not None:
+            if payload.app_version and instance.actual_version != payload.app_version:
+                instance.actual_version = payload.app_version
+            if payload.app_version and not instance.app_version:
+                instance.app_version = payload.app_version
+            if payload.db_version:
+                instance.db_version = payload.db_version
+            if payload.agent_version:
+                instance.agent_version = payload.agent_version
+            if payload.executor_version:
+                instance.executor_version = payload.executor_version
             instance.updated_at = now
     node.status = "online"
     node.last_seen_at = now
@@ -938,32 +1096,58 @@ def list_checks(center, node_id: int, *, limit: int = 20) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------- 阶段四：发布与运维任务
+def _release_payload(row) -> dict[str, Any]:
+    """发布版本响应结构（旧记录新字段返回空值/默认值，不会报错）。"""
+    commit_sha = (row.commit_sha or "").strip().lower()
+    return {
+        "id": str(row.id),
+        "version": row.version,
+        "image_tag": row.image_tag or "",
+        "image_digest": row.image_digest or "",
+        "status": row.status,
+        "commit_sha": commit_sha,
+        "build_config_summary": row.build_config_summary or "",
+        "min_agent_protocol": _safe_int(row.min_agent_protocol),
+        "center_db_version": row.center_db_version or "",
+        "tenant_db_version": row.tenant_db_version or "",
+        "rollback_compatible": bool(row.rollback_compatible),
+        "build_status": row.build_status or "built",
+        "notes": row.notes or "",
+        "created_at": _iso(row.created_at),
+    }
+
+
 def list_releases(center) -> list[dict[str, Any]]:
     from app.modules.ops.models_center import ReleaseVersion
 
     rows = center.execute(select(ReleaseVersion).order_by(ReleaseVersion.id.desc())).scalars().all()
-    return [
-        {
-            "id": str(row.id),
-            "version": row.version,
-            "image_tag": row.image_tag,
-            "image_digest": row.image_digest,
-            "status": row.status,
-            "notes": row.notes,
-            "created_at": _iso(row.created_at),
-        }
-        for row in rows
-    ]
+    return [_release_payload(row) for row in rows]
+
+
+def get_release_by_version(center, version: str):
+    """按版本号读取发布版本记录（不存在返回 None）。"""
+    from app.modules.ops.models_center import ReleaseVersion
+
+    normalized = (version or "").strip()
+    if not normalized:
+        return None
+    return center.execute(
+        select(ReleaseVersion).where(ReleaseVersion.version == normalized)
+    ).scalar_one_or_none()
 
 
 def ensure_release(center, version: str, *, image_tag: str = "", notes: str = "") -> bool:
-    """启动时按当前构建版本自动登记发布版本；返回是否新建。"""
+    """启动时按当前构建版本自动登记发布版本；返回是否新建。
+
+    自动登记不包含完整 commit（构建期未知），仅用于展示与历史回填；
+    升级任务要求目标版本必须已登记完整 commit，自动登记版本需重新登记后才能作为升级目标。
+    """
     from app.modules.ops.models_center import ReleaseVersion
 
     version = (version or "").strip()
     if not version:
         return False
-    existing = center.execute(select(ReleaseVersion).where(ReleaseVersion.version == version)).scalar_one_or_none()
+    existing = get_release_by_version(center, version)
     if existing is not None:
         return False
     row = ReleaseVersion(
@@ -971,7 +1155,14 @@ def ensure_release(center, version: str, *, image_tag: str = "", notes: str = ""
         image_tag=image_tag or version,
         image_digest="",
         status="active",
-        notes=notes or f"自动登记：当前部署版本 {version}",
+        commit_sha="",
+        build_config_summary="",
+        min_agent_protocol=0,
+        center_db_version="",
+        tenant_db_version="",
+        rollback_compatible=False,
+        build_status="built",
+        notes=notes or f"自动登记：当前部署版本 {version}（缺少完整 commit，需人工登记后才能作为升级目标）",
         created_by=None,
     )
     center.add(row)
@@ -980,16 +1171,79 @@ def ensure_release(center, version: str, *, image_tag: str = "", notes: str = ""
 
 
 def create_release(center, payload, *, actor_user_id: int) -> dict[str, Any]:
+    """登记发布版本：只接受完整 Git commit（40/64 hex），并写平台审计。"""
     from app.modules.ops.models_center import ReleaseVersion
+    from app.modules.platform.service import record_platform_audit
 
-    if center.execute(select(ReleaseVersion).where(ReleaseVersion.version == payload.version)).scalar_one_or_none():
+    commit_sha = (payload.commit_sha or "").strip().lower()
+    if not is_full_commit(commit_sha):
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR, "commit_sha 必须是完整的 40 或 64 位十六进制 Git 提交号"
+        )
+    if get_release_by_version(center, payload.version) is not None:
         raise ConflictError("版本号已存在")
     row = ReleaseVersion(
-        version=payload.version, image_tag=payload.image_tag,
-        image_digest=payload.image_digest, notes=payload.notes, created_by=actor_user_id,
+        version=payload.version,
+        image_tag=payload.image_tag,
+        image_digest=payload.image_digest,
+        status=payload.status,
+        commit_sha=commit_sha,
+        build_config_summary=payload.build_config_summary,
+        min_agent_protocol=_safe_int(payload.min_agent_protocol),
+        center_db_version=payload.center_db_version,
+        tenant_db_version=payload.tenant_db_version,
+        rollback_compatible=bool(payload.rollback_compatible),
+        build_status=payload.build_status,
+        notes=payload.notes,
+        created_by=actor_user_id,
     )
-    center.add(row); center.commit()
-    return {"id": str(row.id), "version": row.version}
+    center.add(row)
+    center.flush()
+    record_platform_audit(
+        center,
+        actor_user_id=actor_user_id,
+        action="release.create",
+        resource_type="release_version",
+        resource_id=row.id,
+        summary=f"登记发布版本：{row.version}",
+        payload={
+            "version": row.version,
+            "commit_sha": commit_sha,
+            "build_status": row.build_status,
+            "center_db_version": row.center_db_version,
+            "tenant_db_version": row.tenant_db_version,
+        },
+    )
+    center.commit()
+    return _release_payload(row)
+
+
+def validate_upgrade_target(center, instance: TenantInstance, node: ServerNode | None, target_version: str):
+    """校验升级目标版本：已登记、commit 完整、未退役、Agent 协议满足最低要求。
+
+    返回发布版本行；失败抛 ``AppError``（参数问题 422 / 冲突 409）。
+    """
+
+    version = (target_version or "").strip()
+    if not version:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "升级任务必须指定目标版本")
+    release = get_release_by_version(center, version)
+    if release is None:
+        raise AppError(ErrorCode.VALIDATION_ERROR, f"目标版本未登记：{version}")
+    if not is_full_commit(release.commit_sha):
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            f"目标版本 {version} 未登记完整 Git 提交号，禁止升级",
+        )
+    if release.status == "retired":
+        raise AppError(ErrorCode.VALIDATION_ERROR, f"目标版本 {version} 已退役，禁止升级")
+    node_protocol = _safe_int(node.protocol_version) if node is not None else 0
+    required_protocol = _safe_int(release.min_agent_protocol)
+    if required_protocol and node_protocol and node_protocol < required_protocol:
+        raise ConflictError(
+            f"节点 Agent 协议版本 {node_protocol} 低于目标版本要求 {required_protocol}，请先升级 Agent"
+        )
+    return release
 
 
 def create_operation(center, instance_id: int, payload, *, actor_user_id: int) -> dict[str, Any]:
@@ -1002,10 +1256,16 @@ def create_operation(center, instance_id: int, payload, *, actor_user_id: int) -
     ).scalars().first()
     if node is None:
         raise AppError(ErrorCode.VALIDATION_ERROR, "实例尚未接入服务器节点")
+    is_upgrade = payload.job_type in UPGRADE_JOB_TYPES
+    release = None
+    target_version = (payload.target_version or "").strip()
     key = payload.idempotency_key or f"{instance.id}:{payload.job_type}:{_now().isoformat()}:{secrets.token_hex(4)}"
     existing = center.execute(select(OperationJob).where(OperationJob.idempotency_key == key)).scalar_one_or_none()
     if existing is not None:
-        return _operation_payload(existing)
+        # 幂等重放：直接返回既有任务，不因目标版本后续退役/改动而失败
+        return _operation_payload(existing, center=center)
+    if is_upgrade:
+        release = validate_upgrade_target(center, instance, node, target_version)
     running = center.execute(
         select(OperationJob).where(
             OperationJob.instance_id == instance.id,
@@ -1014,25 +1274,55 @@ def create_operation(center, instance_id: int, payload, *, actor_user_id: int) -
     ).scalars().first()
     if running is not None:
         raise ConflictError("该实例已有未完成运维任务，请等待完成")
+    now = _now()
     row = OperationJob(
         instance_id=instance.id, node_id=node.id, job_type=payload.job_type,
-        status="pending", idempotency_key=key, target_version=payload.target_version,
+        status="pending", idempotency_key=key, target_version=target_version,
+        upgrade_status="pending" if is_upgrade else "",
         payload_json=payload.payload, requested_by=actor_user_id,
+        created_at=now, updated_at=now,
     )
-    center.add(row); center.commit()
+    if is_upgrade:
+        instance.target_version = target_version
+        instance.upgrade_status = "pending"
+        instance.updated_at = now
+        center.add(instance)
+    center.add(row)
+    center.flush()
     record_platform_audit(
         center, actor_user_id=actor_user_id, action="operation.create",
         resource_type="operation_job", resource_id=row.id, tenant_id=instance.tenant_id,
-        summary=f"创建运维任务：{payload.job_type}", payload={"instance_id": instance.id},
+        summary=f"创建运维任务：{payload.job_type}",
+        payload={
+            "instance_id": instance.id,
+            "target_version": target_version,
+            "release_commit": (release.commit_sha if release is not None else ""),
+            "min_agent_protocol": (
+                _safe_int(release.min_agent_protocol) if release is not None else 0
+            ),
+        },
     )
     center.commit()
     return _operation_payload(row, center=center)
 
 
 def _operation_payload(row, center=None) -> dict[str, Any]:
+    checks = row.checks_json or []
     data = {
         "id": str(row.id), "instance_id": str(row.instance_id), "node_id": str(row.node_id) if row.node_id else None,
         "job_type": row.job_type, "status": row.status, "target_version": row.target_version,
+        "actual_version": row.actual_version or "",
+        "agent_version": row.agent_version or "",
+        "agent_protocol_version": _safe_int(row.agent_protocol_version),
+        "db_version": row.db_version or "",
+        "upgrade_status": _upgrade_status(row.upgrade_status, ""),
+        "attempt_id": row.attempt_id or "",
+        "lease_token_present": bool(row.lease_token),
+        "lease_expires_at": _iso(row.lease_expires_at),
+        "last_heartbeat_at": _iso(row.last_heartbeat_at),
+        "event_seq": _safe_int(row.event_seq),
+        "checks_status": row.checks_status or "",
+        "checks": checks,
         "attempts": row.attempts, "error": row.error, "result": row.result_json,
         "created_at": _iso(row.created_at), "started_at": _iso(row.started_at), "finished_at": _iso(row.finished_at),
     }
@@ -1073,10 +1363,154 @@ def list_backups(center, *, instance_id: int | None = None, page: int = 1, page_
                        "error": r.error} for r in rows], "total": total, "page": page, "page_size": page_size}
 
 
-def poll_agent_job(center, node: ServerNode) -> dict[str, Any] | None:
+TERMINAL_JOB_STATUSES = ("succeeded", "failed", "unknown")
+
+
+def _validate_job_lease(row, attempt_id: str = "", lease_token: str = "") -> None:
+    """校验执行批次/租约：旧 Agent 不传时跳过，新 Agent 传错时拒绝写入。"""
+    if attempt_id and row.attempt_id and attempt_id != row.attempt_id:
+        raise ConflictError("执行批次已失效，请重新领取任务")
+    if lease_token and row.lease_token and lease_token != row.lease_token:
+        raise ConflictError("执行租约已失效，请重新领取任务")
+
+
+def _sync_instance_after_job(center, row, now: datetime) -> None:
+    """把升级任务的版本/数据库版本/升级状态同步到实例展示字段。"""
+    instance = center.get(TenantInstance, int(row.instance_id))
+    if instance is None:
+        return
+    if row.job_type in UPGRADE_JOB_TYPES:
+        instance.upgrade_status = _upgrade_status(
+            row.upgrade_status, instance.upgrade_status or "unknown"
+        )
+        if row.actual_version:
+            instance.actual_version = row.actual_version
+            instance.app_version = row.actual_version
+        if row.db_version:
+            instance.db_version = row.db_version
+        if row.agent_version:
+            instance.agent_version = row.agent_version
+        if row.status == "succeeded" and not instance.actual_version:
+            instance.actual_version = row.target_version
+        instance.updated_at = now
+        center.add(instance)
+
+
+def _apply_job_event(center, row, payload, now: datetime) -> None:
+    """把一条 Agent 事件应用到任务（不提交事务）。"""
+    from app.modules.ops.models_center import BackupRecord, OperationJobStep
+
+    if payload.agent_protocol_version:
+        row.agent_protocol_version = _safe_int(payload.agent_protocol_version)
+    if payload.attempt_id and not row.attempt_id:
+        row.attempt_id = payload.attempt_id
+    if payload.step_no and payload.step_name:
+        step = center.execute(
+            select(OperationJobStep).where(
+                OperationJobStep.job_id == row.id, OperationJobStep.step_no == payload.step_no
+            )
+        ).scalar_one_or_none()
+        if step is None:
+            step = OperationJobStep(
+                job_id=row.id, step_no=payload.step_no, name=payload.step_name,
+                status=payload.step_status or "running", message=payload.message, started_at=now,
+            )
+            center.add(step)
+        else:
+            step.status = payload.step_status or step.status
+            step.message = payload.message or step.message
+            step.finished_at = now if step.status in {"succeeded", "failed", "skipped"} else None
+    # 校验结果（数据库版本 / 服务就绪 / 业务只读）；兼容旧 Agent 放在 result.checks
+    result = payload.result if isinstance(payload.result, dict) else {}
+    checks_source = payload.checks if payload.checks is not None else result.get("checks")
+    if checks_source is not None:
+        items = normalize_upgrade_checks(checks_source)
+        if items:
+            row.checks_json = items
+            row.checks_status = evaluate_upgrade_checks(items)
+            db_item = next(
+                (item for item in items if item["name"] == "db_version" and item["value"]), None
+            )
+            if db_item is not None:
+                row.db_version = db_item["value"]
+    if result.get("actual_version"):
+        row.actual_version = str(result["actual_version"])[:64]
+    if result.get("agent_version"):
+        row.agent_version = str(result["agent_version"])[:32]
+    if result.get("db_version"):
+        row.db_version = str(result["db_version"])[:64]
+    # Agent 步骤名映射为升级阶段（新协议英文阶段名 / 旧 Agent 中文步骤名）
+    phase = upgrade_phase_from_step(payload.step_name)
+    if phase:
+        row.upgrade_status = phase
+    if payload.status in TERMINAL_JOB_STATUSES:
+        if payload.status == "succeeded" and row.job_type in UPGRADE_JOB_TYPES:
+            checks = row.checks_json or normalize_upgrade_checks(payload.checks)
+            conclusion = evaluate_upgrade_checks(checks)
+            row.checks_status = conclusion
+            if conclusion == "failed":
+                names = failed_check_names(checks)
+                row.status = "failed"
+                row.upgrade_status = "failed"
+                row.error = ("升级校验未通过：" + "、".join(names))[:500]
+                row.finished_at = now
+                row.updated_at = now
+                _sync_instance_after_job(center, row, now)
+                return
+        row.status = payload.status
+        row.finished_at = now
+        row.error = (payload.error or "")[:500]
+        if payload.result is not None:
+            row.result_json = payload.result
+        if row.job_type in UPGRADE_JOB_TYPES:
+            row.upgrade_status = {"succeeded": "succeeded", "failed": "failed"}.get(
+                payload.status, "unknown"
+            )
+            if payload.status == "succeeded" and not row.actual_version:
+                row.actual_version = row.target_version
+        if row.job_type == "backup":
+            center.add(
+                BackupRecord(
+                    instance_id=row.instance_id, node_id=row.node_id, job_id=row.id,
+                    status="succeeded" if payload.status == "succeeded" else "failed",
+                    storage_key=str(result.get("storage_key", "")),
+                    size_bytes=int(result.get("size_bytes", 0) or 0),
+                    started_at=row.started_at or now, finished_at=now,
+                    retention_until=now + timedelta(days=30), error=(payload.error or "")[:500],
+                )
+            )
+        row.updated_at = now
+        _sync_instance_after_job(center, row, now)
+        return
+    row.status = "running"
+    row.updated_at = now
+
+
+def claim_agent_job(
+    center,
+    node: ServerNode,
+    *,
+    agent_version: str = "",
+    executor_version: str = "",
+    protocol_version: int = 0,
+) -> dict[str, Any] | None:
+    """Agent 领取任务：生成执行批次与租约，返回目标版本与租约凭证。
+
+    * 先处理过期租约（标记 unknown，不自动重跑）；
+    * 每个任务每次领取生成新的 ``attempt_id`` 与 ``lease_token``，旧批次事件会被拒绝；
+    * 旧 Agent 不传版本字段时沿用节点已记录值。
+    """
     from app.modules.ops.models_center import OperationJob
+
     now = _now()
-    # 过期租约先标记为 unknown；绝不自动重新执行，必须人工核对。
+    if agent_version:
+        node.agent_version = agent_version
+    if executor_version:
+        node.executor_version = executor_version
+    if protocol_version:
+        node.protocol_version = _safe_int(protocol_version)
+    if agent_version or executor_version or protocol_version:
+        node.updated_at = now
     stale = center.execute(
         select(OperationJob).where(
             OperationJob.node_id == node.id,
@@ -1090,8 +1524,9 @@ def poll_agent_job(center, node: ServerNode) -> dict[str, Any] | None:
         item.error = "执行中失联，结果待核对"
         item.finished_at = now
         item.updated_at = now
-    if stale:
-        center.commit()
+        if item.job_type in UPGRADE_JOB_TYPES:
+            item.upgrade_status = "unknown"
+            _sync_instance_after_job(center, item, now)
     row = center.execute(
         select(OperationJob).where(
             OperationJob.node_id == node.id,
@@ -1099,44 +1534,282 @@ def poll_agent_job(center, node: ServerNode) -> dict[str, Any] | None:
         ).order_by(OperationJob.id.asc()).with_for_update()
     ).scalars().first()
     if row is None:
+        if stale or agent_version or executor_version or protocol_version:
+            center.commit()
         return None
-    row.status = "leased"; row.attempts = int(row.attempts or 0) + 1
-    row.lease_expires_at = now + timedelta(minutes=10); row.started_at = row.started_at or now
+    row.status = "leased"
+    row.attempts = int(row.attempts or 0) + 1
+    row.attempt_id = str(uuid.uuid4())
+    row.lease_token = secrets.token_urlsafe(32)
+    row.lease_expires_at = now + timedelta(minutes=AGENT_LEASE_MINUTES)
+    row.last_heartbeat_at = now
+    row.started_at = row.started_at or now
+    row.agent_version = agent_version or node.agent_version or row.agent_version
+    protocol = _safe_int(protocol_version) or _safe_int(node.protocol_version)
+    if protocol:
+        row.agent_protocol_version = protocol
+    if row.job_type in UPGRADE_JOB_TYPES and not row.upgrade_status:
+        row.upgrade_status = "pending"
+    row.updated_at = now
     center.commit()
-    return {"id": str(row.id), "job_type": row.job_type, "target_version": row.target_version, "payload": row.payload_json or {}, "attempts": row.attempts}
+    return {
+        "id": str(row.id),
+        "job_type": row.job_type,
+        "target_version": row.target_version,
+        "payload": row.payload_json or {},
+        "attempts": row.attempts,
+        "attempt_id": row.attempt_id,
+        "lease_token": row.lease_token,
+        "lease_expires_at": _iso(row.lease_expires_at),
+        "agent_protocol_version": _safe_int(row.agent_protocol_version),
+        "upgrade_status": row.upgrade_status or "",
+    }
 
 
-def agent_job_event(center, node: ServerNode, job_id: int, payload) -> dict[str, Any]:
-    from app.modules.ops.models_center import BackupRecord, OperationJob, OperationJobStep
-    row = center.execute(select(OperationJob).where(OperationJob.id == job_id, OperationJob.node_id == node.id)).scalar_one_or_none()
+def poll_agent_job(center, node: ServerNode) -> dict[str, Any] | None:
+    """兼容旧 Agent 的任务领取接口（等价于 ``claim_agent_job``）。"""
+    return claim_agent_job(center, node)
+
+
+def heartbeat_agent_job(
+    center,
+    node: ServerNode,
+    job_id: int,
+    *,
+    attempt_id: str = "",
+    lease_token: str = "",
+    event_seq: int = 0,
+    agent_protocol_version: int = 0,
+) -> dict[str, Any]:
+    """Agent 任务执行心跳：续租、记录心跳与事件水位。"""
+    from app.modules.ops.models_center import OperationJob
+
+    row = center.execute(
+        select(OperationJob).where(OperationJob.id == int(job_id), OperationJob.node_id == node.id)
+    ).scalar_one_or_none()
     if row is None:
         raise AppError(ErrorCode.NOT_FOUND, "任务不存在")
     now = _now()
-    if payload.step_no and payload.step_name:
-        step = center.execute(select(OperationJobStep).where(OperationJobStep.job_id == row.id, OperationJobStep.step_no == payload.step_no)).scalar_one_or_none()
-        if step is None:
-            step = OperationJobStep(job_id=row.id, step_no=payload.step_no, name=payload.step_name, status=payload.step_status or "running", message=payload.message, started_at=now)
-            center.add(step)
-        else:
-            step.status = payload.step_status or step.status
-            step.message = payload.message or step.message
-            step.finished_at = now if step.status in {"succeeded", "failed", "skipped"} else None
-    if payload.status in {"succeeded", "failed", "unknown"}:
-        row.status = payload.status; row.finished_at = now; row.error = payload.error[:500]
-        if payload.result is not None:
-            row.result_json = payload.result
-        if row.job_type == "backup":
-            backup = BackupRecord(instance_id=row.instance_id, node_id=row.node_id, job_id=row.id,
-                                  status="succeeded" if payload.status == "succeeded" else "failed",
-                                  storage_key=str((payload.result or {}).get("storage_key", "")),
-                                  size_bytes=int((payload.result or {}).get("size_bytes", 0) or 0),
-                                  started_at=row.started_at or now, finished_at=now,
-                                  retention_until=now + timedelta(days=30), error=payload.error[:500])
-            center.add(backup)
-    else:
-        row.status = "running"
+    node.last_heartbeat_at = now
+    node.updated_at = now
+    if agent_protocol_version:
+        row.agent_protocol_version = _safe_int(agent_protocol_version)
+    if row.status in TERMINAL_JOB_STATUSES:
+        center.commit()
+        return {
+            "ok": True,
+            "job_id": str(row.id),
+            "status": row.status,
+            "upgrade_status": row.upgrade_status or "",
+            "finished": True,
+        }
+    _validate_job_lease(row, attempt_id, lease_token)
+    row.last_heartbeat_at = now
+    row.lease_expires_at = now + timedelta(minutes=AGENT_LEASE_MINUTES)
+    if event_seq:
+        row.event_seq = max(_safe_int(row.event_seq), _safe_int(event_seq))
+    row.updated_at = now
     center.commit()
-    return {"ok": True}
+    return {
+        "ok": True,
+        "job_id": str(row.id),
+        "status": row.status,
+        "upgrade_status": row.upgrade_status or "",
+        "lease_expires_at": _iso(row.lease_expires_at),
+        "event_seq": _safe_int(row.event_seq),
+    }
+
+
+def ingest_agent_heartbeat(center, node: ServerNode, payload: AgentHeartbeatIn) -> dict[str, Any]:
+    """Agent 心跳：同步协议版本/能力/执行器版本/数据库版本，可选携带任务心跳。"""
+    now = _now()
+    if payload.agent_version:
+        node.agent_version = payload.agent_version
+    if payload.executor_version:
+        node.executor_version = payload.executor_version
+    if payload.protocol_version:
+        node.protocol_version = _safe_int(payload.protocol_version)
+    if payload.capabilities:
+        node.capabilities_json = payload.capabilities
+    if payload.db_version:
+        node.db_version = payload.db_version
+    if payload.app_version:
+        node.app_version = payload.app_version
+    node.status = "online"
+    node.last_seen_at = now
+    node.last_heartbeat_at = now
+    node.updated_at = now
+    instance = center.get(TenantInstance, node.instance_id)
+    if instance is not None:
+        if payload.app_version:
+            instance.actual_version = payload.app_version
+            instance.app_version = payload.app_version
+        if payload.db_version:
+            instance.db_version = payload.db_version
+        if payload.agent_version:
+            instance.agent_version = payload.agent_version
+        if payload.executor_version:
+            instance.executor_version = payload.executor_version
+        instance.updated_at = now
+        center.add(instance)
+    job_info: dict[str, Any] | None = None
+    if payload.job_id:
+        job_info = heartbeat_agent_job(
+            center,
+            node,
+            payload.job_id,
+            attempt_id=payload.attempt_id,
+            lease_token=payload.lease_token,
+            event_seq=payload.event_seq,
+            agent_protocol_version=payload.protocol_version,
+        )
+    else:
+        center.commit()
+    return {"ok": True, "server_time": _iso(now), "job": job_info}
+
+
+def record_upgrade_checks(
+    center, job_id: int, checks, *, status: str | None = None
+) -> dict[str, Any]:
+    """写入升级校验结果（数据库版本 / 服务就绪 / 业务只读），更新校验结论与数据库版本。
+
+    供 Agent 事件或人工核对调用；结论为 failed 时调用方应将任务置 failed。
+    """
+    from app.modules.ops.models_center import OperationJob
+
+    row = center.get(OperationJob, int(job_id))
+    if row is None:
+        raise AppError(ErrorCode.NOT_FOUND, "运维任务不存在")
+    items = normalize_upgrade_checks(checks)
+    if not items:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "升级校验结果不能为空")
+    row.checks_json = items
+    row.checks_status = evaluate_upgrade_checks(items)
+    db_item = next((item for item in items if item["name"] == "db_version" and item["value"]), None)
+    if db_item is not None:
+        row.db_version = db_item["value"]
+    if status:
+        if status not in ("pending", "leased", "running", "succeeded", "failed", "unknown"):
+            raise AppError(ErrorCode.VALIDATION_ERROR, "任务状态不合法")
+        row.status = status
+        if status in TERMINAL_JOB_STATUSES:
+            row.finished_at = _now()
+    row.updated_at = _now()
+    center.commit()
+    return _operation_payload(row)
+
+
+def append_agent_job_events(
+    center,
+    node: ServerNode,
+    job_id: int,
+    events,
+    *,
+    attempt_id: str = "",
+    lease_token: str = "",
+) -> dict[str, Any]:
+    """批量写入 Agent 事件（按 event_seq 去重，断线重放不会重复推进结果）。"""
+    from app.modules.ops.models_center import OperationJob
+
+    row = center.execute(
+        select(OperationJob).where(OperationJob.id == int(job_id), OperationJob.node_id == node.id)
+    ).scalar_one_or_none()
+    if row is None:
+        raise AppError(ErrorCode.NOT_FOUND, "任务不存在")
+    _validate_job_lease(row, attempt_id, lease_token)
+    now = _now()
+    applied = 0
+    max_seq = _safe_int(row.event_seq)
+    for event in events or []:
+        seq = _safe_int(getattr(event, "event_seq", 0) or 0)
+        if seq and seq <= max_seq:
+            continue
+        _apply_job_event(center, row, event, now)
+        applied += 1
+        if seq > max_seq:
+            max_seq = seq
+    row.event_seq = max_seq
+    if row.status not in TERMINAL_JOB_STATUSES:
+        row.last_heartbeat_at = now
+        row.lease_expires_at = now + timedelta(minutes=AGENT_LEASE_MINUTES)
+    row.updated_at = now
+    center.commit()
+    return {
+        "ok": True,
+        "applied": applied,
+        "event_seq": max_seq,
+        "status": row.status,
+        "upgrade_status": row.upgrade_status or "",
+        "checks_status": row.checks_status or "",
+    }
+
+
+def agent_job_event(center, node: ServerNode, job_id: int, payload) -> dict[str, Any]:
+    """单条 Agent 任务事件（兼容旧 Agent；新 Agent 携带 attempt/lease/event_seq/checks）。"""
+    from app.modules.ops.models_center import OperationJob
+
+    row = center.execute(
+        select(OperationJob).where(OperationJob.id == job_id, OperationJob.node_id == node.id)
+    ).scalar_one_or_none()
+    if row is None:
+        raise AppError(ErrorCode.NOT_FOUND, "任务不存在")
+    _validate_job_lease(row, getattr(payload, "attempt_id", ""), getattr(payload, "lease_token", ""))
+    seq = _safe_int(getattr(payload, "event_seq", 0))
+    if seq and seq <= _safe_int(row.event_seq):
+        return {
+            "ok": True,
+            "duplicate": True,
+            "event_seq": _safe_int(row.event_seq),
+            "status": row.status,
+            "upgrade_status": row.upgrade_status or "",
+        }
+    now = _now()
+    _apply_job_event(center, row, payload, now)
+    row.event_seq = max(_safe_int(row.event_seq), seq)
+    if row.status not in TERMINAL_JOB_STATUSES:
+        row.last_heartbeat_at = now
+        row.lease_expires_at = now + timedelta(minutes=AGENT_LEASE_MINUTES)
+    row.updated_at = now
+    center.commit()
+    return {
+        "ok": True,
+        "event_seq": _safe_int(row.event_seq),
+        "status": row.status,
+        "upgrade_status": row.upgrade_status or "",
+        "checks_status": row.checks_status or "",
+    }
+
+
+def reconcile_agent_jobs(center, node: ServerNode, active_job_ids: list[int]) -> dict[str, Any]:
+    """对账：Agent 上报本机没有的执行中任务 → 中心标记 unknown，等待人工核对。"""
+    from app.modules.ops.models_center import OperationJob
+
+    now = _now()
+    active = {_safe_int(item) for item in (active_job_ids or [])}
+    rows = center.execute(
+        select(OperationJob).where(
+            OperationJob.node_id == node.id,
+            OperationJob.status.in_(("leased", "running")),
+        )
+    ).scalars().all()
+    lost = [row for row in rows if _safe_int(row.id) not in active]
+    for row in lost:
+        row.status = "unknown"
+        row.error = "Agent 对账时缺失该任务，结果待核对"
+        row.finished_at = now
+        row.updated_at = now
+        if row.job_type in UPGRADE_JOB_TYPES:
+            row.upgrade_status = "unknown"
+            _sync_instance_after_job(center, row, now)
+    node.last_heartbeat_at = now
+    node.updated_at = now
+    center.commit()
+    return {
+        "ok": True,
+        "checked": len(rows),
+        "marked_unknown": len(lost),
+        "job_ids": [str(row.id) for row in lost],
+    }
 
 
 def list_maintenance_windows(center, instance_id: int) -> list[dict[str, Any]]:
@@ -1346,7 +2019,7 @@ def list_metric_aggregates(center, node_id: int, *, resolution: str = "5m", hour
 
 
 def mark_stale_operations(center) -> int:
-    """任务租约过期后标记结果待核对，不自动重跑。"""
+    """任务租约过期后标记结果待核对，不自动重跑；升级任务同步实例升级状态。"""
     from app.modules.ops.models_center import OperationJob
 
     now = _now()
@@ -1362,6 +2035,9 @@ def mark_stale_operations(center) -> int:
         row.error = "执行中失联，结果待核对"
         row.finished_at = now
         row.updated_at = now
+        if row.job_type in UPGRADE_JOB_TYPES:
+            row.upgrade_status = "unknown"
+            _sync_instance_after_job(center, row, now)
     if rows:
         center.commit()
     return len(rows)
@@ -1369,6 +2045,7 @@ def mark_stale_operations(center) -> int:
 
 def retry_operation(center, job_id: int, *, actor_user_id: int) -> dict[str, Any]:
     from app.modules.ops.models_center import OperationJob
+    from app.modules.ops.schemas import OperationCreate
 
     old = center.get(OperationJob, int(job_id))
     if old is None:

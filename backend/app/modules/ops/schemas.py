@@ -168,6 +168,31 @@ class ReleaseCreate(BaseModel):
         return normalize_commit_sha(value)
 
 
+class ReleaseUpdate(BaseModel):
+    """更新发布版本：允许回填旧版本的完整 commit 与构建/数据库目标信息。
+
+    所有字段可选（局部更新）；``commit_sha`` 提供时必须是 40/64 位十六进制。
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    commit_sha: str | None = Field(default=None, min_length=40, max_length=64)
+    build_config_summary: str | None = Field(default=None, max_length=500)
+    min_agent_protocol: int | None = Field(default=None, ge=0, le=10000)
+    center_db_version: str | None = Field(default=None, max_length=64)
+    tenant_db_version: str | None = Field(default=None, max_length=64)
+    rollback_compatible: bool | None = None
+    build_status: Literal["built", "verified", "failed"] | None = None
+    status: Literal["draft", "active", "retired"] | None = None
+    notes: str | None = Field(default=None, max_length=500)
+
+    @field_validator("commit_sha")
+    @classmethod
+    def validate_commit_sha(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_commit_sha(value)
+
+
 class OperationCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     job_type: Literal["deploy", "upgrade", "restart", "backup", "logs", "config"]

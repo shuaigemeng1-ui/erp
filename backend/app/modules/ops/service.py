@@ -1218,6 +1218,77 @@ def create_release(center, payload, *, actor_user_id: int) -> dict[str, Any]:
     return _release_payload(row)
 
 
+def update_release(center, release_id: int, payload, *, actor_user_id: int) -> dict[str, Any]:
+    """更新发布版本（局部更新）：回填旧版本的完整 commit 与构建/数据库目标信息。
+
+    仅允许修改元数据，不允许改版本号（版本号是升级目标的主键语义）；
+    提供 ``commit_sha`` 时必须是 40/64 位十六进制；写平台审计 ``release.update``。
+    """
+    from app.modules.ops.models_center import ReleaseVersion
+    from app.modules.platform.service import record_platform_audit
+
+    row = center.get(ReleaseVersion, int(release_id))
+    if row is None:
+        raise AppError(ErrorCode.NOT_FOUND, "发布版本不存在")
+
+    changes: list[str] = []
+    commit_sha = (payload.commit_sha or "").strip().lower() if payload.commit_sha is not None else None
+    if commit_sha is not None:
+        if not is_full_commit(commit_sha):
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "commit_sha 必须是完整的 40 或 64 位十六进制 Git 提交号",
+            )
+        if row.commit_sha != commit_sha:
+            row.commit_sha = commit_sha
+            changes.append("commit_sha")
+    if payload.build_config_summary is not None and row.build_config_summary != payload.build_config_summary:
+        row.build_config_summary = payload.build_config_summary
+        changes.append("build_config_summary")
+    if payload.min_agent_protocol is not None and _safe_int(row.min_agent_protocol) != _safe_int(
+        payload.min_agent_protocol
+    ):
+        row.min_agent_protocol = _safe_int(payload.min_agent_protocol)
+        changes.append("min_agent_protocol")
+    if payload.center_db_version is not None and row.center_db_version != payload.center_db_version:
+        row.center_db_version = payload.center_db_version
+        changes.append("center_db_version")
+    if payload.tenant_db_version is not None and row.tenant_db_version != payload.tenant_db_version:
+        row.tenant_db_version = payload.tenant_db_version
+        changes.append("tenant_db_version")
+    if payload.rollback_compatible is not None and bool(row.rollback_compatible) != bool(
+        payload.rollback_compatible
+    ):
+        row.rollback_compatible = bool(payload.rollback_compatible)
+        changes.append("rollback_compatible")
+    if payload.build_status is not None and row.build_status != payload.build_status:
+        row.build_status = payload.build_status
+        changes.append("build_status")
+    if payload.status is not None and row.status != payload.status:
+        row.status = payload.status
+        changes.append("status")
+    if payload.notes is not None and row.notes != payload.notes:
+        row.notes = payload.notes
+        changes.append("notes")
+
+    if not changes:
+        return _release_payload(row)
+    row.updated_at = _now()
+    center.add(row)
+    center.flush()
+    record_platform_audit(
+        center,
+        actor_user_id=actor_user_id,
+        action="release.update",
+        resource_type="release_version",
+        resource_id=row.id,
+        summary=f"更新发布版本：{row.version}",
+        payload={"version": row.version, "fields": changes, "commit_sha": row.commit_sha},
+    )
+    center.commit()
+    return _release_payload(row)
+
+
 def validate_upgrade_target(center, instance: TenantInstance, node: ServerNode | None, target_version: str):
     """校验升级目标版本：已登记、commit 完整、未退役、Agent 协议满足最低要求。
 

@@ -126,6 +126,8 @@ PLATFORM_AUDIT_ACTIONS: dict[str, str] = {
     "instance.update": "更新租户实例",
     "instance.node.enroll_token": "生成服务器接入令牌",
     "alert.acknowledge": "确认运维告警",
+    "release.create": "登记发布版本",
+    "release.update": "更新发布版本",
 }
 
 

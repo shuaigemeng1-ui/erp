@@ -16,6 +16,7 @@ from app.modules.ops.schemas import (
     NodeSshExecIn,
     OperationCreate,
     ReleaseCreate,
+    ReleaseUpdate,
 )
 
 router = APIRouter(prefix="/platform", tags=["platform-ops"])
@@ -134,6 +135,15 @@ def releases(center: CenterDb, _: PlatformAdmin) -> dict:
 @router.post("/releases", summary="登记发布版本")
 def create_release(center: CenterDb, admin: PlatformAdmin, payload: ReleaseCreate) -> dict:
     return success(service.create_release(center, payload, actor_user_id=admin.user_id))
+
+
+@router.patch("/releases/{release_id}", summary="更新发布版本（回填 commit/构建信息）")
+def update_release(
+    center: CenterDb, admin: PlatformAdmin, release_id: int, payload: ReleaseUpdate
+) -> dict:
+    return success(
+        service.update_release(center, release_id, payload, actor_user_id=admin.user_id)
+    )
 
 
 @router.get("/operations", summary="运维任务列表")

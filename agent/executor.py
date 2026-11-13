@@ -53,11 +53,11 @@ def _run(command: list[str], cwd: str, timeout: int = 300, extra_env: dict[str, 
         return 1, redact(str(exc))
 
 
-def _compose(config: dict[str, Any]) -> list[str]:
+def _compose(config: dict[str, Any], env_file_path: str | None = None) -> list[str]:
     deploy_dir = Path(str(config.get("deploy_dir") or "/opt/ventasync/deploy"))
     compose_file = str(config.get("compose_file") or "docker-compose.yml")
     compose_server = str(config.get("compose_server_file") or "docker-compose.server.yml")
-    env_file = str(config.get("env_file") or ".env")
+    env_file = env_file_path or str(deploy_dir / str(config.get("env_file") or ".env"))
     return [
         "docker",
         "compose",
@@ -66,7 +66,7 @@ def _compose(config: dict[str, Any]) -> list[str]:
         "-f",
         str(deploy_dir / compose_server),
         "--env-file",
-        str(deploy_dir / env_file),
+        env_file,
     ]
 
 
@@ -114,19 +114,28 @@ def execute(job: dict[str, Any], config: dict[str, Any], report) -> dict[str, An
             size = int(size_match.group(1))
         report(2, "执行备份", "succeeded" if code == 0 else "failed", output)
         return {"ok": code == 0, "exit_code": code, "output": output, "storage_key": key, "size_bytes": size}
-    # deploy / upgrade：目标版本作为 APP_IMAGE_TAG 传入，不修改 .env；固定版本镜像可本地存在。
+    # deploy / upgrade：目标版本写入临时 env 文件，固定镜像版本可本地执行；不修改正式 .env。
     target = str(job.get("target_version") or payload.get("target_version") or "").strip()
     if target and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", target):
         report(2, "校验版本", "failed", "版本号格式不正确")
         return {"ok": False, "error": "invalid_version"}
-    env_extra = {"APP_IMAGE_TAG": target} if target else {}
-    report(2, f"拉取镜像 {target or '当前版本'}", "running", "")
-    code, output = _run([*compose, "pull", "--ignore-pull-failures"], deploy_dir, timeout=1800, extra_env=env_extra)
-    report(2, "拉取镜像", "succeeded" if code == 0 else "failed", output)
-    if code != 0:
-        return {"ok": False, "exit_code": code, "output": output}
-    report(3, f"更新服务 {target or '当前版本'}", "running", "")
-    code2, output2 = _run([*compose, "up", "-d", "--remove-orphans"], deploy_dir, timeout=1800, extra_env=env_extra)
-    report(3, "更新服务", "succeeded" if code2 == 0 else "failed", output2)
-    time.sleep(3)
-    return {"ok": code2 == 0, "exit_code": code2, "output": output2, "target_version": target}
+    env_source = Path(deploy_dir) / str(config.get("env_file") or ".env")
+    temp_env = Path(f"/tmp/erp-agent-env-{os.getpid()}-{time.time_ns()}.env")
+    try:
+        lines = env_source.read_text(encoding="utf-8").splitlines()
+        if target:
+            lines = [line for line in lines if not line.startswith("APP_IMAGE_TAG=")]
+            lines.append(f"APP_IMAGE_TAG={target}")
+        temp_env.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        compose = _compose(config, str(temp_env))
+        report(2, f"检查版本 {target or '当前版本'}", "succeeded", "")
+        report(3, f"更新服务 {target or '当前版本'}", "running", "")
+        code2, output2 = _run([*compose, "up", "-d", "--remove-orphans"], deploy_dir, timeout=1800)
+        report(3, "更新服务", "succeeded" if code2 == 0 else "failed", output2)
+        time.sleep(3)
+        return {"ok": code2 == 0, "exit_code": code2, "output": output2, "target_version": target}
+    finally:
+        try:
+            temp_env.unlink()
+        except OSError:
+            pass

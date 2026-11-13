@@ -237,7 +237,7 @@ caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && systemctl re
 | --- | --- |
 | 改密与密钥轮换 | **完成**（ENCRYPTION_KEY 因租户库密码加密暂不轮换，已记录） |
 | 域名 + HTTPS + 自动续期 | **完成** |
-| 备份定时化 + 恢复演练 | **备份定时完成**；恢复演练按批次 3 记录：旧版脚本事故，修复版 2026-11-13 新备份实测 28 checks 通过，`backup_records` 记录关联待修复 |
+| 备份定时化 + 恢复演练 | **备份定时完成**；恢复演练按批次 3 记录：旧版脚本事故，修复版 2026-11-13 新备份实测 28 checks 通过，094919Z 演练自动匹配 `backup_records id=2` 并写 `restore_status=verified`（`BACKUP_INSTANCE_ID` 必配） |
 | SSH Key / 关闭密码登录 | **未执行**：按用户要求保留 root 密码登录（统一为指定密码）；建议后续单独配置 Key 并关闭密码登录 |
 | Shopee 应用与测试店铺联调 | **待外部条件**：需用户提供 Shopee 开放平台应用（Partner ID/Key、回调审核）与测试店铺授权；回调地址已就绪 |
 

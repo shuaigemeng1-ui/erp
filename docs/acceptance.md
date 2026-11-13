@@ -1,33 +1,34 @@
-# 当前仓库状态（批次 4，2026-11-13，HEAD e705af2）
+# 当前仓库状态（批次 4，2026-11-13，HEAD b485bee）
 
 > 批次 4 为“第二独立租户接入模板与迁移白名单”：只新增 `deploy/scripts/tenant-onboarding/`、
 > `backend/scripts/tenant_migration_whitelist.py`、`docs/batch4-tenant-onboarding.md`，**未连接/修改任何生产**。
-> 当前 HEAD 另含 task-34（恢复演练修复）与 task-35（独立网关代码）提交；批次 3 及以前记录保留为历史。
+> 当前 HEAD 另含 task-34（恢复演练修复）、task-35（独立网关代码）与 b485bee（备份记录关联修复）；
+> 批次 3 及以前记录保留为历史。
 
 | 检查 | 当前结果 |
 | --- | --- |
-| 后端测试 | `cd backend; python -m pytest -q` → **622 passed**，1 条上游 Starlette 提示（当前 HEAD 含 task-35/34 提交） |
+| 后端测试 | `cd backend; python -m pytest -q` → **634 passed**，1 条上游 Starlette 提示（当前 HEAD b485bee） |
 | Agent 测试 | `cd agent; python -m pytest -q` → **22 passed**，exit 0 |
 | 完整契约检查 | **38/38 通过**，0 失败 0 警告（32 个迁移文件，`center_0018`/`tenant_0014`） |
 | 批次 4 交付 | 第二租户 install/config/migrate/provision 模板、TENANT_ID/INSTANCE_ID/Worker 绑定校验、Agent2/SSH 指纹/备份初始化清单、迁移白名单与停写对账（行数/指纹/关联）、双实例隔离与异常场景验收清单 |
 | 离线校验 | 8 个 shell 模板 `bash -n` 通过；白名单/environment/对账 `self-test` 通过；`config.sh` 渲染+绑定校验通过且会拒绝 Worker 不一致/未登记租户；install/migrate/reconcile/verify/provision 全部 plan 模式输出正常，未改系统 |
 | 生产业务库恢复 | 8.163.80.17 从 `/var/lib/ventasync-backups/releases/20261113T075322Z/vs_tenant_kangkang_shop.sql.gz` 恢复 `vs_tenant_kangkang_shop`：**34 表**、schema `tenant_0014`；创建/授权 `vs_t_3`；`.env` 修正 `TENANT_ID=3`/`ERP_WORKER_TENANT_ID=3` 并重启 api/worker/scheduler；登录 200、products 200、tenant HTTP 200；新备份 `093925Z` |
-| 恢复演练（批次3） | **执行通过、记录回写待修复**：新备份 `093801Z` 隔离演练 passed=true/failed=0/**28 checks**，主 center 30/业务 34 表不变、主容器未重启、drill 资源清理；`--record-latest` 因 `backup_records` 关联缺陷失败（仅 id=1、local_path/checksum 空），`restore_status` 未写 verified |
+| 恢复演练（批次3） | **记录链已闭环**：093801Z 演练 passed=true/failed=0/**28 checks**；094919Z 以 `--latest --record-latest --yes` 通过并自动匹配 **`backup_records id=2`**，`restore_status=verified`、`restore_verified_at=2026-11-13 09:49:54`，报告 `ventasync-drill-20261113094923-23419`；主 center 30/业务 34 表不变、租户 200、主容器未重启 |
 | 真实执行 | **第二租户/网关仍未部署**：第二租户开通/域名切换/OAuth 回调重登记/店铺凭据迁移、`copy_data.sh`/`migrate.sh --apply`、停写恢复、断网/Agent 重启/发布失败/恢复验证真机演练均未执行；需 Lead 审批维护窗口 |
-| 剩余风险 | 模板尚未真机验证；恢复演练记录关联待 backend-sales 修复；独立网关（task-35）已合入代码但未部署；第二租户未部署 |
+| 剩余风险 | 模板尚未真机验证；**`BACKUP_INSTANCE_ID` 必配**（等于中心 `tenant_instances.id`，本次=1）；独立网关（task-35）已合入代码但未部署；第二租户未部署 |
 
 补充说明：
 
 - 详细接入手册、白名单规则、双实例隔离清单与异常场景见 `docs/batch4-tenant-onboarding.md`。
 - 本批次不宣称第二租户接入完成；模板默认 plan，任何 `--apply` 必须在目标实例、维护窗口、Lead 审批后执行。
 - 生产恢复与演练证据见 `docs/incident-2026-11-13-restore-drill.md` 第 9 节、`docs/batch3-acceptance.md` 第 4 节；
-  **恢复演练执行通过但记录链未闭合**，不写 `restore_status=verified`。
+  **恢复演练记录链已闭环**（094919Z → backup_records id=2 verified），前提是 `BACKUP_INSTANCE_ID` 已配置。
 
 ---
 
 # 批次 3 验收状态（历史，2026-11-13，离线 3ae757e / 生产试点 3ae757e）
 
-> 本节为批次 3 历史结论；批次 3 详细证据见 `docs/batch3-acceptance.md`；备份/恢复约束见 `docs/backup-restore.md` 顶部 STOP。
+> 本节为批次 3 历史结论；批次 3 详细证据见 `docs/batch3-acceptance.md`；备份/恢复状态见 `docs/backup-restore.md` 顶部。
 
 | 检查 | 当前结果 |
 | --- | --- |
@@ -39,15 +40,15 @@
 | 完整契约检查 | **38/38 通过**，0 失败 0 警告（补齐 `center_0018` 迁移基线后） |
 | 批次 3 交付 | 备份加密/异地存储与 `backup_records` 状态（`center_0018`）、监控/请求性能/告警/watchdog、前端监控总览与备份阶段/维护窗口展示 |
 | 生产试点 | `3ae757e` 中心/租户已部署；job 43 `succeeded`/`checks passed`，tenant HTTP 200；监控/性能/备份 UI 上线 |
-| ⛔→✅ 恢复演练（事故与复验） | 2026-11-13 约 15:53 CST 旧版 `restore_drill.sh` 在 8.163.80.17 清空主 `ventasync_center`（0 表）并停止主容器；用 `075322Z/ventasync_center.sql.gz`（138866 字节，UTC 07:53:22，`--no-record` 无 record ID）恢复中心库 30 表；后续从同目录 `vs_tenant_kangkang_shop.sql.gz` 恢复业务库 **34 表**（schema `tenant_0014`）、创建/授权 `vs_t_3`、修正 `TENANT_ID=3`/`ERP_WORKER_TENANT_ID=3`，登录 200/products 200/tenant 200，新备份 `093925Z`；修复版脚本用新备份 `093801Z` 演练 **passed=true/failed=0/28 checks**（主 center 30/业务 34 不变、主容器未重启、drill 清理）。遗留：`--record-latest` 关联失败（仅 id=1、local_path/checksum 空），`restore_status` 未写 verified |
-| 剩余风险 | 恢复演练记录关联待 backend-sales 修复（`--record-latest`、restore_status 回写）；生产恢复需 Lead 审批且备份记录可追溯；监控/告警真实环境持续观察；第二租户/网关未部署、维护状态等仍在后续批次 |
+| ⛔→✅ 恢复演练（事故与闭环） | 2026-11-13 约 15:53 CST 旧版 `restore_drill.sh` 在 8.163.80.17 清空主 `ventasync_center`（0 表）并停止主容器；用 `075322Z/ventasync_center.sql.gz`（138866 字节，UTC 07:53:22，`--no-record` 无 record ID）恢复中心库 30 表；后续从同目录 `vs_tenant_kangkang_shop.sql.gz` 恢复业务库 **34 表**（schema `tenant_0014`）、创建/授权 `vs_t_3`、修正 `TENANT_ID=3`/`ERP_WORKER_TENANT_ID=3`，登录 200/products 200/tenant 200；修复版脚本 093801Z 演练 28 checks；设置 `BACKUP_INSTANCE_ID=1` 后 094919Z 以 `--latest --record-latest --yes` 通过，自动匹配 **`backup_records id=2`**，`restore_status=verified`、`restore_verified_at=2026-11-13 09:49:54`，报告 `ventasync-drill-20261113094923-23419`；主 center 30/业务 34、tenant 200、主容器未重启 |
+| 剩余风险 | **`BACKUP_INSTANCE_ID` 必配**（等于中心 `tenant_instances.id`，本次=1）；生产恢复需 Lead 审批且备份记录可追溯；监控/告警真实环境持续观察；第二租户/网关未部署、维护状态等仍在后续批次 |
 
 补充说明：
 
-- **恢复演练执行通过但记录链未闭合**：修复版脚本在新备份上 passed=true/28 checks；因 `backup_records` 关联缺陷，
-  `--record-latest` 失败、`restore_status` 未写 verified；修复前只能用显式 `--bundle` 演练，不得宣称记录闭环。
-- `docs/backup-restore.md` 已从“安全冻结”更新为“运行限制/记录关联待修复”：保留显式 `--bundle` + `--dry-run` 规则，
-  撤回 `--record-latest` 回写与旧“独立卷不碰生产”的错误断言。
+- **恢复演练记录链已闭环**：094919Z 演练自动匹配 `backup_records id=2`，`restore_status=verified`、
+  `restore_verified_at=2026-11-13 09:49:54`；**`BACKUP_INSTANCE_ID` 必配**（8.163.80.17=1）。
+- `docs/backup-restore.md` 已从“安全冻结”更新为“记录链已闭环”：恢复 `--latest --record-latest` 用法，
+  新增 `BACKUP_INSTANCE_ID` 必配说明；旧“独立卷不碰生产”的错误断言保留为事故教训。
 - 批次 2 试点（`1da80c2`）与批次 1 试点（`2e34e6b`）记录见下节历史及各自验收文档。
 
 ---

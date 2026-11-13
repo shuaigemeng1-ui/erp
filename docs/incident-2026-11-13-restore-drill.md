@@ -3,7 +3,7 @@
 - 日期：2026-11-13
 - 环境：租户服务器 `8.163.80.17`，Compose 项目 `ventasync`
 - 严重级别：高（主租户中心库表被清空、主业务容器停止）
-- 当前状态（2026-11-13 17:45 CST）：恢复脚本已修复；生产业务库已从 075322Z 备份恢复并修正 TENANT_ID=3；新备份 093801Z 的隔离演练 **passed=true / failed=0 / 28 项检查**。遗留 `backup_records` 关联缺陷（`--record-latest` 无法匹配、restore_status 未写 verified），详见第 9 节。
+- 当前状态（2026-11-13 17:50 CST）：恢复脚本已修复；生产业务库已从 075322Z 备份恢复并修正 TENANT_ID=3；094919Z 演练通过并自动匹配 `backup_records id=2`、写入 `restore_status=verified`（`restore_verified_at=2026-11-13 09:49:54`），**记录链已闭环**。前提是 `BACKUP_INSTANCE_ID=1` 已配置（必配）。详见第 9 节。
 - 关联：批次3 task-31（备份加密异地与恢复演练），脚本 `deploy/scripts/restore_drill.sh`
 
 ## 1. 事件经过
@@ -160,7 +160,8 @@ docker ps -a | grep ventasync-drill          # 应为空
 - [x] 8.163.80.17 再次 `--dry-run` 通过（只读，留存卷名输出）
 - [x] 8.163.80.17 临时卷 actual 演练通过：新备份 093801Z 的 `drill-report.json` passed=true / failed=0 / 28 项检查，
       主卷 CreatedAt/Mountpoint 不变、主容器未重启、主 center 30 表/业务 34 表不变、无 drill 残留
-- [ ] Lead 批准后中心库 `backup_records.restore_status=verified` 写入（当前 `--record-latest` 关联缺陷未修复，见第 9.3 节）
+- [x] Lead 批准后中心库 `backup_records.restore_status=verified` 写入：094919Z 演练自动匹配 `id=2`，
+      `restore_verified_at=2026-11-13 09:49:54`（`BACKUP_INSTANCE_ID=1` 已配置）
 
 ## 8. 文件导入修复及实际演练结果（2026-11-13 17:30 CST）
 
@@ -256,24 +257,36 @@ API 配置 `TENANT_ID=1`，而中心库该租户实际 `tenant_id=3`，路由与
 
 这说明第 4.1/5.1 节的隔离修复与安全断言已在实际演练中生效；本轮演练只使用 drill 专属项目/卷，不触碰主卷。
 
-### 9.3 遗留问题：backup_records 关联缺陷
+### 9.3 记录关联修复与 094919Z 闭环
 
-`restore_drill.sh --record-latest` 仍报：
+历史问题（已修复）：
 
-```text
-未找到唯一匹配本地 run_id/校验值的备份记录
-```
+- `--record-latest` 曾报 `未找到唯一匹配本地 run_id/校验值的备份记录`；
+- `backup_records` 当时只有 `id=1`，`local_path`/`checksum` 为空，`restore_status` 未写 verified。
 
-核对结果：
+修复与验证：
 
-- `backup_records` 当前只有 `id=1`，且 `local_path`/`checksum` 为空；
-- 新演练的 `restore_status` **未写入 verified**；
-- 根因在备份记录与本地 run_id/checksum 的关联/回写逻辑，需要 backend-sales 修复；
-- 修复前：**可执行显式 `--bundle` 演练并保留报告，但不得宣称 `restore_status=verified` 或验收记录链闭合**。
+- backend-sales 修复备份记录与本地 `local_path`/`run_id`/校验值的精确关联（commit `b485bee`）；
+- 8.163.80.17 设置 **`BACKUP_INSTANCE_ID=1`**（与中心 `tenant_instances.id` 一致），生成 094919Z 备份；
+- 执行 `bash deploy/scripts/restore_drill.sh --latest --record-latest --yes`；
+- 结果：**passed=true、failed=0**；自动匹配 **`backup_records id=2`**，写入
+  `restore_status=verified`、`restore_verified_at=2026-11-13 09:49:54`；
+- 报告：`/var/lib/ventasync-backups/drill-reports/ventasync-drill-20261113094923-23419/drill-report.json`；
+- 主库/容器：主 `ventasync_center` **30 表**、业务 `vs_tenant_kangkang_shop` **34 表**，租户 HTTP 200，主容器未重启。
 
-### 9.4 验收口径更新
+结论：**恢复演练记录链已闭环**（报告、平台 `backup_records`、`restore_status=verified` 一致），不再需要人工补写。
 
-- 旧版脚本在 15:53 造成的事故记录仍有效（第 1–8 节）；
-- 修复版脚本在新备份上**演练执行通过**（passed=true/28 checks），主数据与主容器未受影响；
-- 但 `backup_records` 关联未闭合，**批次 3 恢复演练验收状态 = 执行通过、记录回写待修复**；
-- 后续正式演练：先 `--dry-run`，再用显式 `--bundle <包>` + `--yes`，保存报告；`--record-latest` 待修复后再用。
+### 9.4 `BACKUP_INSTANCE_ID` 必配
+
+- `BACKUP_INSTANCE_ID` 必须等于中心库 `tenant_instances.id`（8.163.80.17 为 **1**）；
+- 未配置时备份记录可能缺少 `instance_id`，`--record-latest` 无法唯一匹配，演练记录无法自动回写；
+- 该变量已写入 `deploy/scripts/backup.sh` / `restore_drill.sh` 读取逻辑与 `deploy/.env` 模板说明；
+- 部署/验收清单必须检查：备份、恢复演练前先确认 `BACKUP_INSTANCE_ID` 已设置并与实例 ID 一致。
+
+### 9.5 验收口径更新
+
+- 旧版脚本在 15:53 造成的事故记录仍有效（第 1–8 节），修复过程与防复发规则保留；
+- 修复版脚本在 093801Z 演练执行通过（28 checks），并在 094919Z 演练中完成记录闭环（id=2/verified）；
+- **批次 3 恢复演练验收状态 = 通过（演练执行 + 记录回写均闭环）**，前提是 `BACKUP_INSTANCE_ID` 已配置；
+- 后续正式演练：建议先 `--dry-run`，再 `--latest --record-latest --yes`（或显式 `--bundle ... --record-id`），
+  保存报告并核对 `backup_records.restore_status=verified`。

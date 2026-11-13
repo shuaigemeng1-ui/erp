@@ -4,12 +4,13 @@
 - 角色：deploy-qa（task-36）；**本批次只新增 deploy/scripts、backend/scripts、docs 模板，未连接/修改任何生产环境**
 - 目录：`deploy/scripts/tenant-onboarding/`；工具：`backend/scripts/tenant_migration_whitelist.py`
 - 关联：批次 2 租户模式边界（`docs/batch2-acceptance.md`）、批次 3 备份（`docs/backup-restore.md`）、
-  恢复演练事故（`docs/incident-2026-11-13-restore-drill.md`，当前脚本冻结）
+  恢复演练事故与闭环（`docs/incident-2026-11-13-restore-drill.md`，记录链已闭环）
 
 > 本文件是“第二个独立租户”的可复制接入手册。真实域名切换、OAuth 回调重登记、店铺凭据迁移、
 > Agent2 安装与 SSH 首指纹确认**尚未在第二租户真实执行**；执行前必须经 Lead 审批并完成第 4/5 节停写与对账。
-> 恢复演练脚本旧版曾造成事故，修复版已在新备份通过 28 项检查；但 `backup_records` 记录关联待修复，
-> 不得写 `restore_status=verified`（详见 `docs/incident-2026-11-13-restore-drill.md` 第 9 节）。
+> 恢复演练脚本旧版曾造成事故；修复版已在新备份通过 28 项检查，094919Z 演练完成记录闭环
+> （`backup_records id=2`、`restore_status=verified`）；**`BACKUP_INSTANCE_ID` 必配**（详见
+> `docs/incident-2026-11-13-restore-drill.md` 第 9 节与 `docs/backup-restore.md` 第 0.1 节）。
 
 ## 1. 目标与边界
 
@@ -160,7 +161,7 @@ sudo bash deploy/scripts/tenant-onboarding/migrate.sh --apply --stop-write \
 4. `migrate.sh --plan` 确认迁移清单；需要停写时按 4.5 执行 `reconcile.sh --stop-write`；
 5. 拉取/切换镜像并滚动启动 API/Worker/Scheduler（`docker compose ... up -d`），外部 TLS 由 Caddy 保持；
 6. 验证：`/api/v1/runtime` mode=tenant、`/healthz` 200、租户登录/商品/订单冒烟、版本=目标 tag；
-7. 失败：停止发布、回退镜像；数据库回退只能从升级前备份恢复（Lead 审批），演练操作必须先 `--dry-run` 且不得写 `restore_status=verified`；
+7. 失败：停止发布、回退镜像；数据库回退只能从升级前备份恢复（Lead 审批），演练操作先 `--dry-run` 并核对 `restore_status=verified`；
 8. 记录发布 job/审计/备份 ID 与验证结果；旧实例在确认无回切前保持停机/只读。
 
 ## 5. 迁移白名单与保留标识
@@ -245,7 +246,8 @@ python backend/scripts/tenant_migration_whitelist.py compare-tsv \
 
 1. 发布任务失败时立即停止发布，保留日志/任务事件；不自动 downgrade 数据库；
 2. 迁移前备份存在且可读 → 回退镜像 → 如需回库按 `docs/backup-restore.md` 人工恢复（Lead 审批）；
-3. 恢复演练脚本冻结，不得用 `restore_drill.sh` 验证。
+3. 恢复演练使用修复版脚本（先 `--dry-run`，再 `--latest --record-latest --yes`），核对 `restore_status=verified`；
+   不得用旧版脚本或未配置 `BACKUP_INSTANCE_ID` 的实例验证。
 
 ### 7.4 恢复验证
 
@@ -284,10 +286,11 @@ python backend/scripts/tenant_migration_whitelist.py compare-tsv \
 - 第二租户真实开通、域名切换、OAuth 回调重登记、店铺凭据迁移；**第二租户仍未部署**；
 - `copy_data.sh --apply`、`migrate.sh --apply`、stop-write/resume 真机演练；
 - 中心断网、Agent 重启、发布失败、恢复验证的真实演练；
-- 独立网关（task-35）代码已合入但**未部署**，且不纳入本模板链路；恢复演练记录关联修复（backend-sales）待完成。
+- 独立网关（task-35）代码已合入但**未部署**，且不纳入本模板链路；恢复演练记录关联已由 b485bee 修复并闭环。
 
 生产现状补充（2026-11-13 17:40 CST）：
 
 - `8.163.80.17` 已恢复业务库 `vs_tenant_kangkang_shop`（34 表、schema `tenant_0014`）、创建/授权 `vs_t_3`；
 - `.env` 已修正 `TENANT_ID=3`/`ERP_WORKER_TENANT_ID=3`，登录 200 / products 200 / tenant 200；
-- 新备份 `093925Z`；新备份隔离演练 passed=true/28 checks，但 `--record-latest` 关联缺陷未修复。
+- 新备份 `093925Z`；设置 `BACKUP_INSTANCE_ID=1` 后 094919Z 演练通过，自动匹配 `backup_records id=2` 并写
+  `restore_status=verified`（`restore_verified_at=2026-11-13 09:49:54`）；**`BACKUP_INSTANCE_ID` 必配**。

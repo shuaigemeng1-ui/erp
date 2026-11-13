@@ -225,6 +225,8 @@ def _latest_metric(center, node_id: int) -> NodeMetricSample | None:
 def _metric_payload(row: NodeMetricSample | None) -> dict[str, Any] | None:
     if row is None:
         return None
+    from app.modules.ops import monitoring
+
     return {
         "sampled_at": _iso(row.sampled_at),
         "received_at": _iso(row.received_at),
@@ -239,6 +241,7 @@ def _metric_payload(row: NodeMetricSample | None) -> dict[str, Any] | None:
         "swap_total_mb": int(row.swap_total_mb or 0),
         "swap_used_mb": int(row.swap_used_mb or 0),
         "disks": row.disks or [],
+        "data_disk": monitoring.data_disk_summary(row.disks),
         "network": row.network or {},
         "services": row.services or {},
         "public_ip": row.public_ip or "",
@@ -686,124 +689,10 @@ def _sustained(center, node_id: int, column, threshold: float, seconds: int, min
 
 
 def ingest_telemetry(center, node: ServerNode, payload: TelemetryPayload) -> dict[str, Any]:
-    now = _now()
-    sampled_at = _aware_utc(payload.sampled_at) or now
-    node.hostname = payload.hostname or node.hostname
-    node.os_name = payload.os_name or node.os_name
-    node.arch = payload.arch or node.arch
-    node.cpu_cores = payload.cpu_cores or node.cpu_cores
-    node.memory_total_mb = payload.memory_total_mb or node.memory_total_mb
-    node.disk_total_gb = payload.disk_total_gb or node.disk_total_gb
-    if payload.internal_ips:
-        node.internal_ips = payload.internal_ips
-    if payload.public_ip:
-        node.observed_public_ip = payload.public_ip
-    node.agent_version = payload.agent_version or node.agent_version
-    node.executor_version = payload.executor_version or node.executor_version
-    if payload.protocol_version:
-        node.protocol_version = _safe_int(payload.protocol_version)
-    if payload.capabilities:
-        node.capabilities_json = payload.capabilities
-    node.db_version = payload.db_version or node.db_version
-    node.app_version = payload.app_version or node.app_version
-    if payload.app_version or payload.db_version or payload.protocol_version:
-        instance = center.get(TenantInstance, node.instance_id)
-        if instance is not None:
-            if payload.app_version and instance.actual_version != payload.app_version:
-                instance.actual_version = payload.app_version
-            if payload.app_version and not instance.app_version:
-                instance.app_version = payload.app_version
-            if payload.db_version:
-                instance.db_version = payload.db_version
-            if payload.agent_version:
-                instance.agent_version = payload.agent_version
-            if payload.executor_version:
-                instance.executor_version = payload.executor_version
-            instance.updated_at = now
-    node.status = "online"
-    node.last_seen_at = now
-    node.last_metrics_at = now
-    node.updated_at = now
-    instance = center.get(TenantInstance, node.instance_id)
-    if instance is not None and instance.status == "pending":
-        instance.status = "active"
-        instance.updated_at = now
-    sample = NodeMetricSample(
-        node_id=node.id,
-        sampled_at=sampled_at,
-        received_at=now,
-        cpu_percent=payload.cpu_percent,
-        load1=payload.load1,
-        load5=payload.load5,
-        load15=payload.load15,
-        memory_total_mb=payload.memory_total_mb,
-        memory_used_mb=payload.memory_used_mb,
-        memory_available_mb=payload.memory_available_mb,
-        memory_percent=payload.memory_percent,
-        swap_total_mb=payload.swap_total_mb,
-        swap_used_mb=payload.swap_used_mb,
-        disks=payload.disks,
-        network=payload.network,
-        services=payload.services,
-        public_ip=payload.public_ip,
-    )
-    center.add(sample)
+    """指标入库（task-29）：实时/历史样本分离、数据盘/网络真实速率、持续时间告警。"""
+    from app.modules.ops import monitoring
 
-    _resolve_alerts(center, node, (ALERT_AGENT,), now)
-    # CPU 85% 持续 10 分钟；内存 90% 持续 5 分钟；样本不足时不告警。
-    if _sustained(center, node.id, NodeMetricSample.cpu_percent, 85, 10 * 60, 20):
-        _upsert_alert(
-            center,
-            node,
-            ALERT_CPU,
-            "warning" if payload.cpu_percent < 95 else "critical",
-            f"CPU 使用率持续过高：{payload.cpu_percent:.1f}%",
-            f"{payload.cpu_percent:.1f}%",
-            "85% / 10分钟",
-            now,
-        )
-    elif payload.cpu_percent < 85:
-        _resolve_alerts(center, node, (ALERT_CPU,), now)
-    if _sustained(center, node.id, NodeMetricSample.memory_percent, 90, 5 * 60, 10):
-        _upsert_alert(
-            center,
-            node,
-            ALERT_MEMORY,
-            "critical",
-            f"内存使用率持续过高：{payload.memory_percent:.1f}%",
-            f"{payload.memory_percent:.1f}%",
-            "90% / 5分钟",
-            now,
-        )
-    elif payload.memory_percent < 90:
-        _resolve_alerts(center, node, (ALERT_MEMORY,), now)
-
-    max_disk = 0.0
-    for disk in payload.disks:
-        try:
-            max_disk = max(max_disk, float(disk.get("percent") or 0))
-        except (TypeError, ValueError):
-            continue
-    if max_disk >= 95:
-        _upsert_alert(
-            center, node, ALERT_DISK, "critical",
-            f"磁盘使用率过高：{max_disk:.1f}%", f"{max_disk:.1f}%", "95%", now,
-        )
-    elif max_disk >= 85:
-        _upsert_alert(
-            center, node, ALERT_DISK, "warning",
-            f"磁盘使用率预警：{max_disk:.1f}%", f"{max_disk:.1f}%", "85%", now,
-        )
-    else:
-        _resolve_alerts(center, node, (ALERT_DISK,), now)
-
-    center.commit()
-    return {
-        "ok": True,
-        "node_id": str(node.id),
-        "next_report_seconds": 30,
-        "server_time": _iso(now),
-    }
+    return monitoring.ingest_telemetry(center, node, payload)
 
 
 def mark_stale_nodes_offline(center) -> int:
@@ -846,79 +735,10 @@ def _cert_days_left(domain: str) -> int | None:
 
 
 def probe_node(center, node_id: int) -> dict[str, Any]:
-    node = center.get(ServerNode, int(node_id))
-    if node is None:
-        raise AppError(ErrorCode.NOT_FOUND, "节点不存在")
-    instance = get_instance(center, node.instance_id)
-    cert_days = _cert_days_left(instance.domain)
-    checks: list[NodeCheck] = []
-    for target, path in TARGETS:
-        url = f"https://{instance.domain}{path}"
-        started = _now()
-        ok = False
-        status_code: int | None = None
-        error = ""
-        try:
-            response = httpx.get(url, timeout=8.0, follow_redirects=False)
-            status_code = response.status_code
-            ok = 200 <= response.status_code < 400
-            if not ok:
-                error = f"HTTP {response.status_code}"
-        except httpx.HTTPError as exc:
-            error = str(exc)[:255]
-        latency = int((_now() - started).total_seconds() * 1000)
-        row = NodeCheck(
-            node_id=node.id,
-            checked_at=started,
-            target=target,
-            url=url,
-            ok=ok,
-            status_code=status_code,
-            latency_ms=latency,
-            cert_days_left=cert_days,
-            error=error,
-        )
-        center.add(row)
-        checks.append(row)
-    if cert_days is not None and cert_days < 14:
-        _upsert_alert(center, node, ALERT_CERT, "critical" if cert_days < 7 else "warning",
-                      f"HTTPS 证书剩余 {cert_days} 天", str(cert_days), "14天", _now())
-    elif cert_days is not None:
-        _resolve_alerts(center, node, (ALERT_CERT,), _now())
-    if all(item.ok for item in checks):
-        _resolve_alerts(center, node, (ALERT_PUBLIC,), _now())
-    else:
-        recent = center.execute(
-            select(NodeCheck.ok).where(NodeCheck.node_id == node.id).order_by(NodeCheck.id.desc()).limit(24)
-        ).scalars().all()
-        failures = 0
-        for ok in recent:
-            if ok:
-                break
-            failures += 1
-        if failures >= 6:
-            _upsert_alert(
-                center, node, ALERT_PUBLIC, "critical",
-                "公网访问连续 3 次探测失败", "failed", "连续3次", _now(),
-            )
-    center.commit()
-    return {
-        "node_id": str(node.id),
-        "instance_id": str(instance.id),
-        "domain": instance.domain,
-        "checks": [
-            {
-                "target": item.target,
-                "url": item.url,
-                "ok": item.ok,
-                "status_code": item.status_code,
-                "latency_ms": item.latency_ms,
-                "error": item.error,
-                "checked_at": _iso(item.checked_at),
-            }
-            for item in checks
-        ],
-    }
+    """公网探测（task-29）：root/api 分开记录与独立告警，单节点预算 10s。"""
+    from app.modules.ops import monitoring
+
+    return monitoring.probe_node(center, node_id)
 
 
 def list_metrics(center, node_id: int, *, minutes: int = 60, limit: int = 500) -> dict[str, Any]:
@@ -1025,25 +845,31 @@ _last_probe_at: datetime | None = None
 
 
 def run_center_maintenance(center, *, probe_interval_seconds: int = 60) -> dict[str, int]:
-    """调度进程周期调用：标记 Agent 失联并定时执行公网探测。"""
+    """调度进程周期调用：标记 Agent 失联、投递公网探测队列、聚合/通知/清理。
+
+    公网探测改为独立队列（最大并发 10、单节点预算 10s），本函数立即返回，
+    不等待 HTTP/证书探测完成，避免阻塞调度轮次。
+    """
     global _last_probe_at
     now = _now()
     offline = mark_stale_nodes_offline(center)
     probed = 0
-    failed = 0
+    deferred = 0
     if _last_probe_at is None or (now - _last_probe_at).total_seconds() >= probe_interval_seconds:
         nodes = center.execute(
-            select(ServerNode)
+            select(ServerNode.id)
             .where(ServerNode.enrolled_at.is_not(None))
             .order_by(ServerNode.id.asc())
             .limit(100)
         ).scalars().all()
-        for node in nodes:
-            try:
-                probe_node(center, node.id)
-                probed += 1
-            except Exception:  # noqa: BLE001 - 单节点探测失败不影响其他节点
-                failed += 1
+        try:
+            from app.workers.monitor import enqueue_probe_node_ids
+
+            queued = enqueue_probe_node_ids(nodes)
+            probed = int(queued.get("submitted") or 0)
+            deferred = int(queued.get("deferred") or 0)
+        except Exception:  # noqa: BLE001 - 队列故障不阻塞调度
+            logger.exception("提交公网探测队列失败")
         _last_probe_at = now
     aggregate_metrics(center)
     mark_stale_operations(center)
@@ -1053,7 +879,8 @@ def run_center_maintenance(center, *, probe_interval_seconds: int = 60) -> dict[
     return {
         "offline": offline,
         "probed": probed,
-        "probe_failed": failed,
+        "probe_deferred": deferred,
+        "probe_failed": 0,
         "notified": notified,
         "backup_alerts": notifications,
         "metrics_cleaned": cleaned["metrics"],

@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 
 from celery import Celery
-from celery.signals import worker_process_init
+from celery.signals import worker_process_init, worker_ready
 
 from app.core.config import settings
 
@@ -84,3 +84,14 @@ def _log_worker_binding(**_kwargs: object) -> None:
         settings.deployment_mode,
         binding,
     )
+
+
+@worker_ready.connect
+def _start_worker_heartbeat(**_kwargs: object) -> None:
+    """Worker 就绪后写组件心跳（供 /platform/monitoring/overview 分项状态）。"""
+    try:
+        from app.workers.monitor import start_heartbeat_thread
+
+        start_heartbeat_thread("worker")
+    except Exception:  # noqa: BLE001 - 心跳失败不能阻止 Worker 处理任务
+        logger.exception("启动 Worker 心跳失败（监控分项将显示 unknown）")

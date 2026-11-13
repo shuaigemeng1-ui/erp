@@ -29,6 +29,12 @@ def main() -> None:
         logger.error("调度进程实例绑定配置非法，拒绝启动：%s", exc)
         raise SystemExit(3) from exc
     logger.info("调度进程启动，固定绑定=%s", binding.describe())
+    try:
+        from app.workers.monitor import start_heartbeat_thread
+
+        start_heartbeat_thread("scheduler")
+    except Exception:  # noqa: BLE001 - 心跳失败不阻塞调度进程
+        logger.exception("启动调度器心跳失败（监控分项将显示 unknown）")
     scheduler_main()
 
 

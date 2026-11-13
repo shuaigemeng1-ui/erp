@@ -685,6 +685,51 @@ def test_service_delegates_to_monitoring(center, monkeypatch):
     assert status["components"][0]["name"] == "identity_db"
 
 
+def test_monitoring_overview_http_route(center, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.api.deps import get_center_db, platform_admin
+    from app.core.auth import AuthenticatedUser
+    from app.main import app
+
+    seed_node(center)
+    admin = AuthenticatedUser(
+        user_id=1,
+        email="admin@example.com",
+        display_name="Admin",
+        status="active",
+        is_platform_admin=True,
+    )
+    monkeypatch.setattr(monitoring, "_ping_redis", lambda: None)
+    monkeypatch.setattr(
+        monitoring,
+        "performance_parts",
+        lambda: {
+            "performance": {"request_count": 3, "error_count": 0, "error_5xx": 0},
+            "business_requests": {"request_count": 2, "error_count": 0, "error_5xx": 0},
+        },
+    )
+    app.dependency_overrides[get_center_db] = lambda: center
+    app.dependency_overrides[platform_admin] = lambda: admin
+    try:
+        client = TestClient(app)
+        response = client.get("/api/v1/platform/monitoring/overview")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        data = body.get("data", body)
+        assert data["performance"]["request_count"] == 3
+        assert {item["name"] for item in data["components"]} == {
+            "identity_db",
+            "business_db",
+            "redis",
+            "worker",
+            "scheduler",
+        }
+        assert [item["target"] for item in data["public_probes"]] == ["root", "api"]
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_metric_payload_includes_data_disk(center):
     from app.modules.ops import service
 

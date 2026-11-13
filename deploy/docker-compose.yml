@@ -53,6 +53,7 @@ x-app-env: &app-env
   # 基础
   APP_NAME: ${APP_NAME:-ERP}
   APP_ENV: ${APP_ENV:-production}
+  DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-center}
   API_PREFIX: ${API_PREFIX:-/api/v1}
   DEBUG: ${DEBUG:-false}
   LOG_LEVEL: ${LOG_LEVEL:-INFO}

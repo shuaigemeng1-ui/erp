@@ -191,6 +191,21 @@ def _docker_services() -> dict[str, Any]:
     return {"available": True, "containers": containers}
 
 
+def detect_app_version(config: dict[str, Any] | None = None) -> str:
+    """优先环境变量，否则读取部署目录 .env 的 APP_IMAGE_TAG。"""
+    value = os.environ.get("ERP_APP_VERSION", "").strip()
+    if value:
+        return value
+    deploy_dir = Path(str((config or {}).get("deploy_dir") or "/opt/ventasync/deploy"))
+    try:
+        for line in (deploy_dir / ".env").read_text(encoding="utf-8").splitlines():
+            if line.startswith("APP_IMAGE_TAG="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
 def collect(previous_network: dict[str, Any] | None = None) -> dict[str, Any]:
     mem = _meminfo()
     total = mem.get("MemTotal", 0)
@@ -370,6 +385,7 @@ def run(args: argparse.Namespace) -> int:
     while True:
         try:
             payload = collect(previous_network)
+            payload["app_version"] = detect_app_version(config)
             previous_network = payload["network"]
             cache = _read_cache(args.config)
             cache.append(payload)

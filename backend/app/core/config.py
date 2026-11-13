@@ -134,6 +134,43 @@ class Settings(BaseSettings):
     bootstrap_platform_admin_password: str = ""
     bootstrap_platform_admin_name: str = "平台管理员"
 
+    # ------------------------------------------------------------------ 请求性能指标（HTTP 中间件）
+    # 指标写缓存 Redis 分钟桶（24h TTL），不落业务库；Redis 异常时 fail-open 不影响请求。
+    request_metrics_enabled: bool = True
+    request_metrics_window_seconds: int = 15 * 60
+    request_metrics_retention_hours: int = 24
+    request_metrics_slow_ms: int = 1000
+    # 排除不需要统计的业务前缀（逗号分隔）；健康检查与 Agent 上报始终排除
+    request_metrics_exclude_prefixes: str = "/api/v1/agent/,/api/v1/platform/metrics,/api/v1/monitoring"
+    # 本地内存降级窗口（Redis 不可用时页面仍可展示最近数据）
+    request_metrics_memory_minutes: int = 15
+
+    # ------------------------------------------------------------------ 运维告警阈值（默认持续阈值）
+    # CPU / 内存按持续时间与采样连续性判定；磁盘按水位；Agent 失联按秒数。
+    alert_cpu_percent: float = 85.0
+    alert_cpu_sustain_seconds: int = 10 * 60
+    alert_memory_percent: float = 90.0
+    alert_memory_sustain_seconds: int = 5 * 60
+    alert_disk_warning_percent: float = 85.0
+    alert_disk_critical_percent: float = 95.0
+    alert_agent_offline_seconds: int = 90
+    # 公网探测连续失败次数（root 与 api 分别计数，不互相掩盖）
+    alert_public_failure_count: int = 3
+    # 重复告警抑制间隔（同一告警未恢复时，再次发邮件的间隔）
+    alert_remind_seconds: int = 30 * 60
+    # 恢复邮件
+    alert_recovery_email_enabled: bool = True
+    # 请求性能告警判定阈值（仅用于页面提示，不创建节点告警）
+    alert_request_p95_ms: int = 1500
+    alert_request_5xx_rate: float = 0.05
+    alert_request_min_requests: int = 50
+
+    # ------------------------------------------------------------------ 监控数据保留
+    metric_retention_days: int = 7
+    metric_aggregate_lookback_days: int = 7
+    metric_aggregate_5m_retention_days: int = 30
+    metric_aggregate_1h_retention_days: int = 400
+
     # ------------------------------------------------------------------ 定时任务
     outbox_dispatch_interval_seconds: int = 15
     outbox_batch_size: int = 100

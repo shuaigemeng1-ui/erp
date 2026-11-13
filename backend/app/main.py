@@ -41,6 +41,7 @@ from app.core.errors import AppError, ErrorCode
 from app.core.http import error_body
 from app.core.logging import configure_logging
 from app.core.redis import touch_session
+from app.core.request_metrics import RequestMetricsMiddleware
 from app.db.base import assert_no_foreign_keys
 from app.db.registry import center_metadata, tenant_metadata
 from app.db.session import dispose_all, ping_center
@@ -128,6 +129,9 @@ def create_app() -> FastAPI:
     # 返回 404 不暴露平台功能；健康检查、认证与租户业务接口放行。
     # 最后添加 => 位于用户中间件最外层，WebSocket 握手阶段即可拒绝，且不被异常处理绕过。
     application.add_middleware(ModeBoundaryMiddleware)
+    # 请求性能指标：位于 CORS / TrustedHost 之后、业务中间件之前（记录业务处理耗时）。
+    # 中间件只做内存累加 + 有界队列，Redis 异常 fail-open，绝不影响业务请求。
+    application.add_middleware(RequestMetricsMiddleware)
     # 只允许通过正式域名访问；未配置 TRUSTED_HOSTS 时不限制（本地开发/测试）
     allowed_hosts = settings.allowed_hosts
     if allowed_hosts:

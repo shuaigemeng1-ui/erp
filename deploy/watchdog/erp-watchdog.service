@@ -1,0 +1,32 @@
+[Unit]
+Description=ERP management center external watchdog
+Documentation=file:/opt/erp-watchdog/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/erp-watchdog.env
+ExecStart=/usr/bin/python3 /opt/erp-watchdog/erp_watchdog.py
+Restart=always
+RestartSec=10
+User=erp-watchdog
+Group=erp-watchdog
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/erp-watchdog
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# 允许访问网络（SMTP + HTTPS 探测）
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

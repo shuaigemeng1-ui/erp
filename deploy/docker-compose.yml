@@ -227,6 +227,7 @@ services:
     environment: *app-env
     volumes:
       - catalog_media_data:/app/var/catalog-media
+      - ./releases:/srv/releases:ro
     networks:
       - edge
       - backend

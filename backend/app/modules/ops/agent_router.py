@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Header, Request
+from fastapi.responses import FileResponse
 
 from app.api.deps import CenterDb
 from app.core.http import success
@@ -64,3 +65,27 @@ def job_event(center: CenterDb, job_id: int, payload: AgentJobEvent, authorizati
 @router.get("/ping", summary="Agent 连通性检查")
 def ping(request: Request) -> dict:
     return success({"ok": True})
+
+
+@router.get("/releases/{version}/bundle", summary="Agent 下载离线镜像包")
+def download_release_bundle(
+    version: str,
+    center: CenterDb,
+    authorization: str | None = Header(default=None),
+) -> FileResponse:
+    """节点凭令牌下载中心构建的版本镜像 tar.gz，用于本机 docker load。"""
+    import re
+    from pathlib import Path
+    from app.core.config import settings
+    from app.core.errors import AppError, ErrorCode
+
+    token = _bearer_token(authorization)
+    node = service._node_from_token(center, token) if token else None
+    if node is None:
+        raise AppError(ErrorCode.AUTH_SESSION_REQUIRED, "节点令牌无效")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", version or ""):
+        raise AppError(ErrorCode.VALIDATION_ERROR, "版本号格式不正确")
+    path = Path(settings.release_bundle_dir) / f"{version}.tar.gz"
+    if not path.is_file():
+        raise AppError(ErrorCode.NOT_FOUND, "该版本离线镜像包不存在")
+    return FileResponse(path, media_type="application/gzip", filename=f"erp-{version}.tar.gz")

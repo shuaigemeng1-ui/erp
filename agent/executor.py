@@ -17,6 +17,9 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -129,18 +132,30 @@ def execute(job: dict[str, Any], config: dict[str, Any], report) -> dict[str, An
             lines.append(f"APP_IMAGE_TAG={target}")
         temp_env.write_text("\n".join(lines) + "\n", encoding="utf-8")
         compose = _compose(config, str(temp_env))
-        has_registry = any(
-            line.startswith("IMAGE_REGISTRY=") and line.split("=", 1)[1].strip()
-            for line in lines
-        )
-        if target and has_registry:
-            report(2, f"拉取镜像 {target}", "running", "")
-            code, output = _run([*compose, "pull"], deploy_dir, timeout=1800)
-            report(2, "拉取镜像", "succeeded" if code == 0 else "failed", output)
+        if target:
+            bundle = Path(f"/tmp/erp-release-{target}.tar.gz")
+            report(2, f"下载镜像包 {target}", "running", "")
+            try:
+                base = str(config.get("center") or "").rstrip("/")
+                url = f"{base}/api/v1/agent/releases/{urllib.parse.quote(target)}/bundle"
+                request = urllib.request.Request(
+                    url, headers={"Authorization": f"Bearer {config.get('node_token', '')}"}
+                )
+                with urllib.request.urlopen(request, timeout=3600) as response, bundle.open("wb") as output:
+                    shutil.copyfileobj(response, output)
+                report(2, "下载镜像包", "succeeded", f"{bundle.stat().st_size} bytes")
+            except Exception as exc:  # noqa: BLE001
+                report(2, "下载镜像包", "failed", str(exc)[:500])
+                return {"ok": False, "error": "bundle_download_failed"}
+            report(2, "加载镜像", "running", "")
+            code, output = _run(["docker", "load", "-i", str(bundle)], deploy_dir, timeout=1800)
+            report(2, "加载镜像", "succeeded" if code == 0 else "failed", output)
+            try:
+                bundle.unlink()
+            except OSError:
+                pass
             if code != 0:
                 return {"ok": False, "exit_code": code, "output": output}
-        else:
-            report(2, f"检查版本 {target or '当前版本'}", "succeeded", "")
         report(3, f"更新服务 {target or '当前版本'}", "running", "")
         code2, output2 = _run([*compose, "up", "-d", "--remove-orphans"], deploy_dir, timeout=1800)
         report(3, "更新服务", "succeeded" if code2 == 0 else "failed", output2)

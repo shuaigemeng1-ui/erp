@@ -18,12 +18,10 @@ docker compose -f docker-compose.yml -f docker-compose.server.yml --env-file .en
 # 兼容 compose 构建时未带前缀的镜像标签
 docker tag "ventasync-backend:${VERSION}" "${IMAGE_PREFIX}ventasync-backend:${VERSION}" 2>/dev/null || true
 docker tag "ventasync-frontend:${VERSION}" "${IMAGE_PREFIX}ventasync-frontend:${VERSION}" 2>/dev/null || true
-# 推送走本机 registry，避免大镜像绕公网 nginx 造成超时；仓库路径与公网拉取一致。
-LOCAL_REGISTRY="127.0.0.1:5000"
-docker tag "${IMAGE_PREFIX}ventasync-backend:${VERSION}" "${LOCAL_REGISTRY}/ventasync-backend:${VERSION}"
-docker tag "${IMAGE_PREFIX}ventasync-frontend:${VERSION}" "${LOCAL_REGISTRY}/ventasync-frontend:${VERSION}"
-docker push "${LOCAL_REGISTRY}/ventasync-backend:${VERSION}"
-docker push "${LOCAL_REGISTRY}/ventasync-frontend:${VERSION}"
+# 生成租户可下载的离线镜像包；Agent 下载后 docker load。
+mkdir -p releases
+docker save "${IMAGE_PREFIX}ventasync-backend:${VERSION}" "${IMAGE_PREFIX}ventasync-frontend:${VERSION}" | gzip > "releases/${VERSION}.tar.gz"
+echo "==> 离线镜像包：deploy/releases/${VERSION}.tar.gz ($(du -h "releases/${VERSION}.tar.gz" | cut -f1))"
 
 # 持久化中心版本与镜像仓库前缀
 python3 - "$VERSION" "$IMAGE_PREFIX" <<'PY'

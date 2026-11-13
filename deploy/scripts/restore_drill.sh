@@ -71,6 +71,9 @@ CONFIG_JSON=""
 REPORT=""
 # 仅在「compose config 安全断言通过」后置 1；cleanup 用它决定是否允许执行 down -v
 SAFETY_VERIFIED=0
+# 演练目标信息（写入报告，供证据核对；由 validate_drill_datadir 填充）
+DRILL_DATADIR=""
+DRILL_DATA_VOLUME=""
 
 log() { printf '[drill] %s\n' "$*"; }
 warn() { printf '[drill] 警告：%s\n' "$*" >&2; }
@@ -198,6 +201,8 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 PROJECT="ventasync-drill-$(date -u +%Y%m%d%H%M%S)-$RANDOM"
 [[ "${PROJECT}" =~ ^ventasync-drill-[a-z0-9-]+$ ]] || die "生成的 drill 项目名不合法：${PROJECT}"
 [[ "${PROJECT}" != "${MAIN_PROJECT}" ]] || die "drill 项目名不能等于主项目名：${PROJECT}"
+# 供报告写入演练目标（drill-report.json 的 target 字段）
+export MAIN_PROJECT DRILL_PROJECT="${PROJECT}"
 
 compose() {
     COMPOSE_PROJECT_NAME="${PROJECT}" docker compose -p "${PROJECT}" \
@@ -373,18 +378,75 @@ fi
 # ---------------------------------------------------------------- 启动隔离 MySQL
 log "4/7 启动隔离 MySQL（project=${PROJECT}，独立卷，不暴露端口）"
 compose up -d --no-deps mysql
-MYSQL_READY=0
-for _ in $(seq 1 60); do
-    if compose exec -T mysql sh -c 'export MYSQL_PWD="${MYSQL_ROOT_PASSWORD:?}"; mysqladmin ping -uroot --silent' >/dev/null 2>&1; then
-        MYSQL_READY=1
-        break
+
+mysql_container_id() { compose ps -q mysql 2>/dev/null || true; }
+
+print_mysql_diagnostics() {
+    local cid="$1"
+    warn "MySQL 未就绪/导入失败，输出容器状态与日志（drill 项目 ${PROJECT}，不影响主项目）"
+    if [[ -n "${cid}" ]]; then
+        docker inspect --format 'name={{.Name}} status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${cid}" >&2 || true
+        docker logs --tail 200 "${cid}" >&2 || true
+    else
+        warn "未找到 mysql 容器：project=${PROJECT}"
+        compose ps >&2 || true
     fi
-    sleep 2
-done
-[[ "${MYSQL_READY}" -eq 1 ]] || die "隔离 MySQL 启动超时（仅 drill 项目受影响）"
+}
+
+mysql_ping() {
+    compose exec -T mysql sh -c '
+        set -eu
+        export MYSQL_PWD="${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 未设置}"
+        exec mysqladmin ping -uroot --silent
+    ' >/dev/null 2>&1
+}
+
+mysql_select_one() {
+    local value
+    value="$(compose exec -T mysql sh -c '
+        set -eu
+        export MYSQL_PWD="${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 未设置}"
+        exec mysql -N -B -uroot -e "SELECT 1"
+    ' 2>/dev/null | tr -d "[:space:]" || true)"
+    [[ "${value}" == "1" ]]
+}
+
+# 就绪判定：mysqladmin ping + `SELECT 1` 双探针连续 3 次成功（间隔 2s），最多 120s；
+# 避免 MySQL 容器 entrypoint 的临时初始化实例刚可 ping 就导入导致 ERROR 2002。
+wait_for_mysql_ready() {
+    local deadline=$((SECONDS + 120)) ping_ok=0 select_ok=0 consecutive=0 cid=""
+    log "   等待 MySQL 就绪（双探针：mysqladmin ping + SELECT 1；最多 120s，连续 3 次成功）"
+    while (( SECONDS < deadline )); do
+        cid="$(mysql_container_id)"
+        if [[ -z "${cid}" ]]; then
+            sleep 2
+            continue
+        fi
+        if [[ "$(docker inspect --format '{{.State.Running}}' "${cid}" 2>/dev/null || echo false)" != "true" ]]; then
+            sleep 2
+            continue
+        fi
+        if mysql_ping; then ping_ok=1; else ping_ok=0; fi
+        if mysql_select_one; then select_ok=1; else select_ok=0; fi
+        if [[ "${ping_ok}" -eq 1 && "${select_ok}" -eq 1 ]]; then
+            consecutive=$((consecutive + 1))
+            if (( consecutive >= 3 )); then
+                log "   MySQL 就绪（双探针连续 ${consecutive} 次成功，耗时约 $((120 - (deadline - SECONDS)))s）"
+                return 0
+            fi
+        else
+            consecutive=0
+        fi
+        sleep 2
+    done
+    print_mysql_diagnostics "${cid}"
+    return 1
+}
+
+wait_for_mysql_ready || die "隔离 MySQL 启动超时/未就绪（双探针未连续通过；见上方容器日志；仅 drill 项目受影响）"
 
 # 启动后再次校验：容器名与挂载卷必须属于 drill 项目
-CONTAINER_ID="$(compose ps -q mysql)"
+CONTAINER_ID="$(mysql_container_id)"
 [[ -n "${CONTAINER_ID}" ]] || die "未找到 drill mysql 容器"
 CONTAINER_NAME="$(docker inspect --format '{{.Name}}' "${CONTAINER_ID}")"
 [[ "${CONTAINER_NAME}" == *"${PROJECT}"* ]] || die "异常：mysql 容器名 ${CONTAINER_NAME} 不属于 ${PROJECT}，立即中止"
@@ -412,13 +474,99 @@ mysql_query() {
         exec mysql -N -B -uroot -e "$1"
     ' sh "$1"
 }
+mysql_exec_sql() {
+    compose exec -T mysql sh -c '
+        set -eu
+        export MYSQL_PWD="${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 未设置}"
+        exec mysql -N -B -uroot -e "$1"
+    ' sh "$1"
+}
+db_base_table_count() {
+    local db="$1"
+    local value
+    value="$(mysql_query "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${db}' AND table_type='BASE TABLE'" 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ "${value}" =~ ^[0-9]+$ ]] && echo "${value}" || echo 0
+}
+dump_table_count() {
+    local file="$1"
+    local count
+    count="$(gzip -dc "${file}" | grep -c 'CREATE TABLE' || true)"
+    [[ "${count}" =~ ^[0-9]+$ ]] && echo "${count}" || echo 0
+}
+
+# 导入前校验：datadir 必须是本 drill 项目的临时卷；MySQL 可写；目标库为全新临时库。
+validate_drill_datadir() {
+    local datadir mount_name read_only probe
+    datadir="$(mysql_query 'SELECT @@datadir' | tr -d '[:space:]')"
+    [[ -n "${datadir}" ]] || die "无法读取 drill MySQL @@datadir"
+    case "${datadir}" in
+        /var/lib/mysql|/var/lib/mysql/) ;;
+        *) die "drill MySQL datadir 异常：${datadir}（预期 /var/lib/mysql，禁止导入）" ;;
+    esac
+    mount_name="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/mysql"}}{{.Name}}{{end}}{{end}}' "${CONTAINER_ID}")"
+    [[ -n "${mount_name}" ]] || die "drill MySQL 未把命名卷挂载到 /var/lib/mysql，禁止导入"
+    [[ "${mount_name}" == ${PROJECT}_* ]] || die "drill MySQL datadir 卷 ${mount_name} 不属于 ${PROJECT}，禁止导入"
+    [[ "${mount_name}" != ${MAIN_PROJECT}_* ]] || die "drill MySQL datadir 卷 ${mount_name} 属于主项目 ${MAIN_PROJECT}，禁止导入"
+    read_only="$(mysql_query 'SELECT @@read_only' | tr -d '[:space:]')"
+    [[ "${read_only}" == "0" ]] || die "drill MySQL read_only=${read_only}，禁止导入"
+    probe="$(mysql_exec_sql 'CREATE TEMPORARY TABLE __drill_probe (id INT); DROP TEMPORARY TABLE __drill_probe; SELECT "ok";' | tr -d '[:space:]')"
+    [[ "${probe}" == "ok" ]] || die "drill MySQL 写入探针失败（临时表创建/删除异常），禁止导入"
+    DRILL_DATADIR="${datadir}"
+    DRILL_DATA_VOLUME="${mount_name}"
+    export DRILL_DATADIR DRILL_DATA_VOLUME
+    log "   导入前校验通过：datadir=${datadir}，卷=${mount_name}（drill 项目），read_only=0，可写探针 OK"
+}
+
+# 目标库必须全新（drill 独立卷首次启动）：center 0 张表；租户库不存在或 0 张表。
+assert_target_databases_fresh() {
+    local existing
+    existing="$(db_base_table_count "${CENTER_DB_NAME}")"
+    [[ "${existing}" -eq 0 ]] || die "drill 中心库 ${CENTER_DB_NAME} 已有 ${existing} 张表，不是全新临时库，拒绝导入"
+    for sql in "${TENANT_SQLS[@]}"; do
+        db="$(basename "${sql}" .sql.gz)"
+        existing="$(db_base_table_count "${db}")"
+        [[ "${existing}" -eq 0 ]] || die "drill 租户库 ${db} 已有 ${existing} 张表，不是全新临时库，拒绝导入"
+    done
+    log "   目标库为全新临时库（center/tenant 表数均为 0）"
+}
+
+# 逐库导入并立即核对表数：dump 中 CREATE TABLE 数量 == information_schema BASE TABLE 数量。
+declare -A EXPECTED_TABLES=()
+declare -A IMPORTED_TABLES=()
+import_and_verify() {
+    local sql="$1" db expected actual
+    db="$(basename "${sql}" .sql.gz)"
+    expected="${EXPECTED_TABLES[${db}]:-0}"
+    log "   导入 ${db}（预期表数 ${expected}）"
+    if ! mysql_import "${sql}"; then
+        print_mysql_diagnostics "${CONTAINER_ID}"
+        die "导入 ${db} 失败（ERROR 2002/连接中断等；drill 项目隔离，主项目不受影响）"
+    fi
+    actual="$(db_base_table_count "${db}")"
+    IMPORTED_TABLES[${db}]="${actual}"
+    if [[ "${actual}" -ne "${expected}" ]]; then
+        print_mysql_diagnostics "${CONTAINER_ID}"
+        die "导入表数不一致：${db} 预期 ${expected}，实际 ${actual}（禁止继续；drill 项目隔离）"
+    fi
+    log "   ${db} 表数校验通过：${actual}"
+}
+
+validate_drill_datadir
+assert_target_databases_fresh
 
 log "5/7 恢复中心库与租户库到 drill 临时卷（${#TENANT_SQLS[@]} 个租户库）"
-mysql_import "${CENTER_SQL}"
+CENTER_EXPECTED="$(dump_table_count "${CENTER_SQL}")"
+EXPECTED_TABLES["${CENTER_DB_NAME}"]="${CENTER_EXPECTED}"
+[[ "${CENTER_EXPECTED}" -gt 0 ]] || die "中心库备份 ${CENTER_SQL} 未包含 CREATE TABLE，拒绝导入"
 for sql in "${TENANT_SQLS[@]}"; do
-    log "恢复 $(basename "${sql}")"
-    mysql_import "${sql}"
+    db="$(basename "${sql}" .sql.gz)"
+    EXPECTED_TABLES[${db}]="$(dump_table_count "${sql}")"
 done
+import_and_verify "${CENTER_SQL}"
+for sql in "${TENANT_SQLS[@]}"; do
+    import_and_verify "${sql}"
+done
+log "   导入完成，表数汇总：center=${IMPORTED_TABLES[${CENTER_DB_NAME}]}，租户库=${#TENANT_SQLS[@]} 个，全部与备份包 CREATE TABLE 数一致"
 
 # ---------------------------------------------------------------- 关键数据校验
 log "6/7 校验账号、权限、商品、配置"
@@ -466,6 +614,13 @@ if [[ -f "${CONFIG_ENV}" ]]; then
 fi
 add_check "config_usable" "${CONFIG_OK}" "config/.env 关键项"
 
+IMPORT_SUMMARY="center=${IMPORTED_TABLES[${CENTER_DB_NAME}]}"
+for sql in "${TENANT_SQLS[@]}"; do
+    db="$(basename "${sql}" .sql.gz)"
+    IMPORT_SUMMARY="${IMPORT_SUMMARY}, ${db}=${IMPORTED_TABLES[${db}]}"
+done
+add_check "import_table_counts" "true" "${IMPORT_SUMMARY}（与备份包 CREATE TABLE 数一致）"
+
 FAILED=0
 for i in "${!CHECK_NAMES[@]}"; do
     if [[ "${CHECK_RESULTS[$i]}" != "true" ]]; then
@@ -475,6 +630,7 @@ done
 
 python3 - "${REPORT}" "${WORK_DIR}/bundle/manifest.json" "${CHECK_NAMES[@]}" -- "${CHECK_RESULTS[@]}" -- "${CHECK_DETAILS[@]}" <<'PY'
 import json
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -500,8 +656,16 @@ payload = {
     "drill_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     "run_id": manifest.get("run_id", ""),
     "trigger": manifest.get("trigger", ""),
+    "target": {
+        "project": os.environ.get("DRILL_PROJECT", ""),
+        "datadir": os.environ.get("DRILL_DATADIR", ""),
+        "data_volume": os.environ.get("DRILL_DATA_VOLUME", ""),
+        "main_project": os.environ.get("MAIN_PROJECT", ""),
+        "readiness": "mysqladmin ping + SELECT 1 连续 3 次成功（<=120s）",
+    },
     "checks": checks,
     "failed": sum(1 for item in checks if not item["ok"]),
+    # 只有全部检查（含导入表数与备份包一致）通过，才允许 passed=true
     "passed": all(item["ok"] for item in checks),
 }
 open(report_path, "w", encoding="utf-8").write(json.dumps(payload, ensure_ascii=False, indent=2))

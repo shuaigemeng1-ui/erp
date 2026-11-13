@@ -104,6 +104,32 @@ python3 deploy/scripts/check_drill_isolation.py --project $PROJECT --main-projec
 6. 演练执行后必须保存：`--dry-run` 输出（卷名列表）、演练报告 `drill-report.json`、
    `docker inspect` 的容器/卷证据、中心库 `backup_records.restore_status`。
 
+## 5.1 二次重跑（2026-11-13 下午）与 ERROR 2002 修复
+
+Lead 在 8.163.80.17 用修复版脚本重跑（独立卷/安全断言已生效）：
+
+- 安全断言通过：drill 项目 `ventasync-drill-*`、卷名全部为 drill 专属、mysql 无端口发布；
+- 主卷 `ventasync_mysql_data` 与主 `ventasync_center`（30 表）**未受损**，主容器正常、租户 HTTP 200；
+- 但 step5 导入阶段报 `ERROR 2002 (HY000): Can't connect to local MySQL server through socket`，
+  `drill_exit=1`：MySQL 容器刚启动/初始化阶段，`mysqladmin ping` 已可成功，但 socket 尚不能稳定接受
+  真实连接，导入命令抢跑失败。
+
+修复（本脚本，commit 见仓库日志）：
+
+1. **双探针就绪等待**：`mysqladmin ping` + `mysql -N -B -e 'SELECT 1'` 同时成功、连续 3 次（间隔 2s）
+   才继续，最多 120s；超时打印 `docker inspect` 状态与 `docker logs --tail 200`，退出码 1。
+2. **导入前硬校验**：
+   - `SELECT @@datadir` 必须是 `/var/lib/mysql`；
+   - `/var/lib/mysql` 挂载的命名卷必须属于 `<drill 项目>_*`，且不得属于主项目；
+   - `SELECT @@read_only = 0`，并用临时表创建/删除做写入探针；
+   - 目标库必须全新：`ventasync_center` 与各租户库 BASE TABLE 数必须为 0（drill 独立卷首次启动）。
+3. **导入后表数核对**：逐库比较 `dump 中 CREATE TABLE 数` 与 `information_schema BASE TABLE 数`；
+   不一致立即打印容器日志并中止，不生成“通过”报告。
+4. **报告增强**：`drill-report.json` 增加 `target`（drill 项目、datadir、数据卷、主项目、就绪判据）
+   与 `import_table_counts` 检查项；只有全部检查（含表数一致）通过才会 `passed=true`。
+
+修复后验证（本机）：`bash -n`、`--self-test`、真实 compose `--dry-run` 均通过；服务器重跑待 Lead 执行。
+
 ## 6. 安全重跑步骤（8.163.80.17，必须先 dry-run）
 
 ```bash
@@ -129,6 +155,9 @@ docker ps -a | grep ventasync-drill          # 应为空
 - [x] 根因定位与修复代码
 - [x] 本地自测：`--self-test`（含“复用主卷配置必须被拒绝”）通过
 - [x] 本机 `--dry-run`（真实 deploy compose 文件）解析卷名全部为 drill 专属、`mysql ports: []`、退出码 0
-- [ ] 8.163.80.17 只读 `--dry-run` 通过（待服务器执行并留存输出）
-- [ ] 8.163.80.17 临时卷演练通过且主项目卷/容器无变化（待服务器执行并留存证据）
-- [ ] 中心库 `backup_records.restore_status=verified` 重新写入
+- [x] Lead 在 8.163.80.17 完成第一次修复后重跑：独立卷/安全断言通过、主卷与 center 30 表未受损
+- [x] 定位并修复第二轮失败（ERROR 2002：socket 未就绪）——双探针就绪等待 + 导入前后校验 + 报告 target
+- [ ] 8.163.80.17 再次 `--dry-run` 通过（只读，留存卷名输出）
+- [ ] 8.163.80.17 临时卷 actual 演练通过：`drill-report.json` passed=true、`import_table_counts` 一致，
+      主卷 CreatedAt/Mountpoint 不变、主容器/center 30 表不变、无 drill 残留
+- [ ] Lead 批准后中心库 `backup_records.restore_status=verified` 写入

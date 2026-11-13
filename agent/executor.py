@@ -128,35 +128,26 @@ def execute(job: dict[str, Any], config: dict[str, Any], report) -> dict[str, An
     try:
         lines = env_source.read_text(encoding="utf-8").splitlines()
         if target:
-            lines = [line for line in lines if not line.startswith("APP_IMAGE_TAG=")]
+            lines = [line for line in lines if not line.startswith(("APP_IMAGE_TAG=", "IMAGE_REGISTRY="))]
             lines.append(f"APP_IMAGE_TAG={target}")
+            lines.append("IMAGE_REGISTRY=")
         temp_env.write_text("\n".join(lines) + "\n", encoding="utf-8")
         compose = _compose(config, str(temp_env))
         if target:
-            bundle = Path(f"/tmp/erp-release-{target}.tar.gz")
-            report(2, f"下载镜像包 {target}", "running", "")
-            try:
-                base = str(config.get("center") or "").rstrip("/")
-                url = f"{base}/api/v1/agent/releases/{urllib.parse.quote(target)}/bundle"
-                request = urllib.request.Request(
-                    url, headers={"Authorization": f"Bearer {config.get('node_token', '')}"}
-                )
-                with urllib.request.urlopen(request, timeout=3600) as response, bundle.open("wb") as output:
-                    shutil.copyfileobj(response, output)
-                report(2, "下载镜像包", "succeeded", f"{bundle.stat().st_size} bytes")
-            except Exception as exc:  # noqa: BLE001
-                report(2, "下载镜像包", "failed", str(exc)[:500])
-                return {"ok": False, "error": "bundle_download_failed"}
-            report(2, "加载镜像", "running", "")
-            code, output = _run(["docker", "load", "-i", str(bundle)], deploy_dir, timeout=1800)
-            report(2, "加载镜像", "succeeded" if code == 0 else "failed", output)
-            try:
-                bundle.unlink()
-            except OSError:
-                pass
+            repo_dir = Path(str(config.get("repo_dir") or Path(deploy_dir).parent))
+            report(2, f"更新代码 {target}", "running", "")
+            code, output = _run(["git", "fetch", "--prune", "origin", "main"], str(repo_dir), timeout=600)
+            if code == 0:
+                code, output = _run(["git", "reset", "--hard", target], str(repo_dir), timeout=300)
+            report(2, "更新代码", "succeeded" if code == 0 else "failed", output)
             if code != 0:
                 return {"ok": False, "exit_code": code, "output": output}
-        report(3, f"更新服务 {target or '当前版本'}", "running", "")
+            report(3, f"构建镜像 {target}", "running", "")
+            code, output = _run([*compose, "build", "api", "nginx"], deploy_dir, timeout=3600)
+            report(3, "构建镜像", "succeeded" if code == 0 else "failed", output)
+            if code != 0:
+                return {"ok": False, "exit_code": code, "output": output}
+        report(4, f"更新服务 {target or '当前版本'}", "running", "")
         code2, output2 = _run([*compose, "up", "-d", "--remove-orphans"], deploy_dir, timeout=1800)
         report(3, "更新服务", "succeeded" if code2 == 0 else "failed", output2)
         if code2 == 0 and target:

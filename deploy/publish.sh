@@ -15,6 +15,9 @@ export APP_VERSION="$VERSION"
 
 echo "==> 发布版本 $VERSION"
 docker compose -f docker-compose.yml -f docker-compose.server.yml --env-file .env build api nginx
+# 兼容 compose 构建时未带前缀的镜像标签
+docker tag "ventasync-backend:${VERSION}" "${IMAGE_PREFIX}ventasync-backend:${VERSION}" 2>/dev/null || true
+docker tag "ventasync-frontend:${VERSION}" "${IMAGE_PREFIX}ventasync-frontend:${VERSION}" 2>/dev/null || true
 # 推送走本机 registry，避免大镜像绕公网 nginx 造成超时；仓库路径与公网拉取一致。
 LOCAL_REGISTRY="127.0.0.1:5000"
 docker tag "${IMAGE_PREFIX}ventasync-backend:${VERSION}" "${LOCAL_REGISTRY}/ventasync-backend:${VERSION}"

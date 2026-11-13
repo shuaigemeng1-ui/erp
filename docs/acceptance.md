@@ -1,4 +1,27 @@
-# 当前仓库契约与试点状态（批次 1，2026-11-13，离线 6828c2d / 试点 2e34e6b）
+# 当前仓库契约状态（批次 2，2026-11-13，HEAD 02846cf）
+
+> 本节为批次 2 离线验收结论；批次 1 试点记录保留在下节（历史）。批次 2 详细证据见 `docs/batch2-acceptance.md`。
+
+| 检查 | 当前结果 |
+| --- | --- |
+| 后端测试 | `cd backend; python -m pytest -q` → **531 passed**，exit 0（1 条上游 Starlette 弃用提示） |
+| Agent 测试 | `cd agent; python -m pytest -q` → **22 passed**，exit 0 |
+| 批次 2 特性测试 | tenant 模式边界/任务实例绑定/SSH 安全三文件 → **82 passed** |
+| 前端构建 | `npm run build` exit 0（验收用临时 `--outDir`，未修改受版本管理的 `frontend/dist`；是否更新 dist 由 Lead 决定） |
+| 迁移图 | 31 个迁移文件：中心库 `center_0017 (head)`（17 个）、租户库 `tenant_0014 (head)`（14 个）；离线 SQL 0 外键、中文注释完整 |
+| 业务表 | 中心库 **29** 张、租户库 **33** 张（均不计 `alembic_version`）；`tenant_instances` 部署/迁移状态与 `server_nodes` SSH 指纹列已写入 `docs/data-model.md` |
+| 完整契约检查 | **38/38 通过**，0 失败 0 警告：补齐 `center_0017` 迁移基线后恢复全绿；表清单/中文注释/权限码/94 条文档路由全部通过 |
+| 批次 2 交付 | 租户模式边界（center/tenant/gateway、固定 TENANT_ID/INSTANCE_ID）、任务固定实例/租户绑定、迁移租户调度隔离、升级前强制备份、SSH 主机指纹 TOFU/审计/会话复核、实例部署/迁移状态展示 |
+| 剩余风险 | tenant 模式需 TENANT_ID/INSTANCE_ID；SSH TOFU 首指纹需人工核对；审计标签/前端展示待核对；第二租户、监控、独立网关、备份恢复演练未完成（详见 `docs/batch2-acceptance.md` 第 4 节） |
+
+补充说明：
+
+- 批次 2 未做真实 tenant 实例/SSH 主机/备份恢复试点；上述离线与单测结论不替代真实环境验收。
+- 批次 1 试点（8.163.80.17，`2e34e6b`）记录见下节及 `docs/batch1-acceptance.md`。
+
+---
+
+# 批次 1 验收状态（历史，2026-11-13，离线 6828c2d / 试点 2e34e6b）
 
 > 本节对应当前仓库与第一台试点实测；下方历史章节保留各次发布时点的记录，其迁移数/表数/测试数**不代表当前仓库**。
 > 批次 1 详细证据见 `docs/batch1-acceptance.md`，基线对照见 `docs/batch1-baseline.md`。

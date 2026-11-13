@@ -43,8 +43,8 @@
 
 | 表 | 归属模块 | 关键字段 |
 | --- | --- | --- |
-| `tenant_instances` | ops | tenant_id(唯一), name, domain(唯一), environment, status(pending/active/suspended), app_version, actual_version, target_version, agent_version, executor_version, db_version, upgrade_status(pending/building/maintenance/migrating/verifying/succeeded/failed/unknown), notes |
-| `server_nodes` | ops | instance_id, tenant_id, node_uuid(唯一), hostname, os_name, arch, cpu_cores, memory_total_mb, disk_total_gb, internal_ips(JSON), configured_public_ip, observed_public_ip, agent_version, executor_version, protocol_version, capabilities_json(JSON), db_version, app_version, status(pending/online/offline/unknown), enrolled_at, last_seen_at, last_heartbeat_at, last_metrics_at, token_hash(唯一), token_version, enrollment_expires_at, ssh_host, ssh_port, ssh_username_cipher, ssh_password_cipher；索引(instance_id)、(last_seen_at,status) |
+| `tenant_instances` | ops | tenant_id(唯一), name, domain(唯一), environment, status(pending/active/suspended), deployment_mode(shared=中心共享/independent=独立部署), migration_status(registered=已登记/migrating=迁移中/migrated=已迁出/rollback=回滚), app_version, actual_version, target_version, agent_version, executor_version, db_version, upgrade_status(pending/building/maintenance/migrating/verifying/succeeded/failed/unknown), notes；索引(deployment_mode)、(migration_status) |
+| `server_nodes` | ops | instance_id, tenant_id, node_uuid(唯一), hostname, os_name, arch, cpu_cores, memory_total_mb, disk_total_gb, internal_ips(JSON), configured_public_ip, observed_public_ip, agent_version, executor_version, protocol_version, capabilities_json(JSON), db_version, app_version, status(pending/online/offline/unknown), enrolled_at, last_seen_at, last_heartbeat_at, last_metrics_at, token_hash(唯一), token_version, enrollment_expires_at, ssh_host, ssh_port, ssh_username_cipher, ssh_password_cipher, ssh_host_fingerprint(SHA256主机指纹), ssh_host_fingerprint_verified_at(首次确认UTC), ssh_fingerprint_algorithm(当前固定SHA256)；索引(instance_id)、(last_seen_at,status) |
 | `release_versions` | ops | version(唯一), image_tag, image_digest, status(draft/active/retired), commit_sha(完整40/64位hex，旧记录为空), build_config_summary, min_agent_protocol, center_db_version, tenant_db_version, rollback_compatible(旧应用兼容声明), build_status(built/verified/failed), notes, created_by；负责升级目标版本可信登记 |
 | `operation_jobs` | ops | instance_id, node_id(可空), job_type(deploy/upgrade/restart/backup/logs/config), status(pending/leased/running/succeeded/failed/unknown), idempotency_key(唯一), target_version, actual_version, agent_version, agent_protocol_version, db_version, upgrade_status, attempt_id, lease_token, last_heartbeat_at, event_seq, checks_json(数据库版本/服务readiness/业务只读校验结果), checks_status(passed/failed/partial/missing/空), payload_json, result_json, error, attempts, lease_expires_at, requested_by, started_at, finished_at；索引(instance_id,status)、(node_id,status) |
 | `operation_job_steps` | ops | job_id, step_no, name, status(pending/running/succeeded/failed/skipped), message, started_at, finished_at；唯一(job_id,step_no) |
@@ -137,6 +137,7 @@
 | 中心库 | `alembic/center/versions/0014_center_ops_metrics_agg.py` | center_0014 | 节点指标 5 分钟/小时聚合表（bucket_start、样本数与 CPU/内存/负载/磁盘统计）；无外键。 |
 | 中心库 | `alembic/center/versions/0015_center_server_ssh.py` | center_0015 | 服务器节点 SSH 主机/端口及用户名、密码密文字段；无外键。 |
 | 中心库 | `alembic/center/versions/0016_center_release_upgrade.py` | center_0016 | 批次 1：发布版本清单与升级校验字段（完整 commit、构建配置摘要、最低 Agent 协议、center/tenant DB 目标版本、回退兼容、构建状态），实例/节点实际版本与升级状态，任务执行批次/租约/心跳/事件水位/升级检查结果；全部新增列可空或带默认值，无外键。 |
+| 中心库 | `alembic/center/versions/0017_center_tenant_mode.py` | center_0017 | 批次 2：实例隔离与租户模式边界——`tenant_instances` 增加 `deployment_mode`（shared/independent）与 `migration_status`（registered/migrating/migrated/rollback）及索引；`server_nodes` 增加 SSH 主机指纹 `ssh_host_fingerprint`、首次确认时间 `ssh_host_fingerprint_verified_at`、算法 `ssh_fingerprint_algorithm`（当前固定 SHA256）；新增列可空或带默认值，无外键。 |
 | 租户库 | `alembic/tenant/versions/0001_tenant_identity.py` | tenant_0001 | 租户库基线：角色、权限、绑定范围、租户设置、功能开关、审计与支撑表（tenant_0001）。 |
 | 租户库 | `alembic/tenant/versions/0002_tenant_catalog.py` | tenant_0002 | 租户库：商品、SKU、图片、库存地点、库存余额、库存流水。 |
 | 租户库 | `alembic/tenant/versions/0003_tenant_channels.py` | tenant_0003 | 租户库迁移：店铺、店铺凭据、平台商品与 SKU 映射。 |
@@ -152,7 +153,9 @@
 | 租户库 | `alembic/tenant/versions/0013_tenant_supplier_contacts.py` | tenant_0013 | 供应商增加选填联系人、联系方式和备注，保留原供应商及商品关联，无外键。 |
 | 租户库 | `alembic/tenant/versions/0014_tenant_local_users.py` | tenant_0014 | 租户本机账号表（独立实例模式本地登录）：来源中心用户ID、邮箱、密码哈希、成员编号、负责人标记与同步时间；唯一(tenant_id,email)、(tenant_id,source_user_id)，无外键。 |
 
-模型业务表：中心库 29 张、租户库 33 张（均不计 Alembic 版本表），完整版本图共 30 个迁移文件（center 16 + tenant 14）。当前末端为中心库 `center_0016`、租户库 `tenant_0014`。
+模型业务表：中心库 29 张、租户库 33 张（均不计 Alembic 版本表），完整版本图共 31 个迁移文件（center 17 + tenant 14）。当前末端为中心库 `center_0017`、租户库 `tenant_0014`。
+
+批次 2 部署形态说明：运行模式 `deployment_mode` 取 `center`（统一管理中心）/`tenant`（租户独立实例，固定绑定 `TENANT_ID`/`INSTANCE_ID`，拒绝 `/platform`、`/agent` 接口并返回统一 404）/`gateway`（独立集成网关，仅网关接口与健康检查）。实例迁移状态为 `migrating`/`migrated` 的租户不参与旧中心业务调度，也不能用普通“启用租户”恢复写入。详见 `docs/batch2-acceptance.md`。
 
 追加型表例外：`node_metric_samples`、`node_checks`、`operation_job_steps`、`backup_records`、`node_metric_aggregates` 按文首“约定”不要求完整三时间列，以 `sampled_at`/`checked_at`/`started_at`/`bucket_start` 等业务时间字段作为追加时间；其余业务表仍必须包含 `id`、`created_at`、`updated_at`。
 

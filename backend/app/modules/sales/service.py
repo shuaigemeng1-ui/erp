@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import bindparam, func, select, text
+from sqlalchemy import bindparam, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -59,7 +59,7 @@ from app.modules.sales.order_mapping import (
     parse_epoch,
 )
 from app.modules.tasks import service as tasks_service
-from app.modules.tasks.models_tenant import OutboxEvent, SyncRun
+from app.modules.tasks.models_tenant import OutboxEvent
 
 logger = logging.getLogger("ventasync.sales.service")
 

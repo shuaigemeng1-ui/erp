@@ -96,29 +96,42 @@ def load_optional_route_providers() -> None:
 
 
 def resolve_target(
-    event_type: str, payload: dict[str, Any] | None
+    event_type: str,
+    payload: dict[str, Any] | None,
+    *,
+    tenant_id: int | None = None,
+    binding: Any | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
     """把事件解析为 ``(任务名, 队列, 关键字参数)``。
 
-    库存推送按 payload 选择粒度：只有一个 SKU 时投递 ``push_stock_for_sku``，
-    否则投递整店推送 ``push_stock``（渠道任务内部按店铺 + SKU 串行并读取最新库存）。
+    * ``tenant_id`` 由调用方传入**数据库行**的租户（权威值），payload 只做一致性校验；
+    * 库存推送按 payload 选择粒度：只有一个 SKU 时投递 ``push_stock_for_sku``，
+      否则投递整店推送 ``push_stock``（渠道任务内部按店铺 + SKU 串行并读取最新库存）。
     """
+    from app.modules.tasks import instance
+
     payload = payload or {}
+    binding = binding if binding is not None else instance.current_binding()
+    # 权威租户：数据库行优先；未提供时（纯函数单测 / 旧调用）才回落到 payload
+    authoritative = (
+        instance.authoritative_tenant(payload, int(tenant_id))
+        if tenant_id is not None
+        else int(payload.get("tenant_id") or 0)
+    )
     if event_type == "stock.push.requested":
-        tenant_id = int(payload.get("tenant_id") or 0)
         store_id = int(payload.get("store_id") or 0)
         sku_ids = payload.get("sku_ids")
         if isinstance(sku_ids, list) and len(sku_ids) == 1:
             return (
                 "app.modules.channels.tasks.push_stock_for_sku",
                 "channel",
-                {"tenant_id": tenant_id, "store_id": store_id, "sku_id": int(sku_ids[0])},
+                {"tenant_id": authoritative, "store_id": store_id, "sku_id": int(sku_ids[0])},
             )
         return (
             "app.modules.channels.tasks.push_stock",
             "channel",
             {
-                "tenant_id": tenant_id,
+                "tenant_id": authoritative,
                 "store_id": store_id,
                 "sku_ids": [int(item) for item in sku_ids] if isinstance(sku_ids, list) else None,
             },
@@ -133,13 +146,16 @@ def resolve_target(
         job_type = str(payload.get("job_type") or "")
         kwargs = {
             "sync_run_id": int(payload.get("sync_run_id") or 0),
-            "tenant_id": int(payload.get("tenant_id") or 0),
+            "tenant_id": authoritative,
             "job_type": job_type,
             "store_id": payload.get("store_id"),
             "triggered_by": str(payload.get("triggered_by") or "manual"),
         }
         return route.task_name, JOB_QUEUES.get(job_type, route.queue), kwargs
-    return route.task_name, route.queue, dict(payload)
+    kwargs = dict(payload)
+    # 任何事件都不允许用 payload 覆盖权威租户
+    kwargs["tenant_id"] = authoritative
+    return route.task_name, route.queue, kwargs
 
 
 def _celery_send(task_name: str, queue: str, kwargs: dict[str, Any]) -> None:
@@ -149,10 +165,26 @@ def _celery_send(task_name: str, queue: str, kwargs: dict[str, Any]) -> None:
     celery_app.send_task(task_name, kwargs=kwargs, queue=queue)
 
 
-def _dispatch_one(event: OutboxEvent) -> tuple[bool, str, BaseException | None]:
+def _dispatch_one(
+    event: OutboxEvent, *, binding: Any | None = None
+) -> tuple[bool, str, BaseException | None]:
     """投递单条事件，返回 ``(是否成功, 错误信息, 异常对象)``；不改事件状态。"""
+    from app.modules.tasks import instance
+
+    binding = binding if binding is not None else instance.current_binding()
     try:
-        task_name, queue, kwargs = resolve_target(event.event_type, event.payload)
+        # payload 只能与权威租户一致，禁止覆盖；否则视为伪造消息拒绝投递
+        conflict = instance.payload_binding_conflict(
+            event.payload, tenant_id=int(event.tenant_id), binding=binding
+        )
+        if conflict:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                f"Outbox 事件负载与实例/租户绑定冲突：{conflict}",
+            )
+        task_name, queue, kwargs = resolve_target(
+            event.event_type, event.payload, tenant_id=int(event.tenant_id), binding=binding
+        )
         if not app_task_name_valid(task_name):
             return False, f"非法任务名: {task_name}", None
         _celery_send(task_name, queue, kwargs)
@@ -162,11 +194,20 @@ def _dispatch_one(event: OutboxEvent) -> tuple[bool, str, BaseException | None]:
         return False, f"{type(exc).__name__}: {exc}"[:1000], exc
 
 
-def dispatch_tenant_batch(db: Any, tenant_id: int, *, limit: int) -> dict[str, int]:
-    """处理单个租户的一批待投递事件（调用方负责提交事务）。"""
+def dispatch_tenant_batch(
+    db: Any, tenant_id: int, *, limit: int, binding: Any | None = None
+) -> dict[str, int]:
+    """处理单个租户的一批待投递事件（调用方负责提交事务）。
+
+    权威租户来自 ``outbox_events.tenant_id`` 列；payload 中的 tenant_id / instance_id
+    只允许与权威值一致，否则视为伪造消息：事件置 failed、写审计、不投递。
+    """
+    from app.modules.tasks import instance
+
+    binding = binding if binding is not None else instance.current_binding()
     now = utcnow()
     events = repository.pending_outbox_events(db, now=now, limit=limit, tenant_id=tenant_id)
-    summary = {"scanned": len(events), "dispatched": 0, "failed": 0}
+    summary = {"scanned": len(events), "dispatched": 0, "failed": 0, "rejected": 0}
     for event in events:
         from app.modules.tasks import service as task_service
         payload = event.payload or {}
@@ -176,7 +217,7 @@ def dispatch_tenant_batch(db: Any, tenant_id: int, *, limit: int) -> dict[str, i
         if not task_service.job_enabled(db, tenant_id, job_type):
             event.available_at = now + timedelta(seconds=60)
             continue
-        ok, error, exc = _dispatch_one(event)
+        ok, error, exc = _dispatch_one(event, binding=binding)
         if ok:
             event.status = "dispatched"
             event.dispatched_at = utcnow()
@@ -185,6 +226,24 @@ def dispatch_tenant_batch(db: Any, tenant_id: int, *, limit: int) -> dict[str, i
             continue
         event.attempts = int(event.attempts or 0) + 1
         event.last_error = error
+        # 负载与绑定冲突属于永久错误：直接置 failed，写审计，不再重试
+        conflict = instance.payload_binding_conflict(
+            payload, tenant_id=int(tenant_id), binding=binding
+        )
+        if conflict:
+            event.status = "failed"
+            summary["rejected"] += 1
+            instance.audit_rejection(
+                int(tenant_id),
+                reason=conflict,
+                action="task.outbox_rejected",
+                summary=f"Outbox 事件被拒绝投递：{conflict}",
+                extra={"event_id": int(event.id) if event.id else None, "event_type": event.event_type},
+            )
+            logger.error(
+                "Outbox 事件 %s 负载与绑定冲突（%s），已置 failed 并写审计", event.id, conflict
+            )
+            continue
         retryable = exc is None or is_retryable_error(exc)
         if should_retry(event.attempts, MAX_OUTBOX_ATTEMPTS) and retryable:
             event.status = "pending"
@@ -198,31 +257,64 @@ def dispatch_tenant_batch(db: Any, tenant_id: int, *, limit: int) -> dict[str, i
     return summary
 
 
-def dispatch_pending(*, limit: int | None = None) -> dict[str, int]:
-    """扫描所有 active 租户的待投递事件并投递，返回汇总计数。"""
+def dispatch_pending(
+    *,
+    limit: int | None = None,
+    tenant_ids: list[int] | None = None,
+    binding: Any | None = None,
+) -> dict[str, int]:
+    """扫描本实例可调度的租户，投递待发送事件，返回汇总计数。
+
+    已独立部署 / 迁移中的租户会被跳过（不再由旧中心 Worker 处理），计数写入
+    ``skipped_tenants``，便于部署日志对账。
+    """
+    from app.modules.tasks import instance
+
     load_optional_route_providers()
+    binding = binding if binding is not None else instance.current_binding()
     batch_limit = max(1, int(limit or settings.outbox_batch_size))
-    total = {"scanned": 0, "dispatched": 0, "failed": 0, "tenants": 0}
-    for tenant_id in active_tenant_ids():
+    candidates = tenant_ids if tenant_ids is not None else active_tenant_ids()
+    allowed, skipped = instance.filter_dispatchable_tenants(
+        [int(item) for item in candidates], binding=binding
+    )
+    total = {
+        "scanned": 0,
+        "dispatched": 0,
+        "failed": 0,
+        "rejected": 0,
+        "tenants": 0,
+        "skipped_tenants": len(skipped),
+    }
+    if skipped:
+        logger.info(
+            "Outbox 跳过 %s 个不可调度租户：%s",
+            len(skipped),
+            ", ".join(f"{item['tenant_id']}:{item.get('reason')}" for item in skipped[:10]),
+        )
+    for tenant_id in allowed:
         try:
             with center_session() as center:
                 route = load_tenant_route(center, tenant_id)
             with tenant_session(route) as db:
-                summary = dispatch_tenant_batch(db, tenant_id, limit=batch_limit)
+                summary = dispatch_tenant_batch(
+                    db, tenant_id, limit=batch_limit, binding=binding
+                )
                 db.commit()
         except Exception:  # noqa: BLE001 - 单租户失败不影响其它租户
             logger.exception("Outbox 扫描租户 %s 失败", tenant_id)
             continue
         total["tenants"] += 1
-        for key in ("scanned", "dispatched", "failed"):
+        for key in ("scanned", "dispatched", "failed", "rejected"):
             total[key] += summary[key]
-    if total["scanned"]:
+    if total["scanned"] or total["skipped_tenants"]:
         logger.info(
-            "Outbox 本轮: 租户=%s 扫描=%s 投递=%s 失败=%s",
+            "Outbox 本轮: 租户=%s 跳过=%s 扫描=%s 投递=%s 失败=%s 拒绝=%s",
             total["tenants"],
+            total["skipped_tenants"],
             total["scanned"],
             total["dispatched"],
             total["failed"],
+            total["rejected"],
         )
     return total
 

@@ -101,10 +101,38 @@ def resolve_job_identity(
     user_id: int | None,
     automation: bool,
 ) -> JobIdentity:
-    """确定任务执行身份：手动任务用发起人，自动化任务用租户负责人但限定能力。"""
+    """确定任务执行身份：手动任务用发起人，自动化任务用租户负责人但限定能力。
+
+    统一在此执行「实例 / 租户绑定 + 租户 active + 部署模式」校验：任一不满足即拒绝并
+    写审计（永久错误，不重试）。所有 Worker 处理器都经过本函数，因此不会绕过绑定。
+    """
     from app.modules.identity.service import load_tenant_access
+    from app.modules.tasks import instance
 
     with center_session() as center:
+        decision = instance.evaluate_dispatch(
+            instance.current_binding(), instance.load_tenant_deployment(center, int(tenant_id))
+        )
+        if not decision.allowed:
+            logger.warning(
+                "拒绝后台任务 tenant=%s reason=%s binding=%s decision=%s",
+                tenant_id,
+                decision.reason,
+                instance.current_binding().describe(),
+                decision.describe(),
+            )
+            if decision.audit_required:
+                instance.audit_rejection(
+                    int(tenant_id),
+                    reason=decision.reason,
+                    summary=f"后台任务实例绑定校验拒绝：{decision.reason}",
+                    extra=decision.describe(),
+                )
+            raise AppError(
+                ErrorCode.TENANT_FORBIDDEN,
+                f"租户不满足本实例调度条件：{decision.reason}",
+                details={"reason": decision.reason},
+            )
         # 校验租户库路由存在（凭据只从中心库映射读取）
         load_tenant_route(center, tenant_id)
         actor_user_id = user_id

@@ -26,11 +26,13 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.base import utcnow
 from app.db.session import center_session, tenant_session
-from app.modules.tasks import repository
+from app.modules.tasks import instance, repository
 from app.modules.tasks import service as tasks_service
 from app.modules.tasks.tenancy import active_tenant_ids, load_tenant_route
 
-logger = logging.getLogger("ventasync.tasks.scheduler")# 调度进程轮询间隔（秒）。最小 5 秒，避免空转。
+logger = logging.getLogger("ventasync.tasks.scheduler")
+
+# 调度进程轮询间隔（秒）。最小 5 秒，避免空转。
 DEFAULT_TICK_SECONDS = 30
 # 单租户一次最多生成的任务数
 DEFAULT_BATCH_SIZE = 100
@@ -111,9 +113,15 @@ def run_once(
     tenant_ids: list[int] | None = None,
     recover_stale: bool = True,
     compensate_webhooks: bool = True,
+    binding: instance.WorkerBinding | None = None,
 ) -> dict[str, int]:
-    """执行一轮调度扫描，返回汇总计数（异常只记录，不抛出）。"""
+    """执行一轮调度扫描，返回汇总计数（异常只记录，不抛出）。
+
+    只调度「本实例绑定 + 租户 active + 未独立部署 / 未迁移」的租户；其余跳过并计数，
+    避免旧中心 Scheduler 继续为已迁出租户生成任务。
+    """
     timestamp = now or utcnow()
+    binding = binding if binding is not None else instance.current_binding()
     summary = {
         "tenants": 0,
         "scanned": 0,
@@ -122,10 +130,21 @@ def run_once(
         "recovered": 0,
         "webhook_compensated": 0,
         "webhook_failed": 0,
+        "skipped_tenants": 0,
         "failed": 0,
     }
     candidates = tenant_ids if tenant_ids is not None else active_tenant_ids()
-    for tenant_id in candidates:
+    allowed, skipped = instance.filter_dispatchable_tenants(
+        [int(item) for item in candidates], binding=binding
+    )
+    summary["skipped_tenants"] = len(skipped)
+    if skipped:
+        logger.info(
+            "调度跳过 %s 个不可调度租户：%s",
+            len(skipped),
+            ", ".join(f"{item['tenant_id']}:{item.get('reason')}" for item in skipped[:10]),
+        )
+    for tenant_id in allowed:
         try:
             with center_session() as center:
                 route = load_tenant_route(center, int(tenant_id))
@@ -155,11 +174,15 @@ def run_once(
         or summary["recovered"]
         or summary["webhook_compensated"]
         or summary["webhook_failed"]
+        or summary["skipped_tenants"]
         or summary["failed"]
     ):
         logger.info(
-            "调度轮次: 租户=%s 扫描=%s 新建任务=%s 复用=%s 回收中断=%s 回调补偿=%s 回调补偿失败=%s 失败租户=%s",
+            "调度轮次: 绑定=%s 租户=%s 跳过=%s 扫描=%s 新建任务=%s 复用=%s 回收中断=%s "
+            "回调补偿=%s 回调补偿失败=%s 失败租户=%s",
+            binding.describe(),
             summary["tenants"],
+            summary["skipped_tenants"],
             summary["scanned"],
             summary["created"],
             summary["reused"],
@@ -189,7 +212,10 @@ def main(dispatch_outbox: bool = True) -> int:
 
     configure_logging()
     logger.info(
-        "调度进程启动，轮询间隔 %s 秒，内置 Outbox 投递=%s", tick_seconds(), dispatch_outbox
+        "调度进程启动，绑定=%s，轮询间隔 %s 秒，内置 Outbox 投递=%s",
+        instance.current_binding().describe(),
+        tick_seconds(),
+        dispatch_outbox,
     )
     try:
         while True:

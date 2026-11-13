@@ -19,7 +19,8 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
-from app.modules.tasks import repository
+from app.db.session import center_session, tenant_session
+from app.modules.tasks import instance, repository
 from app.modules.tasks import service as tasks_service
 from app.modules.tasks.models_tenant import SyncRun
 from app.modules.tasks.retry import MAX_TASK_ATTEMPTS, is_retryable_error, retry_delay_seconds
@@ -146,6 +147,62 @@ def interpret_result(result: Any) -> tuple[str, int, str]:
     return status, processed, message[:1000]
 
 
+def _mark_run_rejected(tenant_id: int, sync_run_id: int, reason: str) -> None:
+    """绑定校验拒绝时把任务置 failed（绕过租户上下文校验，直接按中心库路由打开租户库）。"""
+    try:
+        from app.modules.identity.service import load_tenant_db_route
+
+        with center_session() as center:
+            route = load_tenant_db_route(center, int(tenant_id))
+        if route is None:
+            return
+        with tenant_session(route) as db:
+            run = repository.get_sync_run(db, int(tenant_id), int(sync_run_id))
+            if run is None or run.status in FINISHED_STATUSES:
+                return
+            tasks_service.mark_run_finished(
+                db,
+                run,
+                status=tasks_service.RUN_FAILED,
+                total_processed=int(run.total_processed or 0),
+                error_message=f"任务被拒绝执行：{reason}"[:1000],
+            )
+            db.commit()
+    except Exception:  # noqa: BLE001 - 标记失败只记录日志，不掩盖拒绝原因
+        logger.warning("标记被拒绝任务为失败时出错 tenant=%s run=%s", tenant_id, sync_run_id)
+
+
+def guard_task_execution(tenant_id: int, sync_run_id: int) -> dict[str, Any] | None:
+    """任务执行前的实例/租户绑定校验；拒绝时返回结果并落审计与任务状态。
+
+    * 绑定来自进程环境（``ERP_WORKER_INSTANCE_ID`` / ``ERP_WORKER_TENANT_ID``），
+      **不接受任务消息里的 instance_id/tenant_id 覆盖**；
+    * 租户必须 active 且实例一致、未独立部署 / 迁移中；
+    * 拒绝属于永久错误：不重试，任务置 failed，写租户审计。
+    """
+    try:
+        instance.ensure_dispatch_allowed(int(tenant_id), purpose="execute_sync_run")
+        return None
+    except AppError as exc:
+        reason = str((exc.details or {}).get("reason") or exc.message)
+        logger.warning(
+            "拒绝执行任务 tenant=%s run=%s reason=%s binding=%s",
+            tenant_id,
+            sync_run_id,
+            reason,
+            instance.current_binding().describe(),
+        )
+        _mark_run_rejected(int(tenant_id), int(sync_run_id), reason)
+        instance.audit_rejection(
+            int(tenant_id),
+            reason=reason,
+            action="task.execution_rejected",
+            summary=f"后台任务执行被拒绝：{reason}",
+            extra={"sync_run_id": int(sync_run_id), **instance.current_binding().describe()},
+        )
+        return {"status": "rejected", "reason": reason, "tenant_id": int(tenant_id)}
+
+
 def _begin_run(tenant_id: int, sync_run_id: int) -> SyncRun | None:
     """把任务标记为 running 并返回最新记录（独立短事务，避免与业务事务互相影响）。"""
     with job_tenant_session(tenant_id, automation=True) as (_context, db):
@@ -261,12 +318,57 @@ def execute_sync_run(
     triggered_by: str = "manual",
 ) -> dict[str, Any]:
     """统一任务入口：维护任务状态，调用具体处理器，按错误类型决定是否重试。"""
+    # 1) 实例 / 租户绑定校验（固定绑定来自进程环境，任务消息不能覆盖）
+    rejected = guard_task_execution(int(tenant_id), int(sync_run_id))
+    if rejected is not None:
+        return rejected
+    # 2) 进入已校验的任务上下文，处理器内部可据此快速复核
+    with instance.task_tenant_scope(int(tenant_id)):
+        return _execute_sync_run_impl(
+            self,
+            sync_run_id=int(sync_run_id),
+            tenant_id=int(tenant_id),
+            job_type=job_type,
+            store_id=store_id,
+            triggered_by=triggered_by,
+        )
+
+
+def _execute_sync_run_impl(
+    self: Any,
+    *,
+    sync_run_id: int,
+    tenant_id: int,
+    job_type: str,
+    store_id: int | None = None,
+    triggered_by: str = "manual",
+) -> dict[str, Any]:
+    """执行主体（已完成绑定校验）：读取任务事实、校验租户一致、调用处理器。"""
     run = _begin_run(int(tenant_id), int(sync_run_id))
     if run is None:
         logger.warning("任务不存在：tenant=%s run=%s", tenant_id, sync_run_id)
         return {"status": "ignored", "reason": "任务记录不存在"}
     if run.status in FINISHED_STATUSES:
         return {"status": run.status, "skipped": True}
+    # 权威租户来自任务记录本身；消息参数只允许一致，不允许覆盖
+    authoritative_tenant = int(run.tenant_id)
+    if authoritative_tenant != int(tenant_id):
+        reason = "task_tenant_mismatch"
+        logger.error(
+            "任务租户与消息不一致：run.tenant_id=%s message_tenant=%s run=%s",
+            authoritative_tenant,
+            tenant_id,
+            sync_run_id,
+        )
+        _mark_run_rejected(authoritative_tenant, int(sync_run_id), reason)
+        instance.audit_rejection(
+            authoritative_tenant,
+            reason=reason,
+            action="task.execution_rejected",
+            summary="后台任务租户与消息不一致，拒绝执行",
+            extra={"sync_run_id": int(sync_run_id), "message_tenant": int(tenant_id)},
+        )
+        return {"status": "rejected", "reason": reason}
     actual_job_type = str(run.job_type)
     requested_by = int(run.requested_by) if run.requested_by else None
     actual_store_id = int(run.store_id) if run.store_id else None
@@ -275,10 +377,10 @@ def execute_sync_run(
     permission = JOB_PERMISSIONS.get(actual_job_type)
     try:
         with job_tenant_session(
-            tenant_id, user_id=requested_by,
+            authoritative_tenant, user_id=requested_by,
             automation=actual_triggered_by != "manual",
         ) as (context, db):
-            tasks_service.ensure_job_enabled(db, tenant_id, actual_job_type)
+            tasks_service.ensure_job_enabled(db, authoritative_tenant, actual_job_type)
             if actual_triggered_by == "manual" and permission:
                 guard_manual_permission(context, permission)
                 from app.core.access import effective_from_context
@@ -288,7 +390,7 @@ def execute_sync_run(
         handler = load_handler(actual_job_type)
         kwargs = handler_kwargs(
             actual_job_type,
-            tenant_id=int(tenant_id),
+            tenant_id=authoritative_tenant,
             sync_run_id=int(sync_run_id),
             store_id=actual_store_id,
             requested_by=requested_by,
@@ -300,7 +402,7 @@ def execute_sync_run(
         retries_left = int(getattr(self.request, "retries", 0)) < int(self.max_retries or 0)
         logger.warning(
             "任务执行失败 tenant=%s run=%s job_type=%s retryable=%s retries_left=%s: %s",
-            tenant_id,
+            authoritative_tenant,
             sync_run_id,
             actual_job_type,
             retryable,
@@ -312,7 +414,7 @@ def execute_sync_run(
                 exc=exc, countdown=retry_delay_seconds(int(self.request.retries) + 1)
             ) from exc
         _finish_run(
-            int(tenant_id),
+            authoritative_tenant,
             int(sync_run_id),
             status=tasks_service.RUN_FAILED,
             total_processed=0,
@@ -322,7 +424,7 @@ def execute_sync_run(
 
     status, processed, message = interpret_result(result)
     _finish_run(
-        int(tenant_id),
+        authoritative_tenant,
         int(sync_run_id),
         status=status,
         total_processed=processed,
@@ -337,6 +439,7 @@ __all__ = [
     "JOB_PERMISSIONS",
     "JOB_QUEUES",
     "execute_sync_run",
+    "guard_task_execution",
     "handler_kwargs",
     "interpret_result",
     "load_handler",

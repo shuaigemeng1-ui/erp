@@ -343,7 +343,7 @@ def poll_and_execute(config_path: str, base: str, token: str) -> None:
                 "step_no": step_no,
                 "step_name": step_name,
                 "step_status": status,
-                "message": message,
+                "message": (message or "")[:950],
             },
             token=token,
         )

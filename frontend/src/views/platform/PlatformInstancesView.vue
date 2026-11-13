@@ -1285,8 +1285,8 @@ const monitoringOverall = computed(() =>
 )
 const businessPerformance = computed<OpsPerformanceSummary | null>(
   () =>
-    httpMetrics.value ??
     monitoringOverview.value?.business_requests ??
+    httpMetrics.value ??
     monitoringOverview.value?.performance ??
     currentInstance.value?.performance ??
     null,

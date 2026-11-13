@@ -23,6 +23,7 @@ from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 
 DB_PATH = os.environ.get("GATEWAY_DB_PATH", "/data/gateway.db")
@@ -108,6 +109,18 @@ def _row_payload(row: sqlite3.Row, *, include_secret: bool = False) -> dict[str,
         except (InvalidToken, ValueError):
             payload["app_secret"] = ""
     return payload
+
+
+@app.get("/api/v1/gateway/oauth/{channel}/callback")
+def oauth_callback(channel: str, request: Request) -> RedirectResponse:
+    """渠道 OAuth 统一入口：校验渠道后转发到当前租户实例回调地址。"""
+    _validate(channel, "production")
+    target = os.environ.get("GATEWAY_DEFAULT_TENANT_CALLBACK", "").strip()
+    if not target:
+        raise HTTPException(status_code=503, detail="租户回调地址未配置")
+    query = request.url.query
+    location = f"{target}?{query}" if query else target
+    return RedirectResponse(url=location, status_code=307)
 
 
 @app.get("/healthz")

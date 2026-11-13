@@ -1,6 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
+import { Terminal } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
+import '@xterm/xterm/css/xterm.css'
 import { CopyDocument, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import { opsApi } from '@/api/ops'
 import { useTableQuery } from '@/composables/useTableQuery'
@@ -446,6 +449,70 @@ async function runSsh(): Promise<void> {
   } finally {
     sshRunning.value = false
   }
+}
+
+/* ------------------------------ 交互式终端 ------------------------------ */
+const terminalVisible = ref(false)
+const terminalHost = ref<HTMLDivElement>()
+let term: Terminal | null = null
+let fitAddon: FitAddon | null = null
+let sshSocket: WebSocket | null = null
+
+function sendTerminalSize(): void {
+  if (!term || !sshSocket || sshSocket.readyState !== WebSocket.OPEN) return
+  sshSocket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
+}
+
+function closeTerminal(): void {
+  if (sshSocket) {
+    sshSocket.onmessage = null
+    sshSocket.close()
+    sshSocket = null
+  }
+  if (term) {
+    term.dispose()
+    term = null
+  }
+  fitAddon = null
+}
+
+async function openTerminal(): Promise<void> {
+  if (!sshNode.value) return
+  terminalVisible.value = true
+  await nextTick()
+  if (!terminalHost.value) return
+  closeTerminal()
+  term = new Terminal({
+    cursorBlink: true,
+    fontSize: 13,
+    fontFamily: "Consolas, 'SFMono-Regular', Menlo, monospace",
+    scrollback: 5000,
+    theme: { background: '#1f2430', foreground: '#d8dee9', cursor: '#d8dee9' },
+  })
+  fitAddon = new FitAddon()
+  term.loadAddon(fitAddon)
+  term.open(terminalHost.value)
+  fitAddon.fit()
+  term.writeln('正在连接 SSH ...')
+  const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  const socket = new WebSocket(
+    `${scheme}://${window.location.host}/api/v1/platform/nodes/${sshNode.value.id}/ssh/ws`,
+  )
+  sshSocket = socket
+  socket.onopen = () => {
+    term?.clear()
+    sendTerminalSize()
+    term?.focus()
+  }
+  socket.onmessage = (event) => term?.write(String(event.data))
+  socket.onerror = () => term?.writeln('\r\n[连接错误]')
+  socket.onclose = (event) => {
+    if (event.code !== 1000) term?.writeln(`\r\n[连接已关闭 ${event.code}]`)
+  }
+  term.onData((data) => {
+    if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'input', data }))
+  })
+  term.onResize(sendTerminalSize)
 }
 const upgradingId = ref('')
 
@@ -1587,6 +1654,7 @@ async function copyText(value: string | null | undefined, label: string): Promis
         </el-form-item>
         <el-form-item>
           <el-button type="primary" :loading="sshSaving" @click="saveSsh">保存 SSH 配置</el-button>
+          <el-button :disabled="!sshNode" @click="openTerminal">打开交互终端</el-button>
         </el-form-item>
       </el-form>
       <el-divider content-position="left">执行命令</el-divider>
@@ -1596,6 +1664,17 @@ async function copyText(value: string | null | undefined, label: string): Promis
       </div>
       <pre class="ssh-output">{{ sshOutput || '命令输出会显示在这里' }}</pre>
     </div>
+  </el-dialog>
+
+  <el-dialog
+    v-model="terminalVisible"
+    :title="`SSH 终端 · ${sshNode?.hostname || sshNode?.node_uuid || ''}`"
+    width="92vw"
+    top="3vh"
+    destroy-on-close
+    @closed="closeTerminal"
+  >
+    <div ref="terminalHost" class="ssh-terminal" />
   </el-dialog>
 </template>
 
@@ -1878,6 +1957,18 @@ async function copyText(value: string | null | undefined, label: string): Promis
 
 .enrollment-detail {
   margin-top: 12px;
+}
+
+.ssh-terminal {
+  width: 100%;
+  height: 72vh;
+  padding: 8px;
+  background: #1f2430;
+  border-radius: 4px;
+}
+
+.ssh-terminal :deep(.xterm) {
+  height: 100%;
 }
 
 .ssh-actions {

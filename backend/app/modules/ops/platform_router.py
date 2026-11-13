@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 
 from app.api.deps import CenterDb, PlatformAdmin
 from app.core.http import PageParams, paged, success
@@ -206,3 +206,95 @@ def acknowledge_alert(
             center, alert_id, note=payload.note, actor_user_id=admin.user_id
         )
     )
+
+
+@router.websocket("/nodes/{node_id}/ssh/ws")
+async def node_ssh_websocket(websocket: WebSocket, node_id: int) -> None:
+    """浏览器交互式 SSH 终端：Cookie 会话鉴权，PTY 双向转发。"""
+    import asyncio
+    import json
+    import threading
+
+    from app.core import auth as auth_core
+    from app.core.config import settings
+    from app.core.redis import read_session
+    from app.db.session import center_session
+    from app.modules.identity.service import load_authenticated_user
+    from app.modules.ops import service
+
+    origin = websocket.headers.get("origin", "")
+    allowed = auth_core.allowed_origins()
+    if allowed and origin not in allowed:
+        await websocket.close(code=4403)
+        return
+    session_id = websocket.cookies.get(settings.session_cookie_name, "")
+    payload = read_session(session_id) if session_id else None
+    if not payload or auth_core.session_scope(payload) not in (None, "platform"):
+        await websocket.close(code=4401)
+        return
+    user_id = int(payload.get("user_id") or 0)
+    with center_session() as center:
+        user = load_authenticated_user(center, user_id)
+        if user is None or not user.is_platform_admin:
+            await websocket.close(code=4403)
+            return
+        try:
+            params = service.ssh_connect_params(center, node_id)
+        except Exception:
+            await websocket.close(code=4404)
+            return
+    await websocket.accept()
+    try:
+        import paramiko
+    except ImportError:
+        await websocket.close(code=1011)
+        return
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=params["host"], port=params["port"], username=params["username"],
+            password=params["password"], timeout=10, banner_timeout=10, auth_timeout=10,
+            allow_agent=False, look_for_keys=False,
+        )
+        channel = client.invoke_shell(term="xterm-256color", width=120, height=32)
+        channel.settimeout(0.2)
+    except Exception as exc:
+        await websocket.send_text(f"\r\nSSH 连接失败：{str(exc)[:300]}\r\n")
+        await websocket.close(code=1011)
+        client.close()
+        return
+
+    loop = asyncio.get_running_loop()
+
+    def reader() -> None:
+        while True:
+            try:
+                data = channel.recv(4096)
+            except TimeoutError:
+                continue
+            except Exception:
+                break
+            if not data:
+                break
+            asyncio.run_coroutine_threadsafe(websocket.send_text(data.decode("utf-8", "replace")), loop)
+        asyncio.run_coroutine_threadsafe(websocket.close(), loop)
+
+    threading.Thread(target=reader, daemon=True).start()
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                message = json.loads(raw)
+            except ValueError:
+                channel.send(raw)
+                continue
+            if message.get("type") == "input":
+                channel.send(str(message.get("data") or ""))
+            elif message.get("type") == "resize":
+                channel.resize_pty(width=int(message.get("cols") or 120), height=int(message.get("rows") or 32))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        channel.close()
+        client.close()

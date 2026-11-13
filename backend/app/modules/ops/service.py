@@ -1435,6 +1435,23 @@ def save_ssh_config(center, node_id: int, payload, *, actor_user_id: int) -> dic
     return get_ssh_config(center, node_id)
 
 
+def ssh_connect_params(center, node_id: int) -> dict[str, Any]:
+    from app.core.security import decrypt_secret
+
+    node = _ssh_node(center, node_id)
+    host = _ssh_host(node)
+    if not host:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "未配置服务器 IP，无法建立 SSH 连接")
+    if not node.ssh_username_cipher or not node.ssh_password_cipher:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "请先保存 SSH 账号和密码")
+    try:
+        username = decrypt_secret(node.ssh_username_cipher)
+        password = decrypt_secret(node.ssh_password_cipher)
+    except Exception:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "SSH 凭据无法解密，请重新保存") from None
+    return {"host": host, "port": int(node.ssh_port or 22), "username": username, "password": password}
+
+
 def ssh_execute(center, node_id: int, command: str) -> dict[str, Any]:
     from app.core.security import decrypt_secret
 

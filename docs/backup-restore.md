@@ -23,6 +23,34 @@
 
 ---
 
+## 0. 部署前提与权限初始化（必做一次）
+
+Agent 的执行进程用户是 **erp-agent-exec**（共享组 **erp-agent**），升级前备份与每日备份都以
+该用户运行。因此备份根目录与密钥目录必须由 root 预先创建并授权，否则升级前备份会因权限失败
+而**中止升级**（这是预期保护：备份失败不得继续升级）。
+
+```bash
+# 在租户服务器（以及需要备份的中心服务器）root 执行一次
+sudo bash deploy/scripts/install_backup_dirs.sh
+
+# 校验
+stat -c '%a %U:%G %n' /var/lib/ventasync-backups /var/lib/ventasync-backups/releases /etc/ventasync /etc/ventasync/backup.key
+sudo -u erp-agent-exec test -w /var/lib/ventasync-backups && echo "备份目录可写"
+sudo -u erp-agent-exec test -r /etc/ventasync/backup.key && echo "密钥可读"
+```
+
+脚本行为（可重复执行）：
+
+* 创建组 `erp-agent`，把 `erp-agent` / `erp-agent-exec` 加入该组（用户不存在时给提示，Agent 安装后重跑）；
+* 创建 `/var/lib/ventasync-backups`、`/releases`、`/offsite`、`/drill-reports`、`/etc/ventasync`，
+  权限 **2770 root:erp-agent**（setgid 让子目录继承组）；
+* 安装 `/etc/tmpfiles.d/ventasync-backups.conf`，重启后保持权限；
+* 密钥缺失时生成 `/etc/ventasync/backup.key`（**640 root:erp-agent**）；
+* 检查 `erp-agent-exec` 是否在 docker 组、docker compose v2 是否可用（缺失只告警）。
+
+> 说明：备份产物本身仍按「目录 700 / 文件 600」创建（属主为执行备份的用户），
+> 根目录 2770 只用于让 Agent 用户能创建本次备份目录。
+
 ## 1. 备份目录与权限
 
 默认根目录：`/var/lib/ventasync-backups`（**不在 Git 工作目录内**），可用 `BACKUP_ROOT` 覆盖。
@@ -156,6 +184,9 @@ bash deploy/scripts/backup.sh --trigger scheduled --offsite s3 --keep-days 30 --
 # 仅本地调试（不写中心库、不上传）
 bash deploy/scripts/backup.sh --no-offsite --no-record
 
+# 中心服务器：只备份中心库（租户库在远端实例时；脚本也会自动跳过本机不存在的租户库）
+bash deploy/scripts/backup.sh --trigger manual --center-only
+
 # dry-run：只打印计划
 bash deploy/scripts/backup.sh --dry-run --trigger pre_upgrade
 
@@ -172,6 +203,37 @@ bash deploy/scripts/restore_drill.sh --bundle /var/lib/ventasync-backups/release
 `backup_cli.py` 支持：`apply`（上报清单）、`restore-check`（恢复演练结果）、`latest`（查询最新记录）。
 
 ## 8. 隔离环境恢复演练清单
+
+### 8.0 真实机执行前提（restore_drill.sh --latest）
+
+| 前提 | 要求/验证 |
+| --- | --- |
+| 仓库与部署目录 | 服务器 `/opt/ventasync`，脚本 `deploy/scripts/restore_drill.sh` 已随发布更新 |
+| Docker | `docker version` 正常；`docker compose version` 为 v2；当前用户可访问 docker socket |
+| Compose 文件 | `deploy/docker-compose.yml`、`deploy/docker-compose.server.yml`、`deploy/.env` 存在且可读 |
+| MySQL 镜像 | 本地已有 `mysql:8.4`（离线环境先 `docker save/load`；在线可 `docker compose pull mysql`） |
+| 加密密钥 | `/etc/ventasync/backup.key` 存在且当前用户可读（`sudo -u erp-agent-exec test -r ...`） |
+| 备份包 | `BACKUP_ROOT/releases/*/bundle.tar.gz.enc` 存在；推荐 `--latest` 前先确认最新包已完成异地上传 |
+| 磁盘空间 | 至少为加密包解压后大小的 2 倍（`du -sh /var/lib/ventasync-backups/releases/*`） |
+| 端口/项目名 | 脚本使用独立项目 `ventasync-drill-*` 并移除端口发布，不会与生产 3306 冲突；无需停生产 |
+| 中心库连通性 | 回写 `restore_status` 需要 `api` 容器可连中心库；不可达时用 `--record-id` 之外的方式跳过（脚本只告警） |
+| 时间窗口 | 小实例约 5-15 分钟；大库按数据量预估，建议低峰执行 |
+
+执行（租户服务器 8.163.80.17，root 或可访问 docker 的用户）：
+
+```bash
+cd /opt/ventasync
+# 1) 先做一次最新备份并确认本地校验/异地上传状态
+sudo -u erp-agent-exec bash deploy/backup.sh --trigger manual
+# 2) 隔离恢复演练 + 回写最新备份记录
+sudo -u erp-agent-exec bash deploy/scripts/restore_drill.sh --latest --record-latest
+# 3) 查看报告与记录
+cat /var/lib/ventasync-backups/drill-*/drill-report.json 2>/dev/null | tail -n 40
+```
+
+> 演练失败时脚本退出码 1，并在中心库记录 `restore_status=failed` + `restore_notes`；
+> `--keep` 可保留演练 MySQL 容器与解压目录用于人工核查，排查后手动
+> `docker compose -p ventasync-drill-<ts> down -v` 清理。
 
 **隔离规则（必须遵守）**
 
@@ -234,6 +296,53 @@ bash deploy/scripts/restore_drill.sh --bundle /var/lib/ventasync-backups/release
 | 密钥文件丢失 | 异地包无法解密；改用保留期内的本地明文库导出恢复；立即重建密钥并重做异地备份 |
 | 演练失败项 | 按 `drill-report.json` 定位（账号/权限/商品/配置），修复后重跑；失败记录 `restore_status=failed` + `failure_reason` |
 | 磁盘空间不足 | 调低 `BACKUP_RETENTION_DAYS`、清理旧 releases、把 `BACKUP_ROOT` 挂到独立数据盘 |
+
+## 11. center_0018 迁移、验证与回滚（中心服务器 121.37.45.132）
+
+> 顺序固定：**先备份 → 再迁移 → 再启动新版本**；迁移失败立即停止发布，用备份恢复，不自动降级。
+
+```bash
+cd /opt/ventasync
+# 0) 拉取包含批次3的代码（task-29/30 落盘后的目标 commit）
+git fetch origin && git log --oneline -3        # 确认 commit
+# 1) 迁移前备份中心库（--center-only；租户库在远端时自动跳过）
+sudo -u erp-agent-exec bash deploy/backup.sh --trigger manual --center-only
+#    记录输出中的 BACKUP_DIR/BACKUP_CHECKSUM；如需异地把 --center-only 去掉并配置 BACKUP_OFFSITE_MODE
+# 2) 发布迁移（独立 migrate 容器，含 MySQL 命名锁，幂等）
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env --profile release run --rm migrate --target center
+# 3) 校验中心库 revision（应为 center_0018）
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env exec -T mysql \
+  sh -c 'export MYSQL_PWD="${MYSQL_ROOT_PASSWORD:?}"; mysql -uroot -N -B -e "SELECT version_num FROM ventasync_center.alembic_version"'
+# 4) 校验新列（应列出 10 个契约字段）
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env exec -T mysql \
+  sh -c 'export MYSQL_PWD="${MYSQL_ROOT_PASSWORD:?}"; mysql -uroot -N -B -e "SELECT column_name FROM information_schema.columns WHERE table_schema=\"ventasync_center\" AND table_name=\"backup_records\" ORDER BY ordinal_position"'
+# 5) 重启 API/Worker/Scheduler（按发布流程滚动）
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.server.yml --env-file deploy/.env up -d api worker scheduler nginx
+```
+
+回滚（仅在迁移失败且**尚未写入新业务数据**时；否则从备份恢复）：
+
+```bash
+cd /opt/ventasync
+# 1) 先停 worker/scheduler，避免继续写库
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.server.yml --env-file deploy/.env stop worker scheduler
+# 2) 降级中心库迁移（center_0018 → center_0017，会删除 batch3 新列，数据备份先行）
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env exec -T api \
+  alembic -c alembic/center.ini downgrade center_0017
+# 3) 校验 revision=center_0017
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env exec -T mysql \
+  sh -c 'export MYSQL_PWD="${MYSQL_ROOT_PASSWORD:?}"; mysql -uroot -N -B -e "SELECT version_num FROM ventasync_center.alembic_version"'
+# 4) 回退应用镜像到上一版本后启动
+#    APP_IMAGE_TAG=<上一版本标签> docker compose ... up -d api worker scheduler nginx
+```
+
+**恢复优先策略**：若迁移中途失败/DDL 已部分生效，停止发布 → 用步骤 1 的迁移前备份恢复中心库
+（`deploy/scripts/restore.sh -f <中心库.sql.gz> -d ventasync_center --allow-center --yes`，
+或解密 `bundle.tar.gz.enc` 后取对应 `.sql.gz`）→ 回退镜像 → 重新按顺序发布。
+禁止在未备份的情况下 downgrade 生产库。
+
+租户服务器（8.163.80.17）迁移：随其自身发布执行 `migrate --target tenant` 或整机 migrate；
+其中心库若为远端共享库，center_0018 只需在中心服务器执行一次。
 
 ---
 

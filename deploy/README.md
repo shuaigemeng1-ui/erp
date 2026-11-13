@@ -454,7 +454,11 @@ bash deploy/scripts/git_update.sh --skip-migrate
 ## 备份、加密异地与恢复演练（批次3）
 
 备份默认写入 **/var/lib/ventasync-backups**（Git 工作目录之外，目录 700 / 文件 600），
-每日 **03:30（租户服务器本地时区）**由 systemd timer 触发，保留 **30 天**：
+每日 **03:30（租户服务器本地时区）**由 systemd timer 触发，保留 **30 天**。
+**部署前提**：Agent 执行用户为 `erp-agent-exec`（组 `erp-agent`），root 先执行一次
+`sudo bash deploy/scripts/install_backup_dirs.sh` 初始化 `/var/lib/ventasync-backups`
+与 `/etc/ventasync`（2770 root:erp-agent，密钥 640 root:erp-agent，含 tmpfiles 配置），
+否则升级前备份会因权限失败而中止升级。
 
 ```bash
 sudo install -m 644 deploy/systemd/ventasync-backup.service /etc/systemd/system/
@@ -472,7 +476,12 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ventasync-backup.tim
   平台接口：`GET /api/v1/platform/backups`、`POST /api/v1/platform/backups/{id}/restore-check`；
 - 升级前额外备份：Agent 升级步骤已执行 `deploy/backup.sh`，后端登记 `trigger=pre_upgrade`；
 - 隔离恢复演练：`bash deploy/scripts/restore_drill.sh --latest --record-latest`
-  （自测：`--self-test`），自动校验账号/权限/商品/配置并生成 `drill-report.json`。
+  （自测：`--self-test`），自动校验账号/权限/商品/配置并生成 `drill-report.json`；
+  真实机前提（docker/compose v2、mysql:8.4 镜像、密钥可读、磁盘≥2倍、回写需中心库可达）见文档；
+- 中心库迁移与回滚（center_0018）命令见 `docs/backup-restore.md` 第 11 节：
+  `migrate --target center` → 校验 `alembic_version=center_0018`；回滚用
+  `alembic -c alembic/center.ini downgrade center_0017`（先停 worker/scheduler、先备份；
+  迁移中途失败优先从备份恢复）。
 
 完整说明、演练清单与故障处理见 [`docs/backup-restore.md`](../docs/backup-restore.md)。
 

@@ -28,7 +28,17 @@
 #   * 异地存储为独立私有目录/私有桶（BACKUP_OFFSITE_*），不复用商品图片公开目录；
 #   * 生成 → 校验 → 加密 → 异地上传 → 记录中心库 backup_records（可用 --no-record 关闭）。
 #
-# 退出码：0=成功；1=本地生成/校验失败；2=异地加密上传失败（本地包仍保留）。
+# 运行身份与权限（重要）：
+#   Agent 执行进程用户是 erp-agent-exec（共享组 erp-agent），升级前备份也以该用户运行，
+#   因此备份根目录与密钥目录必须由管理员预先初始化（root 执行一次）：
+#       sudo bash deploy/scripts/install_backup_dirs.sh
+#   目录约定：/var/lib/ventasync-backups、/etc/ventasync 属组 erp-agent 2770，
+#   密钥 /etc/ventasync/backup.key 640 root:erp-agent；tmpfiles 配置见
+#   deploy/systemd/ventasync-backups.tmpfiles.conf（重启后保持权限）。
+#   若脚本以非 root 运行且目录不可写，会给出明确修复命令并以退出码 1 结束（升级会因此中止，
+#   这是预期：备份失败不得继续升级）。
+#
+# 退出码：0=成功；1=本地生成/校验失败或权限未初始化；2=异地加密上传失败（本地包仍保留）。
 # =============================================================================
 set -euo pipefail
 
@@ -68,6 +78,8 @@ KEEP_DAYS="${BACKUP_RETENTION_DAYS}"
 OFFSITE_MODE="${BACKUP_OFFSITE_MODE}"
 RECORD="${BACKUP_RECORD}"
 SKIP_MEDIA="${BACKUP_SKIP_MEDIA}"
+BACKUP_GROUP="${BACKUP_GROUP:-erp-agent}"
+CENTER_ONLY=0
 DRY_RUN=0
 
 log() { printf '[backup] %s\n' "$*"; }
@@ -84,6 +96,7 @@ usage() {
   --offsite <none|local|s3>                 异地模式（默认 BACKUP_OFFSITE_MODE）
   --keep-days <天数>                        本地/异地镜像保留天数（默认 30）
   --skip-media                              跳过商品图片卷备份
+  --center-only                             仅备份中心库（中心服务器上租户库在远端时使用）
   --no-offsite                              本次不上传异地
   --no-record                               不写中心库 backup_records
   --dry-run                                 只打印计划，不做任何写操作
@@ -98,6 +111,7 @@ while [[ $# -gt 0 ]]; do
         --offsite) [[ $# -ge 2 ]] || die "--offsite 需要参数"; OFFSITE_MODE="$2"; shift 2 ;;
         --keep-days) [[ $# -ge 2 ]] || die "--keep-days 需要参数"; KEEP_DAYS="$2"; shift 2 ;;
         --skip-media) SKIP_MEDIA=1; shift ;;
+        --center-only) CENTER_ONLY=1; shift ;;
         --no-offsite) OFFSITE_MODE="none"; shift ;;
         --no-record) RECORD=0; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -132,16 +146,41 @@ compose() { docker compose -f "${COMPOSE_FILE}" "$@"; }
 compose ps --status running --services 2>/dev/null | grep -qx "mysql" \
     || die "mysql 服务未运行，请先启动：docker compose -f deploy/docker-compose.yml up -d mysql"
 
-# 加密密钥：文件权限 600，内容不进备份包；丢失将无法解密异地包
+# ---------------------------------------------------------------- 目录与密钥权限
+# Agent 执行用户为 erp-agent-exec（组 erp-agent）。管理员应预先执行 install_backup_dirs.sh；
+# 这里再做一次防御性检查，避免以错误用户运行时静默失败。
+ensure_writable_dir() {
+    local dir="$1"
+    if [[ ! -d "${dir}" ]]; then
+        if [[ "$(id -u)" -eq 0 ]]; then
+            install -d -m 2770 -o root -g "${BACKUP_GROUP}" "${dir}" 2>/dev/null \
+                || install -d -m 700 "${dir}"
+            log "已创建备份目录：${dir}（属组 ${BACKUP_GROUP:-root}，2770）"
+        else
+            die "备份目录不存在：${dir}。请管理员执行一次：sudo bash deploy/scripts/install_backup_dirs.sh"
+        fi
+    fi
+    if [[ ! -w "${dir}" ]]; then
+        die "备份目录不可写：${dir}（当前用户 $(id -un)）。请管理员执行：sudo bash deploy/scripts/install_backup_dirs.sh（属组 ${BACKUP_GROUP}，权限 2770）"
+    fi
+}
+KEY_DIR="$(dirname "${KEY_FILE}")"
+ensure_writable_dir "${BACKUP_ROOT}"
+ensure_writable_dir "${BACKUP_ROOT}/releases"
+
+# 加密密钥：内容不进备份包；丢失将无法解密异地包。管理员初始化时生成 640 root:erp-agent；
+# 若缺失且当前用户可写密钥目录（root 或已授权属组），则生成 600/640。
 if [[ ! -s "${KEY_FILE}" ]]; then
-    install -d -m 700 "$(dirname "${KEY_FILE}")"
-    openssl rand -base64 32 > "${KEY_FILE}"
-    chmod 600 "${KEY_FILE}"
+    ensure_writable_dir "${KEY_DIR}"
+    ( umask 027; openssl rand -base64 32 > "${KEY_FILE}" )
+    chmod 640 "${KEY_FILE}" 2>/dev/null || chmod 600 "${KEY_FILE}"
+    if [[ "$(id -u)" -eq 0 ]] && getent group "${BACKUP_GROUP}" >/dev/null 2>&1; then
+        chown "root:${BACKUP_GROUP}" "${KEY_FILE}" 2>/dev/null || true
+    fi
     log "已生成备份加密密钥：${KEY_FILE}（请异地妥善保管，丢失无法恢复异地备份）"
 fi
-[[ -r "${KEY_FILE}" ]] || die "备份加密密钥不可读：${KEY_FILE}"
+[[ -r "${KEY_FILE}" ]] || die "备份加密密钥不可读：${KEY_FILE}（应为 640 root:${BACKUP_GROUP} 或 600）"
 
-install -d -m 700 "${BACKUP_ROOT}" "${BACKUP_ROOT}/releases"
 install -d -m 700 "${RUN_DIR}" "${CONFIG_DIR}"
 
 sha256_of() {
@@ -196,11 +235,23 @@ CENTER_TABLES="$(mysql_exec -e "SELECT COUNT(*) FROM information_schema.tables W
 [[ "${CENTER_TABLES}" -gt 0 ]] || die "中心库 ${CENTER_DB_NAME} 不存在或为空"
 
 dump_one "${CENTER_DB_NAME}"
-TENANT_DBS="$(mysql_exec -e "SELECT database_name FROM ${CENTER_DB_NAME}.tenant_databases WHERE database_name IS NOT NULL AND LENGTH(database_name) > 0 ORDER BY tenant_id" || true)"
-for tenant_db in ${TENANT_DBS}; do
-    [[ "${tenant_db}" =~ ^[A-Za-z0-9_]+$ ]] || die "非法租户库名：${tenant_db}"
-    dump_one "${tenant_db}"
-done
+if [[ "${CENTER_ONLY}" -eq 1 ]]; then
+    log "按参数仅备份中心库（--center-only），跳过租户库"
+else
+    # 只备份本机存在的租户库：中心服务器上租户库可能在远端独立实例，直接 dump 会失败
+    LOCAL_DBS="$(mysql_exec -e "SELECT schema_name FROM information_schema.schemata" || true)"
+    TENANT_DBS="$(mysql_exec -e "SELECT database_name FROM ${CENTER_DB_NAME}.tenant_databases WHERE database_name IS NOT NULL AND LENGTH(database_name) > 0 ORDER BY tenant_id" || true)"
+    : > "${RUN_DIR}/.skipped_dbs"
+    for tenant_db in ${TENANT_DBS}; do
+        [[ "${tenant_db}" =~ ^[A-Za-z0-9_]+$ ]] || die "非法租户库名：${tenant_db}"
+        if ! grep -Fxq "${tenant_db}" <<< "${LOCAL_DBS}"; then
+            warn "租户库 ${tenant_db} 不在本机 MySQL（远端实例），跳过导出；请在该租户实例上单独备份"
+            printf '%s\n' "${tenant_db}" >> "${RUN_DIR}/.skipped_dbs"
+            continue
+        fi
+        dump_one "${tenant_db}"
+    done
+fi
 CENTER_DB_TABLES="$(sed -n '1p' "${RUN_DIR}/.table_counts" 2>/dev/null | tr -d ' ' || echo 0)"
 rm -f "${RUN_DIR}/.table_counts"
 
@@ -282,9 +333,10 @@ for path in sorted(run_dir.rglob("*")):
 sql_files = [item for item in files if item["path"].endswith(".sql.gz")]
 config_files = [item for item in files if item["path"].startswith("config/")]
 media_files = [item for item in files if item["path"].startswith("catalog_media")]
-table_counts = {}
-for item in sql_files:
-    table_counts[Path(item["path"]).stem.replace(".sql", "")] = None
+skipped_path = run_dir / ".skipped_dbs"
+skipped_dbs = []
+if skipped_path.exists():
+    skipped_dbs = [line.strip() for line in skipped_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 manifest = {
     "run_id": run_dir.name,
     "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -292,6 +344,7 @@ manifest = {
     "instance_id": int(instance_id) if instance_id else None,
     "center_database": center_db,
     "databases": [Path(item["path"]).name.replace(".sql.gz", "") for item in sql_files],
+    "skipped_remote_databases": skipped_dbs,
     "config": [item["path"] for item in config_files],
     "files": files,
     "local": {
@@ -314,6 +367,8 @@ manifest = {
     json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
 )
 os.chmod(run_dir / "manifest.json", 0o600)
+if skipped_path.exists():
+    skipped_path.unlink()
 # 本地校验结果（写回清单，供后端记录与演练核对）
 checks = manifest["checks"]
 checks["local_verified"] = bool(

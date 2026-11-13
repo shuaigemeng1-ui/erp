@@ -15,8 +15,12 @@ export APP_VERSION="$VERSION"
 
 echo "==> 发布版本 $VERSION"
 docker compose -f docker-compose.yml -f docker-compose.server.yml --env-file .env build api nginx
-docker push "${IMAGE_PREFIX}ventasync-backend:${VERSION}"
-docker push "${IMAGE_PREFIX}ventasync-frontend:${VERSION}"
+# 推送走本机 registry，避免大镜像绕公网 nginx 造成超时；仓库路径与公网拉取一致。
+LOCAL_REGISTRY="127.0.0.1:5000"
+docker tag "${IMAGE_PREFIX}ventasync-backend:${VERSION}" "${LOCAL_REGISTRY}/ventasync-backend:${VERSION}"
+docker tag "${IMAGE_PREFIX}ventasync-frontend:${VERSION}" "${LOCAL_REGISTRY}/ventasync-frontend:${VERSION}"
+docker push "${LOCAL_REGISTRY}/ventasync-backend:${VERSION}"
+docker push "${LOCAL_REGISTRY}/ventasync-frontend:${VERSION}"
 
 # 持久化中心版本与镜像仓库前缀
 python3 - "$VERSION" "$IMAGE_PREFIX" <<'PY'

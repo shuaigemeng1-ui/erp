@@ -336,6 +336,8 @@ services:
       - registry
     volumes:
       - registry_data:/var/lib/registry
+    ports:
+      - "127.0.0.1:5000:5000"
     networks:
       - edge
     expose:

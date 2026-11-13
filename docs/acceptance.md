@@ -1,6 +1,6 @@
-# 当前仓库契约状态（批次 2，2026-11-13，HEAD 02846cf）
+# 当前仓库契约状态（批次 2，2026-11-13，离线 02846cf / 试点 1da80c2）
 
-> 本节为批次 2 离线验收结论；批次 1 试点记录保留在下节（历史）。批次 2 详细证据见 `docs/batch2-acceptance.md`。
+> 本节为批次 2 离线验收 + 生产试点结论；批次 1 试点记录保留在下节（历史）。批次 2 详细证据见 `docs/batch2-acceptance.md`。
 
 | 检查 | 当前结果 |
 | --- | --- |
@@ -12,11 +12,13 @@
 | 业务表 | 中心库 **29** 张、租户库 **33** 张（均不计 `alembic_version`）；`tenant_instances` 部署/迁移状态与 `server_nodes` SSH 指纹列已写入 `docs/data-model.md` |
 | 完整契约检查 | **38/38 通过**，0 失败 0 警告：补齐 `center_0017` 迁移基线后恢复全绿；表清单/中文注释/权限码/94 条文档路由全部通过 |
 | 批次 2 交付 | 租户模式边界（center/tenant/gateway、固定 TENANT_ID/INSTANCE_ID）、任务固定实例/租户绑定、迁移租户调度隔离、升级前强制备份、SSH 主机指纹 TOFU/审计/会话复核、实例部署/迁移状态展示 |
-| 剩余风险 | tenant 模式需 TENANT_ID/INSTANCE_ID；SSH TOFU 首指纹需人工核对；审计标签/前端展示待核对；第二租户、监控、独立网关、备份恢复演练未完成（详见 `docs/batch2-acceptance.md` 第 4 节） |
+| 批次 2 生产试点 | **通过**：中心 `1da80c2` + `center_0017`；release 自动登记 verified/协议2/center_0017/tenant_0014；8.163.80.17 升级 job 42 成功（checks passed、actual=1da80c2、db=tenant_0014）；tenant 模式 TENANT_ID=1/INSTANCE_ID=1 登录/runtime/healthz 200、`/platform/releases` 404；SSH 首指纹已记录并 verified（SHA256:T2cB1vQn5bvCsJ9BPqmui5IIb+7vR/n1tuseQFY8LYE） |
+| 剩余风险 | tenant 模式第二租户/多实例配置待验证；SSH 首指纹需纳入运维核对、mismatch 真实演练待补；审计标签待核对；升级前备份步骤因旧 executor 未在 job 42 生效（待 Agent 升级后补验）；备份恢复演练、维护状态、监控、独立网关、第二租户未完成（详见 `docs/batch2-acceptance.md` 第 5 节） |
 
 补充说明：
 
-- 批次 2 未做真实 tenant 实例/SSH 主机/备份恢复试点；上述离线与单测结论不替代真实环境验收。
+- 批次 2 已完成单台生产试点（8.163.80.17）；升级前备份阻断真实路径、备份恢复、维护状态、监控/网关、第二租户仍未验收，
+  上述离线/单台试点结论不替代批次 2 全量完成。
 - 批次 1 试点（8.163.80.17，`2e34e6b`）记录见下节及 `docs/batch1-acceptance.md`。
 
 ---

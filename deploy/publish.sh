@@ -33,6 +33,7 @@ out.extend(f'{key}={value}' for key, value in keys.items())
 path.write_text('\n'.join(out) + '\n', encoding='utf-8')
 PY
 
+docker compose -f docker-compose.yml -f docker-compose.server.yml --env-file .env --profile release run --rm migrate
 docker compose -f docker-compose.yml -f docker-compose.server.yml --env-file .env up -d api worker scheduler nginx
 echo "==> 完成：$VERSION"
 echo "租户实例需要设置 IMAGE_REGISTRY=${IMAGE_PREFIX} 并点击升级到 ${VERSION}"

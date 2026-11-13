@@ -1380,3 +1380,98 @@ def retry_operation(center, job_id: int, *, actor_user_id: int) -> dict[str, Any
         payload=old.payload_json or {}, idempotency_key="",
     )
     return create_operation(center, old.instance_id, payload, actor_user_id=actor_user_id)
+
+
+# --------------------------------------------------------------------------- SSH 凭据与命令执行
+def _ssh_node(center, node_id: int) -> ServerNode:
+    node = center.get(ServerNode, node_id)
+    if node is None:
+        raise AppError(ErrorCode.NOT_FOUND, "服务器节点不存在")
+    return node
+
+
+def _ssh_host(node: ServerNode) -> str:
+    if node.ssh_host:
+        return node.ssh_host
+    if node.observed_public_ip:
+        return node.observed_public_ip
+    if node.configured_public_ip:
+        return node.configured_public_ip
+    ips = node.internal_ips or []
+    return ips[0] if ips else ""
+
+
+def get_ssh_config(center, node_id: int) -> dict[str, Any]:
+    from app.core.security import decrypt_secret
+
+    node = _ssh_node(center, node_id)
+    username = ""
+    if node.ssh_username_cipher:
+        try:
+            username = decrypt_secret(node.ssh_username_cipher)
+        except Exception:
+            username = ""
+    return {
+        "host": node.ssh_host,
+        "detected_host": _ssh_host(node),
+        "port": int(node.ssh_port or 22),
+        "username": username,
+        "has_password": bool(node.ssh_password_cipher),
+    }
+
+
+def save_ssh_config(center, node_id: int, payload, *, actor_user_id: int) -> dict[str, Any]:
+    from app.core.security import encrypt_secret
+
+    node = _ssh_node(center, node_id)
+    node.ssh_host = payload.host.strip()
+    node.ssh_port = int(payload.port or 22)
+    if payload.username is not None:
+        node.ssh_username_cipher = encrypt_secret(payload.username.strip()) if payload.username.strip() else ""
+    if payload.password is not None:
+        node.ssh_password_cipher = encrypt_secret(payload.password) if payload.password else ""
+    center.add(node)
+    center.commit()
+    return get_ssh_config(center, node_id)
+
+
+def ssh_execute(center, node_id: int, command: str) -> dict[str, Any]:
+    from app.core.security import decrypt_secret
+
+    node = _ssh_node(center, node_id)
+    host = _ssh_host(node)
+    if not host:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "未配置服务器 IP，无法建立 SSH 连接")
+    if not node.ssh_username_cipher or not node.ssh_password_cipher:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "请先保存 SSH 账号和密码")
+    try:
+        username = decrypt_secret(node.ssh_username_cipher)
+        password = decrypt_secret(node.ssh_password_cipher)
+    except Exception:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "SSH 凭据无法解密，请重新保存") from None
+    try:
+        import paramiko
+    except ImportError:
+        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "服务器缺少 SSH 依赖") from None
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=host,
+            port=int(node.ssh_port or 22),
+            username=username,
+            password=password,
+            timeout=10,
+            banner_timeout=10,
+            auth_timeout=10,
+            allow_agent=False,
+            look_for_keys=False,
+        )
+        _, stdout, stderr = client.exec_command(command, timeout=60)
+        out = (stdout.read() + stderr.read()).decode("utf-8", "replace")
+        exit_status = stdout.channel.recv_exit_status()
+        return {"output": out[-20000:], "exit_status": int(exit_status), "host": host}
+    except Exception as exc:  # noqa: BLE001 - 返回受控错误给平台管理员
+        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, f"SSH 执行失败：{str(exc)[:200]}") from None
+    finally:
+        client.close()

@@ -15,3 +15,4 @@ email-validator==2.3.0
 # Celery 的 Redis 传输（kombu）在运行期导入 packaging，需要显式声明
 packaging==26.0
 boto3==1.44.0
+paramiko==3.5.1

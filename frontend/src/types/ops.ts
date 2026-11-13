@@ -180,3 +180,24 @@ export interface OpsAlertAckResult {
   status: string
   message: string
 }
+
+export interface OpsNodeSshConfig {
+  host: string
+  detected_host: string
+  port: number
+  username: string
+  has_password: boolean
+}
+
+export interface OpsNodeSshConfigPayload {
+  host: string
+  port: number
+  username?: string | null
+  password?: string | null
+}
+
+export interface OpsNodeSshExecResult {
+  output: string
+  exit_status: number
+  host: string
+}

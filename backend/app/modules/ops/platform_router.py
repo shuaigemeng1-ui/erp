@@ -67,6 +67,25 @@ def probe_node(center: CenterDb, _: PlatformAdmin, node_id: int) -> dict:
     return success(service.probe_node(center, node_id))
 
 
+@router.get("/nodes/{node_id}/ssh", summary="读取服务器 SSH 配置")
+def get_node_ssh(center: CenterDb, _: PlatformAdmin, node_id: int) -> dict:
+    return success(service.get_ssh_config(center, node_id))
+
+
+@router.put("/nodes/{node_id}/ssh", summary="保存服务器 SSH 账号")
+def save_node_ssh(
+    center: CenterDb, admin: PlatformAdmin, node_id: int, payload: NodeSshConfigIn
+) -> dict:
+    return success(service.save_ssh_config(center, node_id, payload, actor_user_id=admin.user_id))
+
+
+@router.post("/nodes/{node_id}/ssh/exec", summary="通过 SSH 执行命令")
+def exec_node_ssh(
+    center: CenterDb, _: PlatformAdmin, node_id: int, payload: NodeSshExecIn
+) -> dict:
+    return success(service.ssh_execute(center, node_id, payload.command))
+
+
 @router.get("/nodes/{node_id}/metrics", summary="节点指标趋势")
 def node_metrics(
     center: CenterDb,

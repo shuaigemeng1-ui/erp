@@ -11,6 +11,9 @@ import type {
   OpsNodeAggregates,
   OpsNodeEnrollment,
   OpsNodeMetrics,
+  OpsNodeSshConfig,
+  OpsNodeSshConfigPayload,
+  OpsNodeSshExecResult,
   OpsProbeResult,
   OpsServerNode,
   OpsTenantOption,
@@ -133,6 +136,18 @@ export const opsApi = {
 
   probeNode(nodeId: EntityId): Promise<OpsProbeResult> {
     return http.post<OpsProbeResult>(`/platform/nodes/${segment(nodeId)}/probe`)
+  },
+
+  nodeSshConfig(nodeId: EntityId): Promise<OpsNodeSshConfig> {
+    return http.get<OpsNodeSshConfig>(`/platform/nodes/${segment(nodeId)}/ssh`)
+  },
+
+  saveNodeSshConfig(nodeId: EntityId, payload: OpsNodeSshConfigPayload): Promise<OpsNodeSshConfig> {
+    return http.put<OpsNodeSshConfig>(`/platform/nodes/${segment(nodeId)}/ssh`, payload)
+  },
+
+  execNodeSsh(nodeId: EntityId, command: string): Promise<OpsNodeSshExecResult> {
+    return http.post<OpsNodeSshExecResult>(`/platform/nodes/${segment(nodeId)}/ssh/exec`, { command })
   },
 
   nodeMetrics(nodeId: EntityId, minutes = 60): Promise<OpsNodeMetrics> {

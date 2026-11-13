@@ -387,6 +387,66 @@ async function loadDetail(instanceId: string): Promise<void> {
 }
 
 const latestVersion = ref('')
+const activePageTab = ref<'servers' | 'alerts'>('servers')
+
+/* ------------------------------ SSH 终端 ------------------------------ */
+const sshVisible = ref(false)
+const sshNode = ref<OpsServerNode | null>(null)
+const sshLoading = ref(false)
+const sshSaving = ref(false)
+const sshRunning = ref(false)
+const sshHost = ref('')
+const sshPort = ref(22)
+const sshUsername = ref('')
+const sshPassword = ref('')
+const sshCommand = ref('')
+const sshOutput = ref('')
+
+async function openSsh(node: OpsServerNode): Promise<void> {
+  sshNode.value = node
+  sshVisible.value = true
+  sshLoading.value = true
+  sshOutput.value = ''
+  sshCommand.value = ''
+  try {
+    const config = await opsApi.nodeSshConfig(node.id)
+    sshHost.value = config.host || config.detected_host || ''
+    sshPort.value = Number(config.port || 22)
+    sshUsername.value = config.username || ''
+    sshPassword.value = ''
+  } finally {
+    sshLoading.value = false
+  }
+}
+
+async function saveSsh(): Promise<void> {
+  if (!sshNode.value) return
+  sshSaving.value = true
+  try {
+    const config = await opsApi.saveNodeSshConfig(sshNode.value.id, {
+      host: sshHost.value.trim(),
+      port: Number(sshPort.value || 22),
+      username: sshUsername.value.trim(),
+      password: sshPassword.value ? sshPassword.value : undefined,
+    })
+    sshPassword.value = ''
+    ElMessage.success(config.has_password ? 'SSH 配置已保存' : 'SSH 配置已保存，但密码为空')
+  } finally {
+    sshSaving.value = false
+  }
+}
+
+async function runSsh(): Promise<void> {
+  if (!sshNode.value || !sshCommand.value.trim()) return
+  sshRunning.value = true
+  sshOutput.value = ''
+  try {
+    const result = await opsApi.execNodeSsh(sshNode.value.id, sshCommand.value.trim())
+    sshOutput.value = `$ ${sshCommand.value.trim()}\n${result.output}\n[exit ${result.exit_status}]`
+  } finally {
+    sshRunning.value = false
+  }
+}
 const upgradingId = ref('')
 
 function canUpgrade(instance: OpsInstance): boolean {
@@ -787,6 +847,8 @@ async function copyText(value: string | null | undefined, label: string): Promis
       </div>
     </div>
 
+    <el-tabs v-model="activePageTab" class="page-tabs">
+      <el-tab-pane label="服务器" name="servers">
     <!-- 实例列表 -->
     <el-card shadow="never" class="page-card">
       <div class="filter-bar">
@@ -890,7 +952,8 @@ async function copyText(value: string | null | undefined, label: string): Promis
         @size-change="handleInstanceSizeChange"
       />
     </el-card>
-
+      </el-tab-pane>
+      <el-tab-pane label="告警中心" name="alerts">
     <!-- 告警中心 -->
     <el-card shadow="never" class="page-card">
       <div class="table-toolbar">
@@ -984,6 +1047,8 @@ async function copyText(value: string | null | undefined, label: string): Promis
         @size-change="handleAlertSizeChange"
       />
     </el-card>
+      </el-tab-pane>
+    </el-tabs>
   </div>
 
   <!-- 新建实例 -->
@@ -1131,7 +1196,7 @@ async function copyText(value: string | null | undefined, label: string): Promis
           <el-table-column label="最后心跳" width="170">
             <template #default="{ row }">{{ formatDateTime(row.last_seen_at) }}</template>
           </el-table-column>
-          <el-table-column label="操作" width="160" fixed="right">
+          <el-table-column label="操作" width="240" fixed="right">
             <template #default="{ row }">
               <el-button
                 text
@@ -1144,6 +1209,9 @@ async function copyText(value: string | null | undefined, label: string): Promis
               </el-button>
               <el-button text type="primary" size="small" @click.stop="loadNodeMetrics(row as OpsServerNode)">
                 查看指标
+              </el-button>
+              <el-button text type="primary" size="small" @click.stop="openSsh(row as OpsServerNode)">
+                SSH
               </el-button>
             </template>
           </el-table-column>
@@ -1501,6 +1569,34 @@ async function copyText(value: string | null | undefined, label: string): Promis
       <el-button @click="probeVisible = false">关闭</el-button>
     </template>
   </el-dialog>
+
+  <el-dialog v-model="sshVisible" :title="`SSH · ${sshNode?.hostname || sshNode?.node_uuid || ''}`" width="760px" destroy-on-close>
+    <div v-loading="sshLoading">
+      <el-form label-width="90px" size="small">
+        <el-form-item label="SSH 地址">
+          <el-input v-model="sshHost" placeholder="留空自动使用探测到的公网/内网 IP" />
+        </el-form-item>
+        <el-form-item label="端口">
+          <el-input-number v-model="sshPort" :min="1" :max="65535" controls-position="right" />
+        </el-form-item>
+        <el-form-item label="用户名">
+          <el-input v-model="sshUsername" autocomplete="off" />
+        </el-form-item>
+        <el-form-item label="密码">
+          <el-input v-model="sshPassword" type="password" show-password autocomplete="new-password" placeholder="留空表示不修改" />
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" :loading="sshSaving" @click="saveSsh">保存 SSH 配置</el-button>
+        </el-form-item>
+      </el-form>
+      <el-divider content-position="left">执行命令</el-divider>
+      <el-input v-model="sshCommand" type="textarea" :rows="3" placeholder="例如：df -h" />
+      <div class="ssh-actions">
+        <el-button type="primary" :loading="sshRunning" :disabled="!sshCommand.trim()" @click="runSsh">执行</el-button>
+      </div>
+      <pre class="ssh-output">{{ sshOutput || '命令输出会显示在这里' }}</pre>
+    </div>
+  </el-dialog>
 </template>
 
 <style scoped>
@@ -1782,6 +1878,22 @@ async function copyText(value: string | null | undefined, label: string): Promis
 
 .enrollment-detail {
   margin-top: 12px;
+}
+
+.ssh-actions {
+  margin: 10px 0;
+}
+
+.ssh-output {
+  max-height: 320px;
+  padding: 10px;
+  overflow: auto;
+  white-space: pre-wrap;
+  background: #1f2430;
+  color: #d8dee9;
+  border-radius: 4px;
+  font-family: Consolas, 'SFMono-Regular', Menlo, monospace;
+  font-size: 12px;
 }
 
 .probe-domain {

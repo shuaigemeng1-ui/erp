@@ -100,6 +100,18 @@ class ServerNode(IdMixin, TimestampMixin, CenterBase):
         DateTime, nullable=True, comment="一次性接入令牌过期时间UTC"
     )
     metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, comment="附加元数据")
+    ssh_host: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default="", comment="SSH主机（空则使用探测IP）"
+    )
+    ssh_port: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=22, server_default=text("22"), comment="SSH端口"
+    )
+    ssh_username_cipher: Mapped[str] = mapped_column(
+        String(1024), nullable=False, default="", server_default="", comment="SSH用户名密文"
+    )
+    ssh_password_cipher: Mapped[str] = mapped_column(
+        String(2048), nullable=False, default="", server_default="", comment="SSH密码密文"
+    )
 
 
 class NodeMetricSample(IdMixin, CenterBase):

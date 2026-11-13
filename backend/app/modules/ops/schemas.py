@@ -147,3 +147,16 @@ class MaintenanceWindowCreate(BaseModel):
     starts_at: datetime
     ends_at: datetime
     reason: str = Field(default="", max_length=255)
+
+
+class NodeSshConfigIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    host: str = Field(default="", max_length=255)
+    port: int = Field(default=22, ge=1, le=65535)
+    username: str | None = Field(default=None, max_length=128)
+    password: str | None = Field(default=None, max_length=512)
+
+
+class NodeSshExecIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    command: str = Field(min_length=1, max_length=2000)

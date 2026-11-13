@@ -157,6 +157,25 @@ def get_channel_app(
     return payload
 
 
+@app.get("/api/v1/gateway/channel-apps/{channel}/{environment}/internal")
+def internal_channel_app(
+    channel: str,
+    environment: str,
+    x_gateway_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """供受信租户实例内部拉取含密钥的渠道配置；不得暴露给浏览器。"""
+    _require_admin(x_gateway_token)
+    _validate(channel, environment)
+    with closing(_db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM gateway_channel_apps WHERE channel=? AND environment=?",
+            (channel, environment),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="渠道应用配置不存在")
+    return _row_payload(row, include_secret=True)
+
+
 @app.put("/api/v1/gateway/channel-apps/{channel}/{environment}")
 def put_channel_app(
     channel: str,

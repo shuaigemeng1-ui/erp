@@ -108,6 +108,10 @@ chmod 640 "$CONFIG"
 chown -R "$COLLECTOR_USER":"$SHARED_GROUP" "$STATE_DIR"
 install -d -m 700 -o "$EXECUTOR_USER" -g "$SHARED_GROUP" "$STATE_DIR/.docker"
 chmod 2770 "$STATE_DIR"
+if [ -f /opt/ventasync/deploy/.env ]; then
+  chgrp erp-agent /opt/ventasync/deploy/.env 2>/dev/null || true
+  chmod 640 /opt/ventasync/deploy/.env 2>/dev/null || true
+fi
 chmod 660 "$STATE_DIR"/*.db "$STATE_DIR"/*.db-* 2>/dev/null || true
 
 # ------------------------------------------------------------------ systemd

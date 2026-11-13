@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import os
+
 import json
 import re
 import subprocess
@@ -310,11 +312,21 @@ def persist_env_version(env_file: Path, target_version: str, *, image_registry: 
     kept = [line for line in lines if line.split("=", 1)[0].strip() not in keys]
     kept.extend(f"{key}={value}" for key, value in keys.items())
     env_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        old_stat = env_file.stat()
+        file_gid = old_stat.st_gid
+    except OSError:
+        file_gid = env_file.parent.stat().st_gid
     temp = env_file.with_name(env_file.name + ".agent-tmp")
     temp.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    try:
+        # 采集进程与执行进程共享部署目录；保留组读，避免升级后采集进程读不到 .env。
+        os.chown(temp, -1, file_gid)
+    except (OSError, AttributeError):
+        pass
     temp.replace(env_file)
     try:
-        env_file.chmod(0o600)
+        env_file.chmod(0o640)
     except OSError:
         pass
 

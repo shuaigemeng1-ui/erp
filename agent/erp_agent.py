@@ -1,289 +1,165 @@
 #!/usr/bin/env python3
-"""ERP 租户服务器采集 Agent（仅标准库，Linux）。
+"""ERP 租户服务器 Agent 2 入口（仅标准库，Linux）。
 
-用法：
-  sudo python3 erp_agent.py enroll --center https://erp.example.com \
-      --token <一次性令牌> --config /etc/erp-agent/config.json
-  sudo python3 erp_agent.py run --config /etc/erp-agent/config.json
+角色分离（部署为两个 systemd unit）：
 
-设计约束：
-* 只采集宿主机与容器状态，不执行任意命令。
-* 30 秒上报一次；断网时本地最多缓存 24 小时，恢复后按原采样时间补报。
-* 节点身份固定在注册时写入的 node_uuid + node_token，IP 变化不影响身份。
+* ``run``（采集进程）：指标采集 + 30s 心跳 + 断网缓存补报 + 结果补报；
+  只读采集，不执行任何变更任务。
+* ``executor``（执行进程）：轮询任务、持有/续租 120s 租约、受限执行、
+  本地 SQLite 执行日志、结果先落库后上报；权限更高，与采集进程分离。
+
+常用命令::
+
+    # 注册（安装时执行一次）
+    sudo python3 erp_agent.py enroll --center https://erp.example.com \
+        --token <一次性令牌> --instance 1 --config /etc/erp-agent/config.json
+
+    # 采集进程（systemd: erp-agent.service）
+    python3 erp_agent.py run --config /etc/erp-agent/config.json
+
+    # 执行进程（systemd: erp-agent-executor.service）
+    python3 erp_agent.py executor --config /etc/erp-agent/config.json
+
+    # 状态 / 人工核对 / 自升级 / 自测
+    python3 erp_agent.py status --config /etc/erp-agent/config.json
+    python3 erp_agent.py reconcile --job-id 12 --note "人工确认已完成"
+    python3 erp_agent.py self-upgrade --source /opt/ventasync/agent --version 2.1.0
+    python3 erp_agent.py selftest
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
+import logging
 import platform
-import shutil
-import socket
-import ssl
-import subprocess
+import signal
+import sys
+import threading
 import time
-import urllib.error
-import urllib.request
-from datetime import datetime, timezone
+import uuid
 from pathlib import Path
 from typing import Any
 
-AGENT_VERSION = "0.1.0"
-DEFAULT_CONFIG = "/etc/erp-agent/config.json"
-CACHE_LIMIT = 2880  # 24h / 30s
-REPORT_SECONDS = 30
+# 允许以脚本方式运行（systemd ExecStart 指向 current/erp_agent.py）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from agentlib import config as config_module  # noqa: E402
+from agentlib import upgrade as upgrade_module  # noqa: E402
+from agentlib.constants import (  # noqa: E402
+    AGENT_VERSION,
+    CAPABILITIES,
+    EXECUTOR_VERSION,
+    HEARTBEAT_SECONDS,
+    JOB_LEASE_RENEW_SECONDS,
+    JOB_LEASE_SECONDS,
+    PROTOCOL_VERSION,
+    RESULT_REPORT_SECONDS,
+    TELEMETRY_SECONDS,
+)
+from agentlib.heartbeat import HeartbeatSender  # noqa: E402
+from agentlib.httpc import CenterClient, data_of  # noqa: E402
+from agentlib.jobs import JobRunner  # noqa: E402
+from agentlib.journal import Journal  # noqa: E402
+from agentlib.telemetry import (  # noqa: E402
+    TelemetryCache,
+    TelemetryReporter,
+    collect,
+    detect_app_version,
+)
+
+import executor as executor_module  # noqa: E402  （受限执行器，版本目录内同目录导入）
+
+LOGGER = logging.getLogger("erp-agent")
+_STOP = threading.Event()
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _read(path: str) -> str:
-    try:
-        return Path(path).read_text(encoding="utf-8")
-    except OSError:
-        return ""
-
-
-def _meminfo() -> dict[str, int]:
-    result: dict[str, int] = {}
-    for line in _read("/proc/meminfo").splitlines():
-        key, _, rest = line.partition(":")
-        value = rest.strip().split(" ")[0] if rest.strip() else "0"
-        if value.isdigit():
-            result[key] = int(value) * 1024
-    return result
-
-
-def _cpu_percent(interval: float = 0.4) -> float:
-    def snapshot() -> tuple[int, int]:
-        line = _read("/proc/stat").splitlines()[0] if _read("/proc/stat") else ""
-        parts = [int(item) for item in line.split()[1:] if item.isdigit()]
-        idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
-        total = sum(parts)
-        return total, idle
-
-    total1, idle1 = snapshot()
-    time.sleep(interval)
-    total2, idle2 = snapshot()
-    total_delta = total2 - total1
-    idle_delta = idle2 - idle1
-    if total_delta <= 0:
-        return 0.0
-    return round(max(0.0, min(100.0, (1 - idle_delta / total_delta) * 100)), 2)
-
-
-def _load() -> tuple[float, float, float]:
-    try:
-        one, five, fifteen = os.getloadavg()
-        return round(one, 2), round(five, 2), round(fifteen, 2)
-    except OSError:
-        return 0.0, 0.0, 0.0
-
-
-def _internal_ips() -> list[str]:
-    ips: list[str] = []
-    try:
-        for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ip = item[4][0]
-            if ip not in ips and not ip.startswith("127."):
-                ips.append(ip)
-    except OSError:
-        pass
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.connect(("8.8.8.8", 80))
-        ip = sock.getsockname()[0]
-        sock.close()
-        if ip not in ips and not ip.startswith("127."):
-            ips.append(ip)
-    except OSError:
-        pass
-    return ips
-
-
-def _public_ip() -> str:
-    try:
-        with urllib.request.urlopen("https://api.ipify.org", timeout=4) as response:
-            value = response.read().decode("utf-8").strip()
-            return value if len(value) <= 64 else ""
-    except Exception:  # noqa: BLE001 - 公网 IP 获取失败不应影响指标上报
-        return ""
-
-
-def _disk() -> list[dict[str, Any]]:
-    disks: list[dict[str, Any]] = []
-    mounts = [("/", "根分区")]
-    for line in _read("/proc/mounts").splitlines():
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        device, mount, fstype = parts[0], parts[1], parts[2]
-        if not device.startswith("/dev/") or fstype in {"tmpfs", "devtmpfs", "overlay", "squashfs"}:
-            continue
-        if mount in {"/boot", "/boot/efi"} and mount not in {item[0] for item in mounts}:
-            mounts.append((mount, "启动分区"))
-    for mount, label in mounts:
-        try:
-            stat = os.statvfs(mount)
-            total = stat.f_frsize * stat.f_blocks
-            free = stat.f_bavail * stat.f_frsize
-            used = total - free
-            percent = round(used / total * 100, 2) if total else 0
-            disks.append(
-                {
-                    "mount": mount,
-                    "label": label,
-                    "total_gb": round(total / 1024**3, 1),
-                    "used_gb": round(used / 1024**3, 1),
-                    "free_gb": round(free / 1024**3, 1),
-                    "percent": percent,
-                    "inodes_percent": round(
-                        (stat.f_files - stat.f_favail) / stat.f_files * 100, 2
-                    )
-                    if stat.f_files
-                    else 0,
-                }
-            )
-        except OSError:
-            continue
-    return disks
-
-
-def _network() -> dict[str, Any]:
-    rx = tx = 0
-    for line in _read("/proc/net/dev").splitlines()[2:]:
-        if ":" not in line:
-            continue
-        _, data = line.split(":", 1)
-        fields = data.split()
-        if len(fields) >= 9:
-            rx += int(fields[0])
-            tx += int(fields[8])
-    return {"rx_bytes": rx, "tx_bytes": tx}
-
-
-def _docker_services() -> dict[str, Any]:
-    if not shutil.which("docker"):
-        return {"available": False, "containers": []}
-    try:
-        result = subprocess.run(
-            ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.State}}\t{{.Status}}"],
-            capture_output=True,
-            text=True,
-            timeout=8,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return {"available": False, "containers": []}
-    containers: list[dict[str, str]] = []
-    for line in result.stdout.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 3:
-            continue
-        health = "healthy" if "(healthy)" in parts[2] else (
-            "unhealthy" if "(unhealthy)" in parts[2] else ""
-        )
-        containers.append(
-            {"name": parts[0], "state": parts[1], "status": parts[2], "health": health}
-        )
-    return {"available": True, "containers": containers}
-
-
-def detect_app_version(config: dict[str, Any] | None = None) -> str:
-    """优先环境变量，否则读取部署目录 .env 的 APP_IMAGE_TAG。"""
-    value = os.environ.get("ERP_APP_VERSION", "").strip()
-    if value:
-        return value
-    deploy_dir = Path(str((config or {}).get("deploy_dir") or "/opt/ventasync/deploy"))
-    try:
-        for line in (deploy_dir / ".env").read_text(encoding="utf-8").splitlines():
-            if line.startswith("APP_IMAGE_TAG="):
-                return line.split("=", 1)[1].strip()
-    except OSError:
-        pass
-    return ""
-
-
-def collect(previous_network: dict[str, Any] | None = None) -> dict[str, Any]:
-    mem = _meminfo()
-    total = mem.get("MemTotal", 0)
-    available = mem.get("MemAvailable", mem.get("MemFree", 0))
-    used = max(0, total - available)
-    swap_total = mem.get("SwapTotal", 0)
-    swap_free = mem.get("SwapFree", 0)
-    load1, load5, load15 = _load()
-    network = _network()
-    net_rate: dict[str, Any] = {}
-    if previous_network:
-        net_rate = {
-            "rx_bytes_per_sec": max(
-                0, network["rx_bytes"] - int(previous_network.get("rx_bytes", 0))
-            )
-            // REPORT_SECONDS,
-            "tx_bytes_per_sec": max(
-                0, network["tx_bytes"] - int(previous_network.get("tx_bytes", 0))
-            )
-            // REPORT_SECONDS,
-        }
-    network.update(net_rate)
-    return {
-        "sampled_at": utc_now(),
-        "hostname": socket.gethostname()[:255],
-        "os_name": platform.platform()[:100],
-        "arch": platform.machine()[:32],
-        "cpu_cores": os.cpu_count() or 0,
-        "memory_total_mb": total // 1024**2,
-        "disk_total_gb": int(sum(item["total_gb"] for item in _disk())),
-        "internal_ips": _internal_ips(),
-        "public_ip": _public_ip(),
-        "agent_version": AGENT_VERSION,
-        "app_version": os.environ.get("ERP_APP_VERSION", ""),
-        "cpu_percent": _cpu_percent(),
-        "load1": load1,
-        "load5": load5,
-        "load15": load15,
-        "memory_used_mb": used // 1024**2,
-        "memory_available_mb": available // 1024**2,
-        "memory_percent": round(used / total * 100, 2) if total else 0,
-        "swap_total_mb": swap_total // 1024**2,
-        "swap_used_mb": (swap_total - swap_free) // 1024**2,
-        "disks": _disk(),
-        "network": network,
-        "services": {"docker": _docker_services()},
-    }
-
-
-def http_json(url: str, payload: dict[str, Any] | None, token: str = "", timeout: int = 10) -> dict[str, Any]:
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-    request = urllib.request.Request(url, data=data, method="POST" if data else "GET")
-    request.add_header("Content-Type", "application/json")
-    request.add_header("User-Agent", f"erp-agent/{AGENT_VERSION}")
-    if token:
-        request.add_header("Authorization", f"Bearer {token}")
-    context = ssl.create_default_context()
-    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
+# --------------------------------------------------------------------------- 兼容旧接口
 def load_config(path: str) -> dict[str, Any]:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    """兼容旧版调用：读取配置（补齐默认值）。"""
+    return config_module.load_config(path)
 
 
 def save_config(path: str, config: dict[str, Any]) -> None:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-    try:
-        os.chmod(target, 0o600)
-    except OSError:
-        pass
+    """兼容旧版调用：原子保存配置（0600）。"""
+    config_module.save_config(path, config)
 
 
-def enroll(args: argparse.Namespace) -> int:
-    base = args.center.rstrip("/")
-    metrics = collect()
+def http_json(url: str, payload: dict[str, Any] | None, token: str = "", timeout: int = 10) -> dict:
+    """兼容旧版调用：单次 JSON 请求（内部改用 CenterClient）。"""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    base = f"{parts.scheme}://{parts.netloc}" if parts.scheme else url.rsplit("/api/v1", 1)[0]
+    client = CenterClient(base, token, timeout=timeout)
+    path = parts.path or "/"
+    if payload is None:
+        return client.get(path)
+    return client.post(path, payload)
+
+
+# --------------------------------------------------------------------------- 工具
+def setup_logging(verbose: bool = False) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        stream=sys.stdout,
+    )
+
+
+def log(message: str) -> None:
+    LOGGER.info(message)
+
+
+def build_client(config: dict[str, Any]) -> CenterClient:
+    return CenterClient(
+        config_module.center_url(config),
+        config_module.node_token(config),
+        logger=log,
+    )
+
+
+def open_journal(config: dict[str, Any]) -> Journal:
+    config_module.ensure_state_dir(config)
+    return Journal(
+        config_module.journal_path(config),
+        lease_seconds=int(config.get("job_lease_seconds") or JOB_LEASE_SECONDS),
+    )
+
+
+def _install_signal_handlers() -> None:
+    def handler(signum: int, _frame: Any) -> None:
+        log(f"收到信号 {signum}，准备退出")
+        _STOP.set()
+
+    for sig_name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):  # pragma: no cover - 非主线程安装信号
+                pass
+
+
+def _config_view(config: dict[str, Any]) -> dict[str, Any]:
+    """打印/上报用配置视图：绝不输出节点令牌明文。"""
+    view = {
+        key: value
+        for key, value in config.items()
+        if key not in {"node_token", "node_uuid"}
+    }
+    token = str(config.get("node_token") or "")
+    view["node_token"] = f"***{token[-4:]}" if token else ""
+    view["node_uuid"] = str(config.get("node_uuid") or "")
+    return view
+
+
+# --------------------------------------------------------------------------- enroll
+def cmd_enroll(args: argparse.Namespace) -> int:
+    base = str(args.center).rstrip("/")
+    client = CenterClient(base, "", logger=log)
+    metrics = collect(config=None)
     payload = {
         "token": args.token,
         "hostname": metrics["hostname"],
@@ -296,134 +172,404 @@ def enroll(args: argparse.Namespace) -> int:
         "public_ip": metrics["public_ip"],
         "agent_version": AGENT_VERSION,
         "app_version": metrics["app_version"],
-        "metadata": {"instance_id": args.instance, "python": platform.python_version()},
+        # Agent 2 新增：协议版本与能力，后端可据此判断是否下发变更任务
+        "agent_protocol_version": PROTOCOL_VERSION,
+        "executor_version": EXECUTOR_VERSION,
+        "capabilities": list(CAPABILITIES),
+        "metadata": {
+            "instance_id": args.instance,
+            "python": platform.python_version(),
+            "agent_version": AGENT_VERSION,
+            "protocol_version": PROTOCOL_VERSION,
+        },
     }
-    result = http_json(f"{base}/api/v1/agent/enroll", payload)
-    data = result.get("data") or {}
+    result = client.enroll(payload)
+    data = data_of(result)
     token = data.get("node_token")
     if not token:
-        print("注册失败：响应缺少 node_token", result)
+        print(f"注册失败：响应缺少 node_token：{json.dumps(result, ensure_ascii=False)[:500]}")
         return 1
-    save_config(
-        args.config,
+    existing = config_module.load_config(args.config)
+    existing.update(
         {
             "center": base,
             "node_id": data.get("node_id"),
             "node_uuid": data.get("node_uuid"),
             "node_token": token,
-            "instance_id": data.get("instance_id"),
-        },
+            "instance_id": data.get("instance_id") or args.instance,
+            "agent_version": AGENT_VERSION,
+            "protocol_version": PROTOCOL_VERSION,
+        }
     )
+    config_module.save_config(args.config, existing)
+    config_module.ensure_state_dir(existing)
     print(f"注册成功：node_id={data.get('node_id')} node_uuid={data.get('node_uuid')}")
-    print(f"配置已保存：{args.config}")
+    print(f"配置已保存：{args.config}（权限 600，Agent 升级不会修改该文件）")
     return 0
 
 
-def _cache_path(config_path: str) -> Path:
-    return Path(config_path).with_name("telemetry-cache.json")
+# --------------------------------------------------------------------------- 采集进程
+def cmd_run(args: argparse.Namespace) -> int:
+    config = config_module.load_config(args.config)
+    if not config_module.center_url(config):
+        print("配置缺少 center，请先执行 enroll", file=sys.stderr)
+        return 2
+    if str(args.role) == "executor":
+        return cmd_executor(args)
+    _install_signal_handlers()
+    client = build_client(config)
+    journal = open_journal(config)
+    cache = TelemetryCache(config_module.telemetry_cache_path(config))
+    boot_id = uuid.uuid4().hex
+    reporter = TelemetryReporter(client, cache, boot_id=boot_id, logger=log)
+    previous_network: dict[str, Any] | None = None
+    telemetry_seconds = int(config.get("telemetry_seconds") or TELEMETRY_SECONDS)
+    heartbeat_seconds = int(config.get("heartbeat_seconds") or HEARTBEAT_SECONDS)
+    report_seconds = int(config.get("result_report_seconds") or RESULT_REPORT_SECONDS)
 
-
-def _read_cache(config_path: str) -> list[dict[str, Any]]:
-    try:
-        return json.loads(_cache_path(config_path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-
-
-def _write_cache(config_path: str, items: list[dict[str, Any]]) -> None:
-    try:
-        _cache_path(config_path).parent.mkdir(parents=True, exist_ok=True)
-        _cache_path(config_path).write_text(
-            json.dumps(items[-CACHE_LIMIT:], ensure_ascii=False), encoding="utf-8"
-        )
-    except OSError:
-        pass
-
-
-def poll_and_execute(config_path: str, base: str, token: str) -> None:
-    """领取一个运维任务并在本机受限执行。"""
-    from executor import execute  # 与 erp_agent.py 同目录
-
-    config = load_config(config_path)
-    result = http_json(f"{base}/api/v1/agent/jobs/poll", {}, token=token)
-    job = (result.get("data") or {}).get("job")
-    if not job:
-        return
-
-    def report(step_no: int, step_name: str, status: str, message: str) -> None:
-        http_json(
-            f"{base}/api/v1/agent/jobs/{job['id']}/events",
-            {
-                "status": "running",
-                "step_no": step_no,
-                "step_name": step_name,
-                "step_status": status,
-                "message": (message or "")[:950],
-            },
-            token=token,
-        )
-
-    outcome = execute(job, config, report)
-    final_status = "succeeded" if outcome.get("ok") else "failed"
-    http_json(
-        f"{base}/api/v1/agent/jobs/{job['id']}/events",
-        {
-            "status": final_status,
-            "result": {k: v for k, v in outcome.items() if k != "output"},
-            "error": "" if outcome.get("ok") else str(outcome.get("error") or outcome.get("exit_code") or "执行失败")[:500],
+    result_reporter = JobRunner(client, journal, config, executor=lambda *a, **k: {}, logger=log)
+    heartbeat = HeartbeatSender(
+        client,
+        role="collector",
+        config=config,
+        boot_id=boot_id,
+        state_provider=lambda: {
+            "telemetry": {"queued": reporter.queued},
+            "executor": result_reporter.status(),
+            "journal": journal.status_summary()["counts"],
+            "agent_protocol_version": PROTOCOL_VERSION,
         },
-        token=token,
+        logger=log,
+        interval=heartbeat_seconds,
+    )
+    heartbeat_thread = threading.Thread(
+        target=heartbeat.run_forever,
+        args=(_STOP,),
+        name="agent-heartbeat",
+        daemon=True,
     )
 
-
-def run(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
-    base = str(config["center"]).rstrip("/")
-    token = str(config["node_token"])
-    previous_network: dict[str, Any] | None = None
-    print(f"Agent 启动：center={base} node_id={config.get('node_id')}")
-    while True:
+    def replay_results() -> None:
         try:
-            payload = collect(previous_network)
+            summary = result_reporter.flush_results()
+            if summary.get("sent") or summary.get("failed"):
+                log(f"结果补报：{summary}")
+        except Exception as exc:  # noqa: BLE001 - 补报失败不影响采集
+            log(f"结果补报异常：{exc}")
+
+    def report_thread() -> None:
+        while not _STOP.wait(max(5, report_seconds)):
+            replay_results()
+
+    log(
+        f"Agent {AGENT_VERSION} 采集进程启动：center={config_module.center_url(config)} "
+        f"node_id={config.get('node_id')} 采集间隔={telemetry_seconds}s"
+    )
+    heartbeat_thread.start()
+    threading.Thread(target=report_thread, name="result-reporter", daemon=True).start()
+    if str(args.role) == "all":
+        executor_thread = threading.Thread(
+            target=_executor_loop, args=(config,), name="executor-inline", daemon=True
+        )
+        executor_thread.start()
+
+    while not _STOP.is_set():
+        tick_started = time.monotonic()
+        try:
+            payload = collect(previous_network, config=config, report_seconds=telemetry_seconds)
             payload["app_version"] = detect_app_version(config)
+            payload["agent_protocol_version"] = PROTOCOL_VERSION
+            payload["executor_version"] = EXECUTOR_VERSION
             previous_network = payload["network"]
-            cache = _read_cache(args.config)
-            cache.append(payload)
-            _write_cache(args.config, cache)
-            remaining: list[dict[str, Any]] = []
-            for item in cache:
-                try:
-                    http_json(f"{base}/api/v1/agent/telemetry", item, token=token)
-                except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-                    print(f"上报失败，保留本地缓存：{exc}")
-                    remaining.append(item)
-            _write_cache(args.config, remaining)
-        except Exception as exc:  # noqa: BLE001 - 采集循环不能因单次异常退出
-            print(f"采集异常：{exc}")
-        try:
-            poll_and_execute(args.config, base, token)
-        except Exception as exc:  # noqa: BLE001 - 任务失败不影响指标采集
-            print(f"任务轮询异常：{exc}")
+            reporter.enqueue(payload)
+            flush_summary = reporter.flush()
+            if flush_summary.get("sent") or flush_summary.get("invalid"):
+                log(
+                    f"指标上报成功：{flush_summary['sent']} 条，"
+                    f"无效丢弃 {flush_summary['invalid']} 条，待补报 {flush_summary['pending']} 条"
+                )
+        except Exception as exc:  # noqa: BLE001 - 采集循环不因单次异常退出
+            log(f"采集异常：{exc}")
         if args.once:
+            replay_results()
+            heartbeat.send_once()
             return 0
-        time.sleep(REPORT_SECONDS)
+        elapsed = time.monotonic() - tick_started
+        _STOP.wait(max(1.0, telemetry_seconds - elapsed))
+    journal.close()
+    log("采集进程退出")
+    return 0
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="ERP 租户服务器采集 Agent")
+# --------------------------------------------------------------------------- 执行进程
+def _executor_loop(config: dict[str, Any]) -> int:
+    client = build_client(config)
+    journal = open_journal(config)
+    runner = executor_module.Executor()
+    job_runner = JobRunner(
+        client,
+        journal,
+        config,
+        executor=runner.execute,
+        logger=log,
+        lease_seconds=int(config.get("job_lease_seconds") or JOB_LEASE_SECONDS),
+        renew_seconds=int(config.get("job_lease_renew_seconds") or JOB_LEASE_RENEW_SECONDS),
+    )
+    recovered = job_runner.recover_on_start()
+    if recovered:
+        log(f"启动恢复：task_id={recovered.get('task_id')} 已标记 unknown，等待人工核对")
+    poll_seconds = int(config.get("job_poll_seconds") or 5)
+    log(
+        f"Agent {AGENT_VERSION} 执行进程启动：protocol={PROTOCOL_VERSION} "
+        f"租约={job_runner.lease_seconds}s 续租={job_runner.renew_seconds}s"
+    )
+    job_runner.run_loop(_STOP, poll_seconds=poll_seconds)
+    journal.close()
+    return 0
+
+
+def cmd_executor(args: argparse.Namespace) -> int:
+    config = config_module.load_config(args.config)
+    if not config_module.center_url(config):
+        print("配置缺少 center，请先执行 enroll", file=sys.stderr)
+        return 2
+    _install_signal_handlers()
+    if args.once:
+        client = build_client(config)
+        journal = open_journal(config)
+        runner = executor_module.Executor()
+        job_runner = JobRunner(
+            client,
+            journal,
+            config,
+            executor=runner.execute,
+            logger=log,
+            lease_seconds=int(config.get("job_lease_seconds") or JOB_LEASE_SECONDS),
+            renew_seconds=int(config.get("job_lease_renew_seconds") or JOB_LEASE_RENEW_SECONDS),
+        )
+        job_runner.recover_on_start()
+        result = job_runner.run_once()
+        print(json.dumps(result, ensure_ascii=False, default=str))
+        journal.close()
+        return 0 if result.get("status") not in {"blocked_unknown", "error"} else 1
+    return _executor_loop(config)
+
+
+# --------------------------------------------------------------------------- 运维命令
+def cmd_heartbeat(args: argparse.Namespace) -> int:
+    config = config_module.load_config(args.config)
+    client = build_client(config)
+    journal = open_journal(config)
+    sender = HeartbeatSender(
+        client,
+        role=str(args.role),
+        config=config,
+        boot_id=uuid.uuid4().hex,
+        state_provider=lambda: {
+            "executor": JobRunner(
+                client, journal, config, executor=lambda *a, **k: {}, logger=log
+            ).status(),
+            "journal": journal.status_summary()["counts"],
+        },
+        logger=log,
+    )
+    result = sender.send_once()
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    journal.close()
+    return 0 if result.get("ok") else 1
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    config = config_module.load_config(args.config)
+    journal = open_journal(config)
+    summary = journal.status_summary()
+    journal.close()
+    output = {
+        "agent_version": AGENT_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "config": _config_view(config),
+        "journal": summary,
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    config = config_module.load_config(args.config)
+    journal = open_journal(config)
+    client = build_client(config)
+    job_runner = JobRunner(client, journal, config, executor=lambda *a, **k: {}, logger=log)
+    target: dict[str, Any] | None
+    if args.job_id:
+        target = journal.get_lease(str(args.job_id))
+    else:
+        target = journal.active_lease()
+    if target is None:
+        print("没有需要核对的 active/unknown 任务")
+        journal.close()
+        return 0
+    if str(target.get("phase")) != "unknown" and not args.force:
+        print(
+            f"任务 {target.get('task_id')} 当前阶段为 {target.get('phase')}，"
+            "只有 unknown 任务需要核对（--force 可强制解除占用）"
+        )
+        journal.close()
+        return 2
+
+    # 先与服务端核对：服务端若已确认终态，以服务端为准并直接解除占用
+    remote = job_runner.reconcile_remote(
+        target, local_status=str(args.status or "unknown"), note=str(args.note or "")
+    )
+    remote_action = str((remote or {}).get("action") or "")
+    remote_status = str((remote or {}).get("server_status") or "")
+    if remote_action in {"marked_succeeded", "marked_failed", "already_terminal"} and remote_status in {
+        "succeeded",
+        "failed",
+    }:
+        journal.override_result(
+            task_id=str(target["task_id"]),
+            status=remote_status,
+            error=str(args.note or "与服务端核对后确认的终态"),
+        )
+        journal.update_lease(
+            task_id=str(target["task_id"]),
+            attempt_id=str(target["attempt_id"]),
+            phase=remote_status,
+        )
+        if args.report:
+            job_runner.flush_results(force=True)
+        journal.close()
+        print(
+            json.dumps(
+                {
+                    "reconciled": True,
+                    "source": "server",
+                    "action": remote_action,
+                    "server_status": remote_status,
+                    "remote": remote,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        return 0
+
+    if args.status:
+        journal.override_result(
+            task_id=str(target["task_id"]),
+            status=str(args.status),
+            error=str(args.note or "人工核对"),
+        )
+    lease = journal.reconcile(task_id=str(target["task_id"]), note=str(args.note or ""))
+    if args.report:
+        job_runner.flush_results(force=True)
+    journal.close()
+    print(
+        json.dumps(
+            {"reconciled": True, "source": "local", "lease": lease, "remote": remote},
+            ensure_ascii=False,
+            default=str,
+        )
+    )
+    return 0
+
+
+def cmd_self_upgrade(args: argparse.Namespace) -> int:
+    config = config_module.load_config(args.config)
+    root = config_module.agent_root(config)
+    units = [str(item) for item in config_module.units(config)]
+    runner = executor_module.SubprocessCommandRunner()
+    result = upgrade_module.self_upgrade(
+        agent_root=root,
+        source=args.source,
+        version=args.version,
+        commit=args.commit or "",
+        config_path=args.config,
+        units=units,
+        runner=runner,
+        restart=not args.no_restart,
+        dry_run=args.dry_run,
+        logger=log,
+    )
+    print(json.dumps(result.as_dict(), ensure_ascii=False, indent=2))
+    return 0 if result.ok else 1
+
+
+def cmd_selftest(_args: argparse.Namespace) -> int:
+    from agentlib.selftest import run_selftest
+
+    return run_selftest()
+
+
+# --------------------------------------------------------------------------- CLI
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="ERP 租户服务器 Agent（Agent 2）")
     sub = parser.add_subparsers(dest="command", required=True)
-    enroll_parser = sub.add_parser("enroll", help="使用一次性令牌注册")
-    enroll_parser.add_argument("--center", required=True, help="管理中心地址，如 https://erp.example.com")
-    enroll_parser.add_argument("--token", required=True, help="后台生成的一次性接入令牌")
-    enroll_parser.add_argument("--instance", type=int, default=0, help="实例ID（仅记录用）")
-    enroll_parser.add_argument("--config", default=DEFAULT_CONFIG)
-    enroll_parser.set_defaults(func=enroll)
-    run_parser = sub.add_parser("run", help="启动周期上报")
-    run_parser.add_argument("--config", default=DEFAULT_CONFIG)
-    run_parser.add_argument("--once", action="store_true", help="只采集上报一次后退出")
-    run_parser.set_defaults(func=run)
-    args = parser.parse_args()
-    return args.func(args)
+
+    enroll = sub.add_parser("enroll", help="使用一次性令牌注册节点")
+    enroll.add_argument("--center", required=True, help="管理中心地址，如 https://erp.example.com")
+    enroll.add_argument("--token", required=True, help="后台生成的一次性接入令牌")
+    enroll.add_argument("--instance", type=int, default=0, help="实例ID（仅记录用）")
+    enroll.add_argument("--config", default="/etc/erp-agent/config.json")
+    enroll.set_defaults(func=cmd_enroll)
+
+    run = sub.add_parser("run", help="采集进程：指标 + 心跳 + 缓存/结果补报")
+    run.add_argument("--config", default="/etc/erp-agent/config.json")
+    run.add_argument("--once", action="store_true", help="只采集/补报一次后退出")
+    run.add_argument(
+        "--role",
+        choices=["collector", "executor", "all"],
+        default="collector",
+        help="collector=仅采集（默认）；executor=仅执行；all=同进程（旧部署兼容）",
+    )
+    run.set_defaults(func=cmd_run)
+
+    executor_cmd = sub.add_parser("executor", help="执行进程：租约任务执行与结果落库")
+    executor_cmd.add_argument("--config", default="/etc/erp-agent/config.json")
+    executor_cmd.add_argument("--once", action="store_true", help="只轮询/执行一次后退出")
+    executor_cmd.set_defaults(func=cmd_executor)
+
+    heartbeat = sub.add_parser("heartbeat", help="发送一次 Agent 心跳（排障用）")
+    heartbeat.add_argument("--config", default="/etc/erp-agent/config.json")
+    heartbeat.add_argument("--role", default="collector")
+    heartbeat.set_defaults(func=cmd_heartbeat)
+
+    status = sub.add_parser("status", help="查看本地执行日志与占用状态")
+    status.add_argument("--config", default="/etc/erp-agent/config.json")
+    status.set_defaults(func=cmd_status)
+
+    reconcile = sub.add_parser("reconcile", help="人工核对 unknown 任务，解除实例占用")
+    reconcile.add_argument("--config", default="/etc/erp-agent/config.json")
+    reconcile.add_argument("--job-id", default="", help="任务ID（默认取当前活动租约）")
+    reconcile.add_argument("--status", choices=["succeeded", "failed", "unknown"], default="", help="核对后上报的终态")
+    reconcile.add_argument("--note", default="", help="核对说明（写入本地日志与结果）")
+    reconcile.add_argument("--force", action="store_true", help="即使不是 unknown 也强制解除占用")
+    reconcile.add_argument("--no-report", dest="report", action="store_false", help="不立即上报结果")
+    reconcile.set_defaults(func=cmd_reconcile, report=True)
+
+    upgrade = sub.add_parser("self-upgrade", help="Agent 自身升级（独立版本目录 + 重启验证）")
+    upgrade.add_argument("--config", default="/etc/erp-agent/config.json")
+    upgrade.add_argument("--source", required=True, help="Agent 源码目录或 tar.gz 离线包")
+    upgrade.add_argument("--version", required=True, help="目标 Agent 版本（如 2.1.0）")
+    upgrade.add_argument("--commit", default="", help="目标完整 commit（可选，40/64 位）")
+    upgrade.add_argument("--no-restart", action="store_true", help="只切版本不重启（调试用）")
+    upgrade.add_argument("--dry-run", action="store_true", help="只校验与暂存，不切链不重启")
+    upgrade.set_defaults(func=cmd_self_upgrade)
+
+    selftest = sub.add_parser("selftest", help="运行离线自测（不依赖真实服务器）")
+    selftest.set_defaults(func=cmd_selftest)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    setup_logging(verbose=bool(getattr(args, "verbose", False)))
+    try:
+        return int(args.func(args))
+    except KeyboardInterrupt:  # pragma: no cover - 交互中断
+        log("收到中断信号")
+        return 130
 
 
 if __name__ == "__main__":

@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     api_prefix: str = "/api/v1"
     # 部署形态：center=统一管理中心，tenant=租户独立实例，gateway=独立集成网关
     deployment_mode: Literal["center", "tenant", "gateway"] = "center"
+    # 固定实例绑定：tenant 模式下本实例只服务这一租户；center 模式为 0（不固定）
+    # 请求路径/查询参数/请求体中的 tenant_id 必须与之一致，否则 403
+    tenant_id: int = 0
+    # 本实例在中心库登记的实例ID（tenant 模式用于任务绑定与自检；0 表示未配置）
+    instance_id: int = 0
     debug: bool = False
     log_level: str = "INFO"
     # 前端站点源，用于 Cookie 会话的请求来源校验

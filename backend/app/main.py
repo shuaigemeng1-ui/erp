@@ -20,6 +20,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response
 
+from app.api.mode_guard import ModeBoundaryMiddleware
 from app.api.router import api_router
 from app.core.auth import (
     UNSAFE_METHODS,
@@ -123,6 +124,10 @@ def create_app() -> FastAPI:
     )
 
     application.add_middleware(RequestContextMiddleware)
+    # 部署形态边界：tenant 模式在 ASGI 层统一拒绝平台 / Agent 专属路径（含 WebSocket），
+    # 返回 404 不暴露平台功能；健康检查、认证与租户业务接口放行。
+    # 最后添加 => 位于用户中间件最外层，WebSocket 握手阶段即可拒绝，且不被异常处理绕过。
+    application.add_middleware(ModeBoundaryMiddleware)
     # 只允许通过正式域名访问；未配置 TRUSTED_HOSTS 时不限制（本地开发/测试）
     allowed_hosts = settings.allowed_hosts
     if allowed_hosts:

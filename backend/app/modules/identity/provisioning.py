@@ -368,6 +368,8 @@ def provision_tenant(center: Session, tenant_id: int, *, operator_user_id: int |
         raise AppError(ErrorCode.UNSUPPORTED_ACTION, "租户已暂停，不能重试开通")
     if tenant.status == TenantStatus.ACTIVE.value:
         raise AppError(ErrorCode.UNSUPPORTED_ACTION, "租户已开通，无需重复执行")
+    # 批次2：已独立部署 / 迁移中的实例不再由旧中心重新开通
+    ensure_instance_allows_center_write(center, tenant_id, action="重新开通")
 
     owner_email = ""
     if tenant.owner_user_id:
@@ -945,6 +947,24 @@ _STEP_HANDLERS: dict[ProvisioningStep, Callable[[_ProvisionContext], None]] = {
 
 
 # --------------------------------------------------------------------------- 平台辅助
+def ensure_instance_allows_center_write(center: Session, tenant_id: int, *, action: str) -> None:
+    """批次2：已独立部署 / 迁移中的租户只能走迁移流程，不能用普通启用/开通恢复写入。
+
+    ``deployment_mode=independent`` 或 ``migration_status in (migrating, migrated, rollback)``
+    时抛 409 CONFLICT；避免旧中心把已迁出实例重新激活造成双写。
+    """
+    try:
+        from app.modules.ops import service as ops_service
+    except Exception:  # noqa: BLE001 - 运维模块未加载时保持旧行为（中心模式恒定可用）
+        logger.warning("ops.service 不可用，跳过实例迁移状态校验 tenant=%s", tenant_id)
+        return
+    if ops_service.tenant_scheduling_blocked(center, tenant_id):
+        raise AppError(
+            ErrorCode.CONFLICT,
+            f"租户实例已独立部署或处于迁移状态，不能用普通「{action}」恢复写入，请通过迁移流程操作",
+        )
+
+
 def suspend_tenant(center: Session, *, tenant_id: int, reason: str, operator_user_id: int | None = None) -> Tenant:
     """暂停租户：禁止租户业务访问与主动同步；已验签回调可暂存但不改库存。"""
     tenant = repo.get_tenant(center, tenant_id)
@@ -972,6 +992,8 @@ def activate_tenant(center: Session, *, tenant_id: int, operator_user_id: int | 
         return tenant
     if tenant.status != TenantStatus.SUSPENDED.value:
         raise AppError(ErrorCode.UNSUPPORTED_ACTION, "只有已暂停的租户可以重新启用")
+    # 批次2：已独立部署 / 迁移中的实例不能通过普通启用恢复写入
+    ensure_instance_allows_center_write(center, tenant_id, action="启用租户")
     database = repo.get_tenant_database(center, tenant_id)
     if database is None or database.status != TENANT_DATABASE_READY:
         raise AppError(ErrorCode.TENANT_DATABASE_UNAVAILABLE, "租户数据库不可用，无法启用")

@@ -29,9 +29,19 @@ def list_instances(
     pagination: PageParams = Depends(),
     q: str = Query(default="", max_length=100),
     status: str = Query(default="", max_length=32),
+    deployment_mode: str = Query(default="", max_length=16, description="部署模式过滤：shared/independent"),
+    migration_status: str = Query(
+        default="", max_length=16, description="迁移状态过滤：registered/migrating/migrated/rollback"
+    ),
 ) -> dict:
     data = service.list_instances(
-        center, page=pagination.page, page_size=pagination.page_size, q=q, status=status
+        center,
+        page=pagination.page,
+        page_size=pagination.page_size,
+        q=q,
+        status=status,
+        deployment_mode=deployment_mode,
+        migration_status=migration_status,
     )
     return paged(data["items"], data["total"], data["page"], data["page_size"])
 

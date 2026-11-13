@@ -59,6 +59,8 @@ class InstanceUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100)
     domain: str | None = Field(default=None, min_length=3, max_length=255)
     status: Literal["pending", "active", "suspended"] | None = None
+    deployment_mode: Literal["shared", "independent"] | None = None
+    migration_status: Literal["registered", "migrating", "migrated", "rollback"] | None = None
     app_version: str | None = Field(default=None, max_length=64)
     notes: str | None = Field(default=None, max_length=500)
 

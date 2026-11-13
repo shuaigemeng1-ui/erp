@@ -41,6 +41,16 @@ UPGRADE_JOB_TYPES = ("deploy", "upgrade")
 # 升级校验项：数据库版本 / 服务就绪 / 业务只读
 UPGRADE_CHECK_NAMES = ("db_version", "readiness", "business_readonly")
 
+# 实例部署模式与迁移状态（批次2：实例隔离与租户模式边界）
+INSTANCE_DEPLOYMENT_MODES = ("shared", "independent")
+INSTANCE_MIGRATION_STATUSES = ("registered", "migrating", "migrated", "rollback")
+# 已独立部署 / 迁移中 / 已迁出 / 回滚中：不再参与旧中心调度，也不能普通启用恢复写入
+BLOCKED_DEPLOYMENT_MODES = frozenset({"independent"})
+BLOCKED_MIGRATION_STATUSES = frozenset({"migrating", "migrated", "rollback"})
+MIGRATION_WRITE_BLOCKED_MESSAGE = (
+    "该租户实例已独立部署或处于迁移状态，请通过迁移流程操作，不能用普通启用恢复写入"
+)
+
 ALERT_CPU = "cpu_high"
 ALERT_MEMORY = "memory_high"
 ALERT_DISK = "disk_high"
@@ -289,6 +299,9 @@ def instance_payload(center, instance: TenantInstance, tenant_name: str = "") ->
         "domain": instance.domain,
         "environment": instance.environment,
         "status": instance.status,
+        "deployment_mode": normalize_deployment_mode(instance.deployment_mode),
+        "migration_status": normalize_migration_status(instance.migration_status),
+        "write_blocked": instance_write_blocked(instance),
         "app_version": app_version,
         "actual_version": actual_version,
         "target_version": instance.target_version or "",
@@ -305,6 +318,42 @@ def instance_payload(center, instance: TenantInstance, tenant_name: str = "") ->
     }
 
 
+def normalize_deployment_mode(value: str | None) -> str:
+    normalized = (value or "").strip().lower()
+    return normalized if normalized in INSTANCE_DEPLOYMENT_MODES else "shared"
+
+
+def normalize_migration_status(value: str | None) -> str:
+    normalized = (value or "").strip().lower()
+    return normalized if normalized in INSTANCE_MIGRATION_STATUSES else "registered"
+
+
+def instance_write_blocked(instance: TenantInstance | None) -> bool:
+    """实例是否禁止普通写入：独立部署 / 迁移中 / 已迁出 / 回滚中。"""
+    if instance is None:
+        return False
+    mode = normalize_deployment_mode(instance.deployment_mode)
+    migration = normalize_migration_status(instance.migration_status)
+    return mode in BLOCKED_DEPLOYMENT_MODES or migration in BLOCKED_MIGRATION_STATUSES
+
+
+def get_instance_by_tenant(center, tenant_id: int) -> TenantInstance | None:
+    return center.execute(
+        select(TenantInstance).where(TenantInstance.tenant_id == int(tenant_id))
+    ).scalar_one_or_none()
+
+
+def tenant_scheduling_blocked(center, tenant_id: int) -> bool:
+    """租户是否应停止旧中心调度（迁移中 / 已迁出 / 独立部署）。"""
+    return instance_write_blocked(get_instance_by_tenant(center, tenant_id))
+
+
+def ensure_tenant_writable(center, tenant_id: int) -> None:
+    """租户处于迁移流程时拒绝普通启用 / 重新开通，只允许迁移流程操作。"""
+    if tenant_scheduling_blocked(center, tenant_id):
+        raise ConflictError(MIGRATION_WRITE_BLOCKED_MESSAGE)
+
+
 def list_instances(
     center,
     *,
@@ -312,6 +361,8 @@ def list_instances(
     page_size: int,
     q: str = "",
     status: str = "",
+    deployment_mode: str = "",
+    migration_status: str = "",
 ) -> dict[str, Any]:
     from app.modules.identity.models_center import Tenant
 
@@ -323,6 +374,14 @@ def list_instances(
         stmt = stmt.where(or_(TenantInstance.name.like(pattern), TenantInstance.domain.like(pattern)))
     if status:
         stmt = stmt.where(TenantInstance.status == status)
+    if deployment_mode:
+        stmt = stmt.where(
+            TenantInstance.deployment_mode == normalize_deployment_mode(deployment_mode)
+        )
+    if migration_status:
+        stmt = stmt.where(
+            TenantInstance.migration_status == normalize_migration_status(migration_status)
+        )
     total = int(center.execute(select(func.count()).select_from(stmt.subquery())).scalar_one())
     rows = center.execute(
         stmt.order_by(TenantInstance.id.desc())
@@ -405,7 +464,19 @@ def update_instance(
     if payload.name is not None and payload.name != row.name:
         row.name = payload.name
         changes.append("name")
+    if payload.deployment_mode is not None and payload.deployment_mode != normalize_deployment_mode(
+        row.deployment_mode
+    ):
+        row.deployment_mode = payload.deployment_mode
+        changes.append("deployment_mode")
+    if payload.migration_status is not None and payload.migration_status != normalize_migration_status(
+        row.migration_status
+    ):
+        row.migration_status = payload.migration_status
+        changes.append("migration_status")
     if payload.status is not None and payload.status != row.status:
+        if payload.status == "active" and instance_write_blocked(row):
+            raise ConflictError(MIGRATION_WRITE_BLOCKED_MESSAGE)
         row.status = payload.status
         changes.append("status")
     if payload.app_version is not None and payload.app_version != row.app_version:
@@ -424,7 +495,11 @@ def update_instance(
             resource_id=row.id,
             tenant_id=row.tenant_id,
             summary=f"更新租户实例：{row.name}",
-            payload={"fields": changes},
+            payload={
+                "fields": changes,
+                "deployment_mode": normalize_deployment_mode(row.deployment_mode),
+                "migration_status": normalize_migration_status(row.migration_status),
+            },
         )
     center.commit()
     return instance_payload(center, row)
@@ -1361,6 +1436,9 @@ def create_operation(center, instance_id: int, payload, *, actor_user_id: int) -
     from app.modules.platform.service import record_platform_audit
 
     instance = get_instance(center, instance_id)
+    # 迁移中 / 已迁出 / 独立部署的实例不再参与旧中心运维任务调度
+    if instance_write_blocked(instance):
+        raise ConflictError(MIGRATION_WRITE_BLOCKED_MESSAGE)
     node = center.execute(
         select(ServerNode).where(ServerNode.instance_id == instance.id).order_by(ServerNode.id.asc())
     ).scalars().first()

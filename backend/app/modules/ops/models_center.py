@@ -67,6 +67,20 @@ class TenantInstance(IdMixin, TimestampMixin, CenterBase):
         server_default="unknown",
         comment="升级状态：pending/building/maintenance/migrating/verifying/succeeded/failed/unknown",
     )
+    deployment_mode: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="shared",
+        server_default="shared",
+        comment="部署模式：shared=中心共享，independent=独立部署（已迁出中心）",
+    )
+    migration_status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="registered",
+        server_default="registered",
+        comment="迁移状态：registered=已登记，migrating=迁移中，migrated=已迁出，rollback=回滚",
+    )
     notes: Mapped[str] = mapped_column(
         String(500), nullable=False, default="", server_default="", comment="备注"
     )
@@ -152,6 +166,23 @@ class ServerNode(IdMixin, TimestampMixin, CenterBase):
     )
     ssh_password_cipher: Mapped[str] = mapped_column(
         String(2048), nullable=False, default="", server_default="", comment="SSH密码密文"
+    )
+    ssh_host_fingerprint: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+        default="",
+        server_default="",
+        comment="SSH主机公钥指纹（SHA256:xxxx；用于连接前校验主机身份）",
+    )
+    ssh_host_fingerprint_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, comment="主机指纹首次确认时间UTC"
+    )
+    ssh_fingerprint_algorithm: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="SHA256",
+        server_default="SHA256",
+        comment="主机指纹算法（当前固定SHA256，预留扩展）",
     )
 
 

@@ -224,9 +224,18 @@ class S3StorageClient:
         url = self.config.public_base_url.rstrip("/") + "/" + quote(full_key, safe="/-_.~")
         if len(url) > 2048:
             raise StorageProviderError("对象存储访问地址过长", code="InvalidConfiguration")
+        put_kwargs = {
+            "Bucket": self.config.bucket,
+            "Key": full_key,
+            "Body": data,
+            "ContentType": content_type,
+            "ContentLength": len(data),
+        }
+        # OBS 桶默认私有；商品图需要长期公开 URL，上传时显式设置对象 ACL。
+        if self.config.provider == "obs":
+            put_kwargs["ACL"] = "public-read"
         try:
-            self._client.put_object(Bucket=self.config.bucket, Key=full_key, Body=data,
-                                    ContentType=content_type, ContentLength=len(data))
+            self._client.put_object(**put_kwargs)
         except StorageProviderError:
             raise
         except Exception as exc:

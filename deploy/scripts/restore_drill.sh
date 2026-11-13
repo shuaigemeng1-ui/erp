@@ -69,6 +69,8 @@ PROJECT=""
 OVERRIDE_FILE=""
 CONFIG_JSON=""
 REPORT=""
+# 仅在「compose config 安全断言通过」后置 1；cleanup 用它决定是否允许执行 down -v
+SAFETY_VERIFIED=0
 
 log() { printf '[drill] %s\n' "$*"; }
 warn() { printf '[drill] 警告：%s\n' "$*" >&2; }
@@ -227,12 +229,18 @@ cleanup() {
         warn "项目名异常，跳过自动清理（请人工检查：${PROJECT:-<空>}）"
         return
     fi
+    if [[ "${SAFETY_VERIFIED}" -ne 1 ]]; then
+        warn "安全断言未通过，跳过自动 docker 清理（只删除临时目录；请人工核对 drill 资源：project=${PROJECT}）"
+        rm -rf "${WORK_DIR:-}" 2>/dev/null || true
+        return
+    fi
     if [[ "${KEEP}" -eq 1 ]]; then
         log "保留演练环境以便人工核查：project=${PROJECT} work=${WORK_DIR}"
         return
     fi
     log "清理 drill 项目与临时卷：${PROJECT}"
-    docker compose -p "${PROJECT}" \
+    # 再次固定 COMPOSE_PROJECT_NAME：避免 base compose 中 ${COMPOSE_PROJECT_NAME}_* 回退到主项目卷名
+    COMPOSE_PROJECT_NAME="${PROJECT}" docker compose -p "${PROJECT}" \
         -f "${COMPOSE_FILE}" -f "${COMPOSE_SERVER}" -f "${OVERRIDE_FILE}" down -v --remove-orphans \
         >/dev/null 2>&1 || true
     rm -rf "${WORK_DIR}"
@@ -327,6 +335,7 @@ fi
 if ! python3 "${SAFETY_CHECKER}" --project "${PROJECT}" --main-project "${MAIN_PROJECT}" --config "${CONFIG_JSON}"; then
     die "隔离安全断言失败：拒绝启动（不会影响主项目）"
 fi
+SAFETY_VERIFIED=1
 python3 - "${CONFIG_JSON}" "${PROJECT}" <<'PY'
 import json
 import sys

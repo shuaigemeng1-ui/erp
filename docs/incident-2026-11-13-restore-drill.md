@@ -69,8 +69,12 @@ Compose 的显式 `name:` **优先于** `docker compose -p <project>` 的项目�
    只做解密校验与 compose 安全断言，不执行任何 docker 启动/清理命令。
 5. **启动后再校验**：`docker inspect` 校验容器名含 drill 项目、mysql 所有挂载卷名以 drill 项目开头；
    不满足立即中止（不会对主项目执行 down/rm）。
-6. **清理保护**：只执行 `docker compose -p <drill> down -v`，且项目名必须匹配 `ventasync-drill-*`；
-   `--keep` 保留演练环境；任何异常路径都不会调用主项目的 down/up。dry-run 不执行 docker 清理。
+6. **清理保护**：只执行 `COMPOSE_PROJECT_NAME=<drill> docker compose -p <drill> down -v`，且：
+   * 仅在启动前安全断言通过（`SAFETY_VERIFIED=1`）后才允许 docker 清理；
+   * 项目名必须匹配 `ventasync-drill-*`；
+   * 清理时再次固定 `COMPOSE_PROJECT_NAME=<drill>`，防止 base compose 的 `${COMPOSE_PROJECT_NAME}_*`
+     在 down 时回退为主项目卷名；
+   * `--keep` 保留演练环境；任何异常路径都不会调用主项目的 down/up。dry-run 不执行 docker 清理。
 
 ### 4.2 新增 `deploy/scripts/check_drill_isolation.py`
 

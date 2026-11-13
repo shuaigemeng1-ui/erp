@@ -333,25 +333,76 @@ def _config_from_row(row: PlatformChannelApp) -> ChannelAppConfig:
 
 
 def _load_gateway_channel_app(channel: str, environment: str) -> ChannelAppConfig | None:
-    """从独立集成网关拉取渠道应用配置（仅租户实例启用时）。"""
+    """从独立集成网关拉取渠道应用配置（租户实例可选来源）。
+
+    新链优先使用本实例令牌（``GATEWAY_INSTANCE_ID`` / ``GATEWAY_INSTANCE_TOKEN``）；
+    迁移期若新链失败且 ``GATEWAY_LEGACY_ADMIN_ENABLED=true``，回退旧 admin token
+    （网关侧仍受 legacy 开关控制）。两者都不可用或网关异常时返回 ``None``，
+    由 :func:`load_channel_app` 回退中心库本地配置。
+    """
     from app.core.config import settings
     import json
-    import httpx
+    from app.modules.gateway.client import GatewayCallError, GatewayClient
 
-    if not settings.gateway_base_url or not settings.gateway_admin_token:
+    if not settings.gateway_channel_config or not settings.gateway_base_url:
         return None
-    base = settings.gateway_base_url.rstrip("/")
+    client = GatewayClient(
+        settings.gateway_base_url, timeout=settings.gateway_timeout_seconds
+    )
+    payload: dict[str, Any] | None = None
+    used_mode = ""
     try:
-        response = httpx.get(
-            f"{base}/api/v1/gateway/channel-apps/{channel}/{environment}/internal",
-            headers={"X-Gateway-Token": settings.gateway_admin_token},
-            timeout=settings.gateway_timeout_seconds,
-        )
-        if response.status_code != 200:
+        attempts: list[tuple[str, Any]] = []
+        if settings.gateway_instance_id and settings.gateway_instance_token:
+            attempts.append(
+                (
+                    "instance",
+                    lambda: client.fetch_instance_channel_app(
+                        instance_id=settings.gateway_instance_id,
+                        instance_token=settings.gateway_instance_token,
+                        channel=channel,
+                        environment=environment,
+                    ),
+                )
+            )
+        if settings.gateway_legacy_admin_enabled and settings.gateway_admin_token:
+            attempts.append(
+                (
+                    "legacy_admin",
+                    lambda: client.fetch_legacy_channel_app(
+                        admin_token=settings.gateway_admin_token,
+                        channel=channel,
+                        environment=environment,
+                    ),
+                )
+            )
+        if not attempts:
+            logger.info("网关渠道配置未启用：未配置实例令牌且 legacy 回退已关闭")
             return None
-        payload = response.json()
-    except Exception:  # noqa: BLE001 - 网关不可用时回退本地配置
+        for mode, fetch in attempts:
+            try:
+                payload = fetch()
+                used_mode = mode
+                break
+            except GatewayCallError as exc:
+                logger.warning(
+                    "读取网关渠道配置失败（尝试回退）：mode=%s status=%s code=%s message=%s",
+                    mode,
+                    exc.status_code,
+                    exc.code,
+                    exc,
+                )
+    finally:
+        client.close()
+    if payload is None:
+        logger.warning("网关渠道配置不可用：channel=%s environment=%s", channel, environment)
         return None
+    logger.debug(
+        "网关渠道配置来源 mode=%s channel=%s environment=%s",
+        used_mode,
+        channel,
+        environment,
+    )
     extra = payload.get("extra") or {}
     if isinstance(extra, str):
         try:

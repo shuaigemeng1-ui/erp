@@ -119,7 +119,12 @@ class Settings(BaseSettings):
     tiktok_auth_base: str = "https://auth.tiktok-shops.com"
     # 独立集成网关（租户实例可选的渠道配置来源）
     gateway_base_url: str = ""
+    # 迁移期旧凭据：租户侧 admin token；仅在 GATEWAY_LEGACY_ADMIN_ENABLED=true 时回退使用
     gateway_admin_token: str = ""
+    gateway_legacy_admin_enabled: bool = True
+    # 新链实例身份：每实例独立令牌（只存于该实例环境变量，不共享）
+    gateway_instance_id: str = ""
+    gateway_instance_token: str = ""
     gateway_channel_config: bool = False
     gateway_timeout_seconds: float = 5.0
 

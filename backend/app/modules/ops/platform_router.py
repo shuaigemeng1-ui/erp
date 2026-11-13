@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+import logging
+from typing import Any
+
+from fastapi import APIRouter, Depends, Query, Request, WebSocket, WebSocketDisconnect
 
 from app.api.deps import CenterDb, PlatformAdmin
+from app.core.context import get_request_id
+from app.core.errors import AppError
 from app.core.http import PageParams, paged, success
 from app.modules.ops import service
 from app.modules.ops.schemas import (
@@ -14,12 +19,21 @@ from app.modules.ops.schemas import (
     MaintenanceWindowCreate,
     NodeSshConfigIn,
     NodeSshExecIn,
+    NodeSshFingerprintResetIn,
     OperationCreate,
     ReleaseCreate,
     ReleaseUpdate,
 )
 
+logger = logging.getLogger("ventasync.ssh")
+
 router = APIRouter(prefix="/platform", tags=["platform-ops"])
+
+
+def _client_ip(request: Request | None) -> str:
+    if request is None or request.client is None:
+        return ""
+    return request.client.host or ""
 
 
 @router.get("/instances", summary="租户实例列表")
@@ -94,16 +108,63 @@ def get_node_ssh(center: CenterDb, _: PlatformAdmin, node_id: int) -> dict:
 
 @router.put("/nodes/{node_id}/ssh", summary="保存服务器 SSH 账号")
 def save_node_ssh(
-    center: CenterDb, admin: PlatformAdmin, node_id: int, payload: NodeSshConfigIn
+    center: CenterDb,
+    admin: PlatformAdmin,
+    node_id: int,
+    payload: NodeSshConfigIn,
+    request: Request,
 ) -> dict:
-    return success(service.save_ssh_config(center, node_id, payload, actor_user_id=admin.user_id))
+    return success(
+        service.save_ssh_config(
+            center,
+            node_id,
+            payload,
+            actor_user_id=admin.user_id,
+            request_id=get_request_id(),
+            ip=_client_ip(request),
+        )
+    )
+
+
+@router.post("/nodes/{node_id}/ssh/fingerprint/reset", summary="重置服务器 SSH 主机指纹")
+def reset_node_ssh_fingerprint(
+    center: CenterDb,
+    admin: PlatformAdmin,
+    node_id: int,
+    payload: NodeSshFingerprintResetIn,
+    request: Request,
+) -> dict:
+    """管理员确认后清空主机指纹；下次连接重新记录（用于服务器重装/换机）。"""
+    del payload  # 已由模型校验 confirm=true
+    return success(
+        service.reset_ssh_host_fingerprint(
+            center,
+            node_id,
+            actor_user_id=admin.user_id,
+            request_id=get_request_id(),
+            ip=_client_ip(request),
+        )
+    )
 
 
 @router.post("/nodes/{node_id}/ssh/exec", summary="通过 SSH 执行命令")
 def exec_node_ssh(
-    center: CenterDb, _: PlatformAdmin, node_id: int, payload: NodeSshExecIn
+    center: CenterDb,
+    admin: PlatformAdmin,
+    node_id: int,
+    payload: NodeSshExecIn,
+    request: Request,
 ) -> dict:
-    return success(service.ssh_execute(center, node_id, payload.command))
+    return success(
+        service.ssh_execute(
+            center,
+            node_id,
+            payload.command,
+            actor_user_id=admin.user_id,
+            request_id=get_request_id(),
+            ip=_client_ip(request),
+        )
+    )
 
 
 @router.get("/nodes/{node_id}/metrics", summary="节点指标趋势")
@@ -230,91 +291,172 @@ def acknowledge_alert(
 
 @router.websocket("/nodes/{node_id}/ssh/ws")
 async def node_ssh_websocket(websocket: WebSocket, node_id: int) -> None:
-    """浏览器交互式 SSH 终端：Cookie 会话鉴权，PTY 双向转发。"""
+    """浏览器交互式 SSH 终端：Cookie 鉴权 + 30s 会话复核 + 15min 空闲断开。
+
+    * 阻塞的 Redis/DB/Paramiko 调用全部放线程池，不阻塞事件循环；
+    * 连接前校验主机指纹（不匹配关闭码 4409），连接/终端打开/关闭写平台审计；
+    * 每 30s 复核会话、账号状态与平台管理员权限，撤权/注销关闭连接（4411）；
+    * 15 分钟无输入自动断开（4410）。
+    """
     import asyncio
     import json
     import threading
+    import time
+
+    from starlette.concurrency import run_in_threadpool
 
     from app.core import auth as auth_core
+    from app.core import redis as redis_core
     from app.core.config import settings
-    from app.core.redis import read_session
-    from app.db.session import center_session
-    from app.modules.identity.service import load_authenticated_user
-    from app.modules.ops import service
+    from app.core.context import new_request_id
 
+    request_id = new_request_id()
     origin = websocket.headers.get("origin", "")
     allowed = auth_core.allowed_origins()
     if allowed and origin not in allowed:
         await websocket.close(code=4403)
         return
     session_id = websocket.cookies.get(settings.session_cookie_name, "")
-    payload = read_session(session_id) if session_id else None
+    payload = (
+        await run_in_threadpool(redis_core.read_session, session_id) if session_id else None
+    )
     if not payload or auth_core.session_scope(payload) not in (None, "platform"):
         await websocket.close(code=4401)
         return
     user_id = int(payload.get("user_id") or 0)
-    with center_session() as center:
-        user = load_authenticated_user(center, user_id)
-        if user is None or not user.is_platform_admin:
-            await websocket.close(code=4403)
-            return
-        try:
-            params = service.ssh_connect_params(center, node_id)
-        except Exception:
-            await websocket.close(code=4404)
-            return
+    user = (
+        await run_in_threadpool(service.load_platform_ssh_user, user_id) if user_id else None
+    )
+    if user is None or user.status != "active" or not user.is_platform_admin:
+        await websocket.close(code=4403)
+        return
+    ip = websocket.client.host if websocket.client is not None else ""
+    try:
+        await run_in_threadpool(service.ssh_prepare_terminal, node_id)
+    except AppError:
+        await websocket.close(code=4404)
+        return
+    except Exception:
+        logger.warning("SSH WS 目标不可用 node=%s", node_id, exc_info=True)
+        await websocket.close(code=4404)
+        return
+
     await websocket.accept()
+    resources: dict[str, Any] | None = None
+    reason = "client_closed"
+    started = time.monotonic()
+    input_bytes = 0
     try:
-        import paramiko
-    except ImportError:
-        await websocket.close(code=1011)
-        return
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(
-            hostname=params["host"], port=params["port"], username=params["username"],
-            password=params["password"], timeout=10, banner_timeout=10, auth_timeout=10,
-            allow_agent=False, look_for_keys=False,
-        )
-        channel = client.invoke_shell(term="xterm-256color", width=120, height=32)
-        channel.settimeout(0.2)
-    except Exception as exc:
-        await websocket.send_text(f"\r\nSSH 连接失败：{str(exc)[:300]}\r\n")
-        await websocket.close(code=1011)
-        client.close()
-        return
+        try:
+            resources = await run_in_threadpool(
+                service.ssh_open_terminal,
+                node_id,
+                actor_user_id=user_id,
+                request_id=request_id,
+                ip=ip,
+            )
+        except AppError as exc:
+            details = exc.details if isinstance(exc.details, dict) else {}
+            code = 4409 if details.get("reason") == "fingerprint_mismatch" else 1011
+            await websocket.send_text(f"\r\n{exc.message}\r\n")
+            await websocket.close(code=code)
+            return
+        except Exception as exc:  # noqa: BLE001 - 连接异常反馈给终端页面
+            logger.exception("SSH WS 连接失败 node=%s", node_id)
+            await websocket.send_text(f"\r\nSSH 连接失败：{str(exc)[:300]}\r\n")
+            await websocket.close(code=1011)
+            return
 
-    loop = asyncio.get_running_loop()
+        channel = resources["channel"]
+        loop = asyncio.get_running_loop()
 
-    def reader() -> None:
+        def reader() -> None:
+            while True:
+                try:
+                    data = channel.recv(4096)
+                except TimeoutError:
+                    continue
+                except Exception:
+                    break
+                if not data:
+                    break
+                asyncio.run_coroutine_threadsafe(
+                    websocket.send_text(data.decode("utf-8", "replace")), loop
+                )
+            asyncio.run_coroutine_threadsafe(websocket.close(), loop)
+
+        threading.Thread(target=reader, daemon=True, name=f"ssh-reader-{node_id}").start()
+        last_activity = time.monotonic()
+        last_check = last_activity
         while True:
+            now = time.monotonic()
+            if now - last_activity >= service.SSH_WS_IDLE_SECONDS:
+                reason = "idle_timeout"
+                try:
+                    await websocket.send_text("\r\n空闲超过 15 分钟，SSH 连接已断开。\r\n")
+                    await websocket.close(code=4410)
+                except Exception:  # pragma: no cover - 对端已断开
+                    pass
+                break
+            if now - last_check >= service.SSH_SESSION_RECHECK_SECONDS:
+                last_check = now
+                ok, check_reason = await run_in_threadpool(
+                    service.ssh_session_recheck, session_id, user_id
+                )
+                if not ok:
+                    reason = check_reason or "session_revoked"
+                    try:
+                        await websocket.send_text("\r\n会话或平台权限已失效，SSH 连接已断开。\r\n")
+                        await websocket.close(code=4411)
+                    except Exception:  # pragma: no cover - 对端已断开
+                        pass
+                    break
+            wait_seconds = max(
+                0.1,
+                min(
+                    service.SSH_SESSION_RECHECK_SECONDS - (time.monotonic() - last_check),
+                    service.SSH_WS_IDLE_SECONDS - (time.monotonic() - last_activity),
+                ),
+            )
             try:
-                data = channel.recv(4096)
-            except TimeoutError:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=wait_seconds)
+            except asyncio.TimeoutError:
                 continue
-            except Exception:
-                break
-            if not data:
-                break
-            asyncio.run_coroutine_threadsafe(websocket.send_text(data.decode("utf-8", "replace")), loop)
-        asyncio.run_coroutine_threadsafe(websocket.close(), loop)
-
-    threading.Thread(target=reader, daemon=True).start()
-    try:
-        while True:
-            raw = await websocket.receive_text()
+            last_activity = time.monotonic()
+            input_bytes += len(raw)
             try:
                 message = json.loads(raw)
             except ValueError:
-                channel.send(raw)
+                await run_in_threadpool(channel.send, raw)
                 continue
             if message.get("type") == "input":
-                channel.send(str(message.get("data") or ""))
+                data = str(message.get("data") or "")
+                input_bytes += len(data)
+                await run_in_threadpool(channel.send, data)
             elif message.get("type") == "resize":
-                channel.resize_pty(width=int(message.get("cols") or 120), height=int(message.get("rows") or 32))
+                await run_in_threadpool(
+                    channel.resize_pty,
+                    width=int(message.get("cols") or 120),
+                    height=int(message.get("rows") or 32),
+                )
     except WebSocketDisconnect:
-        pass
+        reason = "client_disconnected"
+    except Exception:  # noqa: BLE001 - 终端异常不能影响其它连接
+        logger.exception("SSH WS 会话异常 node=%s", node_id)
+        reason = "error"
     finally:
-        channel.close()
-        client.close()
+        duration = int(time.monotonic() - started)
+        if resources is not None:
+            try:
+                await run_in_threadpool(
+                    service.ssh_close_terminal,
+                    resources,
+                    actor_user_id=user_id,
+                    request_id=request_id,
+                    ip=ip,
+                    reason=reason,
+                    duration_seconds=duration,
+                    input_bytes=input_bytes,
+                )
+            except Exception:  # pragma: no cover - 关闭审计失败不影响资源释放
+                logger.exception("SSH WS 关闭审计失败 node=%s", node_id)

@@ -245,11 +245,39 @@ class MaintenanceWindowCreate(BaseModel):
 
 
 class NodeSshConfigIn(BaseModel):
+    """SSH 目标只允许管理员显式配置（不允许 URL/路径；不会使用 Agent 上报 IP 回退）。"""
+
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     host: str = Field(default="", max_length=255)
     port: int = Field(default=22, ge=1, le=65535)
     username: str | None = Field(default=None, max_length=128)
     password: str | None = Field(default=None, max_length=512)
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        host = (value or "").strip()
+        if not host:
+            return ""
+        if "://" in host or any(char in host for char in ("/", "\\", "@", " ", "\t")):
+            raise ValueError("SSH 主机只填写主机名或 IP，不含协议、路径与账号")
+        if not re.fullmatch(r"[A-Za-z0-9._:\[\]-]{1,255}", host):
+            raise ValueError("SSH 主机格式不正确")
+        return host
+
+
+class NodeSshFingerprintResetIn(BaseModel):
+    """管理员重置 SSH 主机指纹（必须显式确认，防止误操作）。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    confirm: bool = Field(description="确认重置主机指纹（必须为 true）")
+
+    @field_validator("confirm")
+    @classmethod
+    def validate_confirm(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError("重置 SSH 主机指纹需要显式确认")
+        return value
 
 
 class NodeSshExecIn(BaseModel):

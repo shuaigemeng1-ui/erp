@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
+import re
 import secrets
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -266,6 +270,10 @@ def node_payload(node: ServerNode, *, metric: NodeMetricSample | None = None) ->
         "last_seen_at": _iso(node.last_seen_at),
         "last_heartbeat_at": _iso(node.last_heartbeat_at),
         "last_metrics_at": _iso(node.last_metrics_at),
+        "ssh_host": node.ssh_host or "",
+        "ssh_host_fingerprint": node.ssh_host_fingerprint or "",
+        "ssh_fingerprint_algorithm": node.ssh_fingerprint_algorithm or "",
+        "ssh_host_fingerprint_verified_at": _iso(node.ssh_host_fingerprint_verified_at),
         "latest_metric": _metric_payload(latest),
     }
 
@@ -2253,7 +2261,76 @@ def retry_operation(center, job_id: int, *, actor_user_id: int) -> dict[str, Any
     return create_operation(center, old.instance_id, payload, actor_user_id=actor_user_id)
 
 
-# --------------------------------------------------------------------------- SSH 凭据与命令执行
+# --------------------------------------------------------------------------- SSH 凭据、主机指纹与命令执行
+SSH_CONNECT_TIMEOUT_SECONDS = 10
+SSH_COMMAND_TIMEOUT_SECONDS = 60
+# WebSocket 会话每 30s 复核账号/平台权限/会话；15 分钟无输入自动断开
+SSH_SESSION_RECHECK_SECONDS = 30
+SSH_WS_IDLE_SECONDS = 15 * 60
+SSH_FINGERPRINT_ALGORITHM_DEFAULT = "SHA256"
+
+_SSH_SECRET_FLAG_RE = re.compile(
+    r"(?i)(--?(?:password|passwd|pass|token|secret|api[-_]?key|access[-_]?key|private[-_]?key)(?:[=\s]+))(\S+)"
+)
+_SSH_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd|token|secret|api[-_]?key|access[-_]?key|authorization|credential)(\s*[:=]\s*)(\S+)"
+)
+_SSH_SHORT_PASSWORD_RE = re.compile(r"(?<![\w-])-p([^\s;|&'\"]+)")
+_SSH_URL_CREDENTIAL_RE = re.compile(r"(://[^:/\s@]+:)([^@/\s]+)(@)")
+_SSH_AUTH_HEADER_RE = re.compile(
+    r"(?i)\b(authorization|proxy-authorization)(\s*[:=]\s*)(\S+(?:\s+\S+)?)"
+)
+_SSH_BEARER_RE = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._\-]+")
+
+
+def ssh_key_fingerprint(key) -> tuple[str, str]:
+    """计算 Paramiko PKey 的 OpenSSH 风格 SHA256 指纹：``SHA256:<base64>``。"""
+    digest = hashlib.sha256(key.asbytes()).digest()
+    encoded = base64.b64encode(digest).decode("ascii").rstrip("=")
+    get_name = getattr(key, "get_name", None)
+    algorithm = str(get_name() if callable(get_name) else SSH_FINGERPRINT_ALGORITHM_DEFAULT)
+    return f"SHA256:{encoded}", (algorithm or SSH_FINGERPRINT_ALGORITHM_DEFAULT)[:16]
+
+
+def sanitize_ssh_command(command: str, *, limit: int = 500) -> str:
+    """审计用命令脱敏：密码/Token/URL 凭据/Bearer 值替换为 ``***``，并压缩空白/截断。"""
+    text = str(command or "")
+    text = _SSH_SECRET_FLAG_RE.sub(lambda match: match.group(1) + "***", text)
+    text = _SSH_AUTH_HEADER_RE.sub(
+        lambda match: match.group(1) + match.group(2) + "***", text
+    )
+    text = _SSH_BEARER_RE.sub(lambda match: match.group(1) + "***", text)
+    text = _SSH_SECRET_ASSIGN_RE.sub(lambda match: match.group(1) + "=***", text)
+    text = _SSH_SHORT_PASSWORD_RE.sub(lambda match: "-p***", text)
+    text = _SSH_URL_CREDENTIAL_RE.sub(lambda match: match.group(1) + "***" + match.group(3), text)
+    text = " ".join(text.split())
+    return text[: max(1, int(limit))]
+
+
+def _sanitize_ssh_error(exc: BaseException) -> str:
+    return sanitize_ssh_command(str(exc), limit=300)
+
+
+def _new_ssh_host_key_policy(expected_fingerprint: str = ""):
+    """连接前校验主机指纹的 Paramiko 策略（在认证之前调用，不匹配直接拒绝）。"""
+    import paramiko
+
+    class _HostKeyPolicy(paramiko.MissingHostKeyPolicy):
+        def __init__(self) -> None:
+            self.expected = (expected_fingerprint or "").strip()
+            self.fingerprint = ""
+            self.algorithm = ""
+            self.mismatch = False
+
+        def missing_host_key(self, client, hostname, key) -> None:  # noqa: ANN001 - Paramiko 接口
+            self.fingerprint, self.algorithm = ssh_key_fingerprint(key)
+            if self.expected and not hmac.compare_digest(self.expected, self.fingerprint):
+                self.mismatch = True
+                raise paramiko.SSHException("SSH 主机指纹不匹配")
+
+    return _HostKeyPolicy()
+
+
 def _ssh_node(center, node_id: int) -> ServerNode:
     node = center.get(ServerNode, node_id)
     if node is None:
@@ -2261,9 +2338,8 @@ def _ssh_node(center, node_id: int) -> ServerNode:
     return node
 
 
-def _ssh_host(node: ServerNode) -> str:
-    if node.ssh_host:
-        return node.ssh_host
+def _detected_ssh_host(node: ServerNode) -> str:
+    """Agent 观测/配置的 IP：仅用于页面展示，绝不作为 SSH 连接目标回退。"""
     if node.observed_public_ip:
         return node.observed_public_ip
     if node.configured_public_ip:
@@ -2272,7 +2348,36 @@ def _ssh_host(node: ServerNode) -> str:
     return ips[0] if ips else ""
 
 
+def _record_ssh_audit(
+    center,
+    node: ServerNode,
+    action: str,
+    *,
+    actor_user_id: int | None,
+    request_id: str = "",
+    ip: str = "",
+    summary: str = "",
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """写平台审计（连接 / 命令 / 终端 / 指纹），不提交事务。"""
+    from app.modules.platform.service import record_platform_audit
+
+    record_platform_audit(
+        center,
+        actor_user_id=actor_user_id,
+        action=action,
+        resource_type="server_node",
+        resource_id=int(node.id),
+        tenant_id=int(node.tenant_id),
+        summary=(summary or action)[:255],
+        payload=payload,
+        request_id=request_id,
+        ip=ip,
+    )
+
+
 def get_ssh_config(center, node_id: int) -> dict[str, Any]:
+    """读取 SSH 配置（不返回密码；指纹只读展示）。"""
     from app.core.security import decrypt_secret
 
     node = _ssh_node(center, node_id)
@@ -2282,37 +2387,144 @@ def get_ssh_config(center, node_id: int) -> dict[str, Any]:
             username = decrypt_secret(node.ssh_username_cipher)
         except Exception:
             username = ""
+    fingerprint = node.ssh_host_fingerprint or ""
     return {
-        "host": node.ssh_host,
-        "detected_host": _ssh_host(node),
+        "host": node.ssh_host or "",
+        "detected_host": _detected_ssh_host(node),
         "port": int(node.ssh_port or 22),
         "username": username,
         "has_password": bool(node.ssh_password_cipher),
+        "host_configured": bool((node.ssh_host or "").strip()),
+        "credentials_configured": bool(node.ssh_username_cipher and node.ssh_password_cipher),
+        "ssh_host_fingerprint": fingerprint,
+        "ssh_fingerprint_algorithm": node.ssh_fingerprint_algorithm or "",
+        "ssh_host_fingerprint_verified_at": _iso(node.ssh_host_fingerprint_verified_at),
+        "fingerprint_status": "verified" if fingerprint else "unverified",
     }
 
 
-def save_ssh_config(center, node_id: int, payload, *, actor_user_id: int) -> dict[str, Any]:
+def save_ssh_config(
+    center,
+    node_id: int,
+    payload,
+    *,
+    actor_user_id: int,
+    request_id: str = "",
+    ip: str = "",
+) -> dict[str, Any]:
+    """保存 SSH 显式目标/账号；主机或端口变化时清空旧主机指纹（需重新记录）。"""
     from app.core.security import encrypt_secret
 
     node = _ssh_node(center, node_id)
-    node.ssh_host = payload.host.strip()
-    node.ssh_port = int(payload.port or 22)
+    old_host = node.ssh_host or ""
+    old_port = int(node.ssh_port or 22)
+    new_host = (payload.host or "").strip()
+    new_port = int(payload.port or 22)
+    target_changed = (old_host, old_port) != (new_host, new_port)
+
+    fingerprint_cleared = False
+    previous_fingerprint = node.ssh_host_fingerprint or ""
+    if target_changed and previous_fingerprint:
+        node.ssh_host_fingerprint = ""
+        node.ssh_host_fingerprint_verified_at = None
+        node.ssh_fingerprint_algorithm = SSH_FINGERPRINT_ALGORITHM_DEFAULT
+        fingerprint_cleared = True
+
+    node.ssh_host = new_host
+    node.ssh_port = new_port
+    username_changed = payload.username is not None
+    password_changed = payload.password is not None
     if payload.username is not None:
-        node.ssh_username_cipher = encrypt_secret(payload.username.strip()) if payload.username.strip() else ""
+        node.ssh_username_cipher = (
+            encrypt_secret(payload.username.strip()) if payload.username.strip() else ""
+        )
     if payload.password is not None:
         node.ssh_password_cipher = encrypt_secret(payload.password) if payload.password else ""
     center.add(node)
+    _record_ssh_audit(
+        center,
+        node,
+        "ssh.config.update",
+        actor_user_id=actor_user_id,
+        request_id=request_id,
+        ip=ip,
+        summary=f"更新 SSH 配置：{(new_host or '未配置')}:{new_port}",
+        payload={
+            "host": new_host,
+            "port": new_port,
+            "target_changed": target_changed,
+            "username_changed": username_changed,
+            "password_changed": password_changed,
+            "fingerprint_cleared": fingerprint_cleared,
+        },
+    )
+    if fingerprint_cleared:
+        _record_ssh_audit(
+            center,
+            node,
+            "ssh.fingerprint.reset",
+            actor_user_id=actor_user_id,
+            request_id=request_id,
+            ip=ip,
+            summary="SSH 目标变更，旧主机指纹已清空",
+            payload={
+                "reason": "target_changed",
+                "previous_fingerprint": previous_fingerprint[:128],
+                "host": new_host,
+                "port": new_port,
+            },
+        )
     center.commit()
     return get_ssh_config(center, node_id)
 
 
+def reset_ssh_host_fingerprint(
+    center,
+    node_id: int,
+    *,
+    actor_user_id: int,
+    request_id: str = "",
+    ip: str = "",
+) -> dict[str, Any]:
+    """管理员重置 SSH 主机指纹：仅清空指纹三字段，不动 host/port/账号密码。"""
+    node = _ssh_node(center, node_id)
+    previous = node.ssh_host_fingerprint or ""
+    node.ssh_host_fingerprint = ""
+    node.ssh_host_fingerprint_verified_at = None
+    node.ssh_fingerprint_algorithm = SSH_FINGERPRINT_ALGORITHM_DEFAULT
+    center.add(node)
+    _record_ssh_audit(
+        center,
+        node,
+        "ssh.fingerprint.reset",
+        actor_user_id=actor_user_id,
+        request_id=request_id,
+        ip=ip,
+        summary="管理员重置 SSH 主机指纹",
+        payload={
+            "reason": "admin_reset",
+            "previous_fingerprint": previous[:128],
+            "host": node.ssh_host or "",
+            "port": int(node.ssh_port or 22),
+        },
+    )
+    center.commit()
+    config = get_ssh_config(center, node_id)
+    config["reset"] = True
+    return config
+
+
 def ssh_connect_params(center, node_id: int) -> dict[str, Any]:
+    """SSH 连接参数：主机只取管理员显式配置的 ``ssh_host``，禁止回退 Agent 上报 IP。"""
     from app.core.security import decrypt_secret
 
     node = _ssh_node(center, node_id)
-    host = _ssh_host(node)
+    host = (node.ssh_host or "").strip()
     if not host:
-        raise AppError(ErrorCode.VALIDATION_ERROR, "未配置服务器 IP，无法建立 SSH 连接")
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            "请先显式配置服务器 SSH 主机地址（不会使用 Agent 上报 IP 自动回退）",
+        )
     if not node.ssh_username_cipher or not node.ssh_password_cipher:
         raise AppError(ErrorCode.VALIDATION_ERROR, "请先保存 SSH 账号和密码")
     try:
@@ -2320,46 +2532,475 @@ def ssh_connect_params(center, node_id: int) -> dict[str, Any]:
         password = decrypt_secret(node.ssh_password_cipher)
     except Exception:
         raise AppError(ErrorCode.VALIDATION_ERROR, "SSH 凭据无法解密，请重新保存") from None
-    return {"host": host, "port": int(node.ssh_port or 22), "username": username, "password": password}
+    return {
+        "host": host,
+        "port": int(node.ssh_port or 22),
+        "username": username,
+        "password": password,
+        "node_id": int(node.id),
+    }
 
 
-def ssh_execute(center, node_id: int, command: str) -> dict[str, Any]:
-    from app.core.security import decrypt_secret
+def ssh_prepare_terminal(node_id: int) -> dict[str, Any]:
+    """WebSocket 连接前准备（独立中心库 Session，供线程池调用）。"""
+    from app.db.session import center_session
 
-    node = _ssh_node(center, node_id)
-    host = _ssh_host(node)
-    if not host:
-        raise AppError(ErrorCode.VALIDATION_ERROR, "未配置服务器 IP，无法建立 SSH 连接")
-    if not node.ssh_username_cipher or not node.ssh_password_cipher:
-        raise AppError(ErrorCode.VALIDATION_ERROR, "请先保存 SSH 账号和密码")
-    try:
-        username = decrypt_secret(node.ssh_username_cipher)
-        password = decrypt_secret(node.ssh_password_cipher)
-    except Exception:
-        raise AppError(ErrorCode.VALIDATION_ERROR, "SSH 凭据无法解密，请重新保存") from None
+    with center_session() as center:
+        return ssh_connect_params(center, node_id)
+
+
+def confirm_ssh_host_fingerprint(
+    center,
+    node: ServerNode,
+    fingerprint: str,
+    algorithm: str,
+    *,
+    actor_user_id: int | None,
+    request_id: str = "",
+    ip: str = "",
+    host: str = "",
+) -> dict[str, Any]:
+    """首次连接记录指纹；后续不匹配拒绝；匹配则仅返回信息（不覆盖已记录值）。"""
+    actual = (fingerprint or "").strip()
+    if not actual:
+        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "SSH 服务端未返回主机指纹，已拒绝连接")
+    actual_algorithm = (algorithm or SSH_FINGERPRINT_ALGORITHM_DEFAULT)[:16]
+    stored = (node.ssh_host_fingerprint or "").strip()
+    target = host or node.ssh_host or ""
+    if stored:
+        if not hmac.compare_digest(stored, actual):
+            _record_ssh_audit(
+                center,
+                node,
+                "ssh.fingerprint.mismatch",
+                actor_user_id=actor_user_id,
+                request_id=request_id,
+                ip=ip,
+                summary="SSH 主机指纹不匹配，拒绝连接",
+                payload={
+                    "host": target,
+                    "expected": stored[:128],
+                    "actual": actual[:128],
+                    "algorithm": actual_algorithm,
+                },
+            )
+            center.commit()
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "SSH 主机指纹不匹配，已拒绝连接；如确认服务器变更，请管理员核对后重置指纹",
+                details={
+                    "reason": "fingerprint_mismatch",
+                    "expected": stored[:128],
+                    "actual": actual[:128],
+                    "algorithm": actual_algorithm,
+                    "host": target,
+                },
+            )
+        return {"recorded": False, "fingerprint": stored, "algorithm": node.ssh_fingerprint_algorithm or actual_algorithm}
+
+    node.ssh_host_fingerprint = actual[:128]
+    node.ssh_fingerprint_algorithm = actual_algorithm
+    node.ssh_host_fingerprint_verified_at = _now()
+    center.add(node)
+    _record_ssh_audit(
+        center,
+        node,
+        "ssh.fingerprint.recorded",
+        actor_user_id=actor_user_id,
+        request_id=request_id,
+        ip=ip,
+        summary="首次连接记录 SSH 主机指纹",
+        payload={
+            "host": target,
+            "fingerprint": actual[:128],
+            "algorithm": actual_algorithm,
+        },
+    )
+    center.commit()
+    return {"recorded": True, "fingerprint": actual[:128], "algorithm": actual_algorithm}
+
+
+def _open_ssh_client(
+    center,
+    node: ServerNode,
+    params: dict[str, Any],
+    *,
+    actor_user_id: int | None,
+    request_id: str = "",
+    ip: str = "",
+    purpose: str = "command",
+):
+    """建立 SSH 连接：认证前校验主机指纹，连接/失败均写审计。"""
     try:
         import paramiko
     except ImportError:
         raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "服务器缺少 SSH 依赖") from None
+
+    expected = (node.ssh_host_fingerprint or "").strip()
+    policy = _new_ssh_host_key_policy(expected)
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.set_missing_host_key_policy(policy)
+    started = time.perf_counter()
     try:
         client.connect(
-            hostname=host,
-            port=int(node.ssh_port or 22),
-            username=username,
-            password=password,
-            timeout=10,
-            banner_timeout=10,
-            auth_timeout=10,
+            hostname=params["host"],
+            port=int(params["port"]),
+            username=params["username"],
+            password=params["password"],
+            timeout=SSH_CONNECT_TIMEOUT_SECONDS,
+            banner_timeout=SSH_CONNECT_TIMEOUT_SECONDS,
+            auth_timeout=SSH_CONNECT_TIMEOUT_SECONDS,
             allow_agent=False,
             look_for_keys=False,
         )
-        _, stdout, stderr = client.exec_command(command, timeout=60)
-        out = (stdout.read() + stderr.read()).decode("utf-8", "replace")
-        exit_status = stdout.channel.recv_exit_status()
-        return {"output": out[-20000:], "exit_status": int(exit_status), "host": host}
+    except Exception as exc:  # noqa: BLE001 - 统一转受控错误
+        try:
+            client.close()
+        except Exception:
+            pass
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        if policy.mismatch:
+            _record_ssh_audit(
+                center,
+                node,
+                "ssh.fingerprint.mismatch",
+                actor_user_id=actor_user_id,
+                request_id=request_id,
+                ip=ip,
+                summary="SSH 主机指纹不匹配，拒绝连接",
+                payload={
+                    "host": params["host"],
+                    "port": int(params["port"]),
+                    "purpose": purpose,
+                    "expected": expected[:128],
+                    "actual": (policy.fingerprint or "")[:128],
+                    "algorithm": policy.algorithm or "",
+                },
+            )
+            center.commit()
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "SSH 主机指纹不匹配，已拒绝连接；如确认服务器变更，请管理员核对后重置指纹",
+                details={
+                    "reason": "fingerprint_mismatch",
+                    "expected": expected[:128],
+                    "actual": (policy.fingerprint or "")[:128],
+                    "algorithm": policy.algorithm or "",
+                    "host": params["host"],
+                },
+            ) from None
+        error = _sanitize_ssh_error(exc)
+        _record_ssh_audit(
+            center,
+            node,
+            "ssh.connect.failed",
+            actor_user_id=actor_user_id,
+            request_id=request_id,
+            ip=ip,
+            summary="SSH 连接失败",
+            payload={
+                "host": params["host"],
+                "port": int(params["port"]),
+                "purpose": purpose,
+                "error": error,
+                "duration_ms": duration_ms,
+            },
+        )
+        center.commit()
+        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, f"SSH 连接失败：{error}") from None
+
+    info = confirm_ssh_host_fingerprint(
+        center,
+        node,
+        policy.fingerprint,
+        policy.algorithm,
+        actor_user_id=actor_user_id,
+        request_id=request_id,
+        ip=ip,
+        host=params["host"],
+    )
+    _record_ssh_audit(
+        center,
+        node,
+        "ssh.connect",
+        actor_user_id=actor_user_id,
+        request_id=request_id,
+        ip=ip,
+        summary=f"SSH 连接成功：{params['host']}",
+        payload={
+            "host": params["host"],
+            "port": int(params["port"]),
+            "purpose": purpose,
+            "fingerprint": info["fingerprint"],
+            "algorithm": info["algorithm"],
+            "fingerprint_recorded": bool(info.get("recorded")),
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+        },
+    )
+    center.commit()
+    return client, params, info
+
+
+def ssh_execute(
+    center,
+    node_id: int,
+    command: str,
+    *,
+    actor_user_id: int | None = None,
+    request_id: str = "",
+    ip: str = "",
+) -> dict[str, Any]:
+    """非交互命令执行：线程池由调用方（FastAPI sync 路由）保证；连接/命令/断开写审计。"""
+    node = _ssh_node(center, node_id)
+    params = ssh_connect_params(center, node_id)
+    sanitized = sanitize_ssh_command(command)
+    started = time.perf_counter()
+    client, params, info = _open_ssh_client(
+        center,
+        node,
+        params,
+        actor_user_id=actor_user_id,
+        request_id=request_id,
+        ip=ip,
+        purpose="command",
+    )
+    output = ""
+    exit_status: int | None = None
+    error = ""
+    try:
+        _, stdout, stderr = client.exec_command(command, timeout=SSH_COMMAND_TIMEOUT_SECONDS)
+        output = (stdout.read() + stderr.read()).decode("utf-8", "replace")
+        exit_status = int(stdout.channel.recv_exit_status())
     except Exception as exc:  # noqa: BLE001 - 返回受控错误给平台管理员
-        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, f"SSH 执行失败：{str(exc)[:200]}") from None
+        error = _sanitize_ssh_error(exc)
     finally:
-        client.close()
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        try:
+            client.close()
+        except Exception:
+            pass
+        _record_ssh_audit(
+            center,
+            node,
+            "ssh.command",
+            actor_user_id=actor_user_id,
+            request_id=request_id,
+            ip=ip,
+            summary=f"SSH 执行命令（exit={exit_status if exit_status is not None else 'error'}）",
+            payload={
+                "host": params["host"],
+                "port": int(params["port"]),
+                "command": sanitized,
+                "exit_status": exit_status,
+                "duration_ms": duration_ms,
+                "fingerprint": info["fingerprint"],
+                "error": error,
+            },
+        )
+        _record_ssh_audit(
+            center,
+            node,
+            "ssh.disconnect",
+            actor_user_id=actor_user_id,
+            request_id=request_id,
+            ip=ip,
+            summary="SSH 连接已关闭（命令执行结束）",
+            payload={
+                "host": params["host"],
+                "port": int(params["port"]),
+                "reason": "command_completed" if not error else "command_error",
+                "duration_ms": duration_ms,
+            },
+        )
+        center.commit()
+    if error:
+        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, f"SSH 执行失败：{error}")
+    return {
+        "output": output[-20000:],
+        "exit_status": int(exit_status or 0),
+        "host": params["host"],
+        "fingerprint": info["fingerprint"],
+        "algorithm": info["algorithm"],
+    }
+
+
+def ssh_open_terminal(
+    node_id: int,
+    *,
+    actor_user_id: int,
+    request_id: str = "",
+    ip: str = "",
+) -> dict[str, Any]:
+    """打开交互式 SSH 终端（阻塞调用，WebSocket 侧通过线程池执行）。"""
+    from app.db.session import center_session
+
+    with center_session() as center:
+        node = _ssh_node(center, node_id)
+        params = ssh_connect_params(center, node_id)
+        client, params, info = _open_ssh_client(
+            center,
+            node,
+            params,
+            actor_user_id=actor_user_id,
+            request_id=request_id,
+            ip=ip,
+            purpose="terminal",
+        )
+        try:
+            channel = client.invoke_shell(term="xterm-256color", width=120, height=32)
+            channel.settimeout(0.2)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                client.close()
+            except Exception:
+                pass
+            error = _sanitize_ssh_error(exc)
+            _record_ssh_audit(
+                center,
+                node,
+                "ssh.terminal.open.failed",
+                actor_user_id=actor_user_id,
+                request_id=request_id,
+                ip=ip,
+                summary="SSH 交互终端打开失败",
+                payload={"host": params["host"], "port": int(params["port"]), "error": error},
+            )
+            center.commit()
+            raise AppError(
+                ErrorCode.SERVICE_UNAVAILABLE, f"SSH 交互终端打开失败：{error}"
+            ) from None
+        _record_ssh_audit(
+            center,
+            node,
+            "ssh.terminal.open",
+            actor_user_id=actor_user_id,
+            request_id=request_id,
+            ip=ip,
+            summary=f"打开交互式 SSH 终端：{params['host']}",
+            payload={
+                "host": params["host"],
+                "port": int(params["port"]),
+                "fingerprint": info["fingerprint"],
+                "algorithm": info["algorithm"],
+            },
+        )
+        center.commit()
+        return {
+            "node_id": int(node.id),
+            "client": client,
+            "channel": channel,
+            "host": params["host"],
+            "port": int(params["port"]),
+            "fingerprint": info["fingerprint"],
+            "algorithm": info["algorithm"],
+        }
+
+
+def ssh_close_terminal(
+    resources: dict[str, Any],
+    *,
+    actor_user_id: int,
+    request_id: str = "",
+    ip: str = "",
+    reason: str = "client_closed",
+    duration_seconds: int = 0,
+    input_bytes: int = 0,
+) -> None:
+    """关闭交互式 SSH 终端并写终端关闭 / 断开审计（阻塞调用，线程池执行）。"""
+    client = resources.get("client")
+    channel = resources.get("channel")
+    try:
+        if channel is not None:
+            channel.close()
+    except Exception:
+        pass
+    try:
+        if client is not None:
+            client.close()
+    except Exception:
+        pass
+    node_id = resources.get("node_id")
+    if not node_id:
+        return
+    from app.db.session import center_session
+
+    with center_session() as center:
+        node = center.get(ServerNode, int(node_id))
+        if node is None:
+            return
+        _record_ssh_audit(
+            center,
+            node,
+            "ssh.terminal.close",
+            actor_user_id=actor_user_id,
+            request_id=request_id,
+            ip=ip,
+            summary=f"关闭交互式 SSH 终端（{reason}）",
+            payload={
+                "host": resources.get("host", ""),
+                "reason": reason,
+                "duration_seconds": int(duration_seconds),
+                "input_bytes": int(input_bytes),
+                "fingerprint": resources.get("fingerprint", ""),
+            },
+        )
+        _record_ssh_audit(
+            center,
+            node,
+            "ssh.disconnect",
+            actor_user_id=actor_user_id,
+            request_id=request_id,
+            ip=ip,
+            summary=f"SSH 连接已断开（{reason}）",
+            payload={
+                "host": resources.get("host", ""),
+                "reason": reason,
+                "duration_seconds": int(duration_seconds),
+            },
+        )
+        center.commit()
+
+
+# --------------------------------------------------------------------------- WebSocket 会话复核
+def _read_ws_session(session_id: str) -> dict[str, Any] | None:
+    from app.core.redis import read_session
+
+    return read_session(session_id)
+
+
+def _load_ws_user(user_id: int):
+    from app.db.session import center_session
+    from app.modules.identity.service import load_authenticated_user
+
+    with center_session() as center:
+        return load_authenticated_user(center, user_id)
+
+
+def load_platform_ssh_user(user_id: int):
+    """WebSocket 初始鉴权：加载用户并复核平台管理员身份（线程池调用）。"""
+    return _load_ws_user(user_id)
+
+
+def ssh_session_recheck(session_id: str, user_id: int) -> tuple[bool, str]:
+    """每 30s 复核：会话仍有效、账号 active、仍具平台管理员权限。
+
+    返回 ``(ok, reason)``；reason 取值：session_revoked / account_disabled /
+    permission_revoked。撤权/注销后 WebSocket 必须关闭连接。
+    """
+    from app.core.auth import session_scope
+
+    payload = _read_ws_session(session_id)
+    if not payload:
+        return False, "session_revoked"
+    if int(payload.get("user_id") or 0) != int(user_id):
+        return False, "session_revoked"
+    if session_scope(payload) not in (None, "platform"):
+        return False, "session_revoked"
+    user = _load_ws_user(int(user_id))
+    if user is None:
+        return False, "account_disabled"
+    if user.status != "active":
+        return False, "account_disabled"
+    if not user.is_platform_admin:
+        return False, "permission_revoked"
+    return True, ""

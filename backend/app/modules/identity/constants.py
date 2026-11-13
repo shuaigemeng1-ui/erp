@@ -128,6 +128,18 @@ PLATFORM_AUDIT_ACTIONS: dict[str, str] = {
     "alert.acknowledge": "确认运维告警",
     "release.create": "登记发布版本",
     "release.update": "更新发布版本",
+    "ssh.config.update": "更新 SSH 配置",
+    "ssh.connect": "SSH 连接成功",
+    "ssh.connect.failed": "SSH 连接失败",
+    "ssh.fingerprint.recorded": "记录 SSH 主机指纹",
+    "ssh.fingerprint.mismatch": "SSH 主机指纹不匹配",
+    "ssh.fingerprint.reset": "重置 SSH 主机指纹",
+    "ssh.command": "执行 SSH 命令",
+    "ssh.disconnect": "断开 SSH 连接",
+    "ssh.terminal.open": "打开 SSH 终端",
+    "ssh.terminal.open.failed": "打开 SSH 终端失败",
+    "ssh.terminal.close": "关闭 SSH 终端",
+    "task.outbox_rejected": "拒绝越权任务投递",
 }
 
 

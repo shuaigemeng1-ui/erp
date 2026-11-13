@@ -34,6 +34,9 @@ export interface OpsAlertQuery extends PageParams {
 /** 发布版本状态（后端 draft/active/retired） */
 export type OpsReleaseStatus = 'draft' | 'active' | 'retired'
 
+/** 构建状态（发布可用性仍由 status 控制） */
+export type OpsBuildStatus = 'built' | 'verified' | 'failed'
+
 /** 运维任务类型（后端白名单） */
 export type OpsJobType = 'deploy' | 'upgrade' | 'restart' | 'backup' | 'logs' | 'config'
 
@@ -47,21 +50,55 @@ export interface OpsRelease {
   image_tag: string
   image_digest: string
   status: OpsReleaseStatus | string
+  /** 完整 40/64 位 commit；旧记录为空串 */
+  commit_sha?: string | null
+  /** 构建配置摘要；旧记录为空串 */
+  build_config_summary?: string | null
+  /** 最低 Agent 协议版本；旧记录为 0 */
+  min_agent_protocol?: number | null
+  center_db_version?: string | null
+  tenant_db_version?: string | null
+  /** 是否允许旧应用兼容新库（回退兼容声明） */
+  rollback_compatible?: boolean | null
+  build_status?: OpsBuildStatus | string | null
   notes: string
   created_at?: string | null
 }
 
 export interface OpsReleaseCreatePayload {
   version: string
+  /** 必填，40/64 位完整 Git commit */
+  commit_sha: string
   image_tag?: string
   image_digest?: string
+  status?: OpsReleaseStatus
+  build_config_summary?: string
+  min_agent_protocol?: number
+  center_db_version?: string
+  tenant_db_version?: string
+  rollback_compatible?: boolean
+  build_status?: OpsBuildStatus
   notes?: string
 }
 
-/** 登记发布版本返回：后端只回 id/version */
+/** 登记发布版本返回（后端现返回完整 ReleaseItem） */
 export interface OpsReleaseCreateResult {
   id: EntityId
   version: string
+}
+
+export interface OpsOperationCheck {
+  name: string
+  ok: boolean
+  value?: string
+  message?: string
+}
+
+export interface OpsOperationStep {
+  step_no: number
+  name: string
+  status: string
+  message?: string
 }
 
 /** 运维任务项：GET /platform/operations 分页数据 */
@@ -72,6 +109,19 @@ export interface OpsOperation {
   job_type: OpsJobType | string
   status: OpsOperationStatus | string
   target_version: string
+  /** 批次1新增字段，旧接口缺失 */
+  actual_version?: string | null
+  agent_version?: string | null
+  agent_protocol_version?: number | null
+  db_version?: string | null
+  upgrade_status?: string | null
+  attempt_id?: string | null
+  lease_expires_at?: string | null
+  last_heartbeat_at?: string | null
+  event_seq?: number | null
+  checks_status?: string | null
+  checks?: OpsOperationCheck[] | null
+  steps?: OpsOperationStep[] | null
   attempts: number
   error: string
   result: Record<string, unknown> | null
@@ -198,8 +248,8 @@ export const opsApi = {
     return http.get<OpsRelease[]>('/platform/releases')
   },
 
-  createRelease(payload: OpsReleaseCreatePayload): Promise<OpsReleaseCreateResult> {
-    return http.post<OpsReleaseCreateResult>('/platform/releases', payload)
+  createRelease(payload: OpsReleaseCreatePayload): Promise<OpsRelease> {
+    return http.post<OpsRelease>('/platform/releases', payload)
   },
 
   operations(query: OpsOperationQuery = {}): Promise<PagedData<OpsOperation>> {

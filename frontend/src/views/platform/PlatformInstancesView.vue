@@ -6,6 +6,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { CopyDocument, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import { opsApi } from '@/api/ops'
+import type { OpsRelease } from '@/api/ops'
 import { useTableQuery } from '@/composables/useTableQuery'
 import PaginationBar from '@/components/PaginationBar.vue'
 import IdCopy from '@/components/IdCopy.vue'
@@ -389,7 +390,8 @@ async function loadDetail(instanceId: string): Promise<void> {
   }
 }
 
-const latestVersion = ref('')
+const releases = ref<OpsRelease[]>([])
+const releasesLoading = ref(false)
 const activePageTab = ref<'servers' | 'alerts'>('servers')
 
 /* ------------------------------ SSH 终端 ------------------------------ */
@@ -516,35 +518,145 @@ async function openTerminal(): Promise<void> {
 }
 const upgradingId = ref('')
 
-function canUpgrade(instance: OpsInstance): boolean {
-  return Boolean(latestVersion.value && instance.app_version && instance.app_version !== latestVersion.value)
+function actualVersionFor(instance: OpsInstance): string {
+  return textOrDash(instance.actual_version || instance.app_version)
 }
 
-async function loadLatestVersion(): Promise<void> {
+function isUpgradeInProgress(status?: string | null): boolean {
+  return ['pending', 'building', 'maintenance', 'migrating', 'verifying'].includes(status ?? '')
+}
+
+function upgradeStatusType(status?: string | null): TagType {
+  if (status === 'succeeded') return 'success'
+  if (status === 'pending') return 'info'
+  if (status === 'failed') return 'danger'
+  if (
+    status === 'building' ||
+    status === 'maintenance' ||
+    status === 'migrating' ||
+    status === 'verifying'
+  ) {
+    return 'warning'
+  }
+  return 'info'
+}
+
+function upgradeStatusText(status?: string | null): string {
+  if (status === 'pending') return '待升级'
+  if (status === 'building') return '构建中'
+  if (status === 'maintenance') return '维护中'
+  if (status === 'migrating') return '迁移中'
+  if (status === 'verifying') return '校验中'
+  if (status === 'succeeded') return '已升级'
+  if (status === 'failed') return '升级失败'
+  if (status === 'unknown') return '未知'
+  return textOrDash(status)
+}
+
+function isFullCommit(commitSha?: string | null): boolean {
+  return /^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test((commitSha ?? '').trim())
+}
+
+function releaseByVersion(version?: string | null): OpsRelease | null {
+  if (!version) return null
+  return releases.value.find((release) => release.version === version) ?? null
+}
+
+/** 优先实例指定的目标版本，否则取最新的 active 且可升级的发布版本。 */
+function preferredRelease(instance: OpsInstance): OpsRelease | null {
+  if (instance.target_version) return releaseByVersion(instance.target_version)
+  const activeReleases = releases.value.filter((release) => release.status === 'active')
+  return (
+    activeReleases.find(
+      (release) => release.build_status === 'verified' && isFullCommit(release.commit_sha),
+    ) ??
+    activeReleases[0] ??
+    releases.value[0] ??
+    null
+  )
+}
+
+/** 空串表示可升级；否则用于禁用按钮 tooltip。 */
+function upgradeBlockedReason(instance: OpsInstance): string {
+  if (releasesLoading.value) return '正在加载发布清单'
+  const release = preferredRelease(instance)
+  if (!release) {
+    return instance.target_version
+      ? `目标版本 ${instance.target_version} 未登记发布清单`
+      : '暂无已登记发布版本'
+  }
+  if (release.status !== 'active') {
+    return `目标版本 ${release.version} 不是 active 状态`
+  }
+  if (release.build_status !== 'verified') {
+    return `目标版本 ${release.version} 构建状态不是 verified`
+  }
+  if (!isFullCommit(release.commit_sha)) {
+    return `目标版本 ${release.version} 未登记完整 commit_sha`
+  }
+  if (isUpgradeInProgress(instance.upgrade_status)) {
+    return `实例升级状态为${upgradeStatusText(instance.upgrade_status)}`
+  }
+  if (actualVersionFor(instance) === release.version) {
+    return `实例已运行 ${release.version}`
+  }
+  return ''
+}
+
+function canUpgrade(instance: OpsInstance): boolean {
+  return upgradeBlockedReason(instance) === ''
+}
+
+function upgradeTargetVersion(instance: OpsInstance): string {
+  return preferredRelease(instance)?.version ?? '-'
+}
+
+function releaseCommitShort(release: OpsRelease | null): string {
+  const commit = (release?.commit_sha ?? '').trim()
+  return commit ? commit.slice(0, 12) : '-'
+}
+
+function targetReleaseCommit(instance: OpsInstance): string {
+  const commit = (preferredRelease(instance)?.commit_sha ?? '').trim()
+  return commit || '-'
+}
+
+async function loadReleases(): Promise<void> {
+  releasesLoading.value = true
   try {
-    const list = await opsApi.releases()
-    latestVersion.value = list.find((item) => item.status === 'active')?.version ?? list[0]?.version ?? ''
+    releases.value = await opsApi.releases()
   } catch {
-    latestVersion.value = ''
+    releases.value = []
+  } finally {
+    releasesLoading.value = false
   }
 }
 
 async function upgradeInstance(instance: OpsInstance): Promise<void> {
-  if (!latestVersion.value) return
-  await ElMessageBox.confirm(
-    `将实例「${instance.name}」从 ${instance.app_version || '未知版本'} 升级到 ${latestVersion.value}？`,
-    '一键升级',
-    { type: 'warning', confirmButtonText: '开始升级', cancelButtonText: '取消' },
-  ).catch(() => false)
+  const blockedReason = upgradeBlockedReason(instance)
+  const target = preferredRelease(instance)
+  if (blockedReason || !target) {
+    ElMessage.warning(blockedReason || '当前没有可升级的目标版本')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `将实例「${instance.name}」从 ${actualVersionFor(instance)} 升级到 ${target.version}？\n目标 commit：${releaseCommitShort(target)}…`,
+      '一键升级',
+      { type: 'warning', confirmButtonText: '开始升级', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
   if (upgradingId.value) return
   upgradingId.value = instance.id
   try {
     await opsApi.createOperation(instance.id, {
       job_type: 'upgrade',
-      target_version: latestVersion.value,
+      target_version: target.version,
       payload: {},
     })
-    ElMessage.success(`升级任务已创建：${latestVersion.value}`)
+    ElMessage.success(`升级任务已创建：${target.version}（commit ${releaseCommitShort(target)}）`)
     await refreshPage()
   } finally {
     upgradingId.value = ''
@@ -555,10 +667,10 @@ async function refreshPage(): Promise<void> {
   if (drawerVisible.value && currentInstance.value) {
     await loadDetail(currentInstance.value.id)
   }
-  await Promise.all([reloadInstances(), reloadAlerts()])
+  await Promise.all([reloadInstances(), reloadAlerts(), loadReleases()])
 }
 
-onMounted(loadLatestVersion)
+onMounted(loadReleases)
 
 /* ------------------------------ 编辑实例 ------------------------------ */
 const editVisible = ref(false)
@@ -972,8 +1084,39 @@ async function copyText(value: string | null | undefined, label: string): Promis
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="版本" width="110">
-          <template #default="{ row }">{{ textOrDash(row.app_version) }}</template>
+        <el-table-column label="目标版本" width="125">
+          <template #default="{ row }">
+            <span class="mono">{{ textOrDash(row.target_version) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="实际版本" width="125">
+          <template #default="{ row }">
+            <span class="mono">{{ actualVersionFor(row as OpsInstance) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="Agent 版本" width="120">
+          <template #default="{ row }">{{ textOrDash(row.agent_version) }}</template>
+        </el-table-column>
+        <el-table-column label="Executor 版本" width="130">
+          <template #default="{ row }">{{ textOrDash(row.executor_version) }}</template>
+        </el-table-column>
+        <el-table-column label="DB 版本" width="150">
+          <template #default="{ row }">
+            <span class="mono">{{ textOrDash(row.db_version) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="升级状态" width="105">
+          <template #default="{ row }">
+            <el-tag
+              v-if="row.upgrade_status"
+              :type="upgradeStatusType(row.upgrade_status)"
+              size="small"
+              disable-transitions
+            >
+              {{ upgradeStatusText(row.upgrade_status) }}
+            </el-tag>
+            <span v-else class="text-muted">-</span>
+          </template>
         </el-table-column>
         <el-table-column label="节点" width="110">
           <template #default="{ row }">
@@ -991,7 +1134,7 @@ async function copyText(value: string | null | undefined, label: string): Promis
         <el-table-column label="创建时间" width="170">
           <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="170" fixed="right">
+        <el-table-column label="操作" width="230" fixed="right">
           <template #default="{ row }">
             <el-button
               v-if="canUpgrade(row as OpsInstance)"
@@ -1001,8 +1144,17 @@ async function copyText(value: string | null | undefined, label: string): Promis
               :loading="upgradingId === row.id"
               @click.stop="upgradeInstance(row as OpsInstance)"
             >
-              升级 {{ latestVersion }}
+              升级 {{ upgradeTargetVersion(row as OpsInstance) }}
             </el-button>
+            <el-tooltip
+              v-else
+              :content="upgradeBlockedReason(row as OpsInstance)"
+              placement="top"
+            >
+              <span class="upgrade-disabled" @click.stop>
+                <el-button text type="info" size="small" disabled>升级</el-button>
+              </span>
+            </el-tooltip>
             <el-button text type="primary" size="small" @click.stop="openDetail(row as OpsInstance)">详情</el-button>
           </template>
         </el-table-column>
@@ -1190,8 +1342,8 @@ async function copyText(value: string | null | undefined, label: string): Promis
               {{ instanceStatusText(currentInstance.status) }}
             </el-tag>
           </el-descriptions-item>
-          <el-descriptions-item label="应用版本">
-            {{ textOrDash(currentInstance.app_version) }}
+          <el-descriptions-item label="实际版本">
+            {{ actualVersionFor(currentInstance) }}
           </el-descriptions-item>
           <el-descriptions-item label="创建时间">
             {{ formatDateTime(currentInstance.created_at) }}
@@ -1207,6 +1359,38 @@ async function copyText(value: string | null | undefined, label: string): Promis
           </el-descriptions-item>
           <el-descriptions-item label="备注" :span="2">
             {{ textOrDash(currentInstance.notes) }}
+          </el-descriptions-item>
+        </el-descriptions>
+
+        <div class="section-head">
+          <span>发布与升级</span>
+        </div>
+        <el-descriptions :column="2" border size="small" class="detail-descriptions">
+          <el-descriptions-item label="目标版本">
+            <span class="mono">{{ textOrDash(currentInstance.target_version) }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="升级状态">
+            <el-tag
+              v-if="currentInstance.upgrade_status"
+              :type="upgradeStatusType(currentInstance.upgrade_status)"
+              size="small"
+              disable-transitions
+            >
+              {{ upgradeStatusText(currentInstance.upgrade_status) }}
+            </el-tag>
+            <span v-else class="text-muted">-</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="Agent 版本">
+            {{ textOrDash(currentInstance.agent_version) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="Executor 版本">
+            {{ textOrDash(currentInstance.executor_version) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="DB 版本">
+            <span class="mono">{{ textOrDash(currentInstance.db_version) }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="目标发布 commit">
+            <span class="commit-full mono">{{ targetReleaseCommit(currentInstance) }}</span>
           </el-descriptions-item>
         </el-descriptions>
 
@@ -1251,10 +1435,14 @@ async function copyText(value: string | null | undefined, label: string): Promis
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="版本" width="130">
+          <el-table-column label="运行版本" width="205">
             <template #default="{ row }">
               <div>Agent {{ textOrDash(row.agent_version) }}</div>
-              <div class="text-muted">应用 {{ textOrDash(row.app_version) }}</div>
+              <div class="text-muted">
+                Executor {{ textOrDash(row.executor_version) }} · 协议 {{ row.protocol_version ?? '-' }}
+              </div>
+              <div class="text-muted">应用 {{ textOrDash(row.actual_version || row.app_version) }}</div>
+              <div class="text-muted">DB {{ textOrDash(row.db_version) }}</div>
             </template>
           </el-table-column>
           <el-table-column label="最近指标" min-width="150">
@@ -1753,6 +1941,21 @@ async function copyText(value: string | null | undefined, label: string): Promis
 
 .node-id {
   margin-top: 2px;
+}
+
+.commit-full {
+  display: inline-block;
+  max-width: 100%;
+  line-height: 1.5;
+  white-space: normal;
+  word-break: break-all;
+  font-size: 11px;
+}
+
+.upgrade-disabled {
+  display: inline-flex;
+  margin-right: 12px;
+  vertical-align: middle;
 }
 
 .drawer-body {

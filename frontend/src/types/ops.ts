@@ -28,6 +28,13 @@ export interface OpsInstance {
   environment: OpsEnvironment | string
   status: OpsInstanceStatus | string
   app_version: string
+  /** 批次1新增发布/升级展示字段；旧接口可能缺失 */
+  target_version?: string | null
+  actual_version?: string | null
+  agent_version?: string | null
+  executor_version?: string | null
+  db_version?: string | null
+  upgrade_status?: string | null
   notes: string
   created_at?: string | null
   node_count: number
@@ -81,6 +88,11 @@ export interface OpsServerNode {
   observed_public_ip: string
   agent_version: string
   app_version: string
+  /** 节点实际上报的应用版本（批次1新增） */
+  actual_version?: string | null
+  executor_version?: string | null
+  protocol_version?: number | null
+  db_version?: string | null
   status: OpsNodeStatus | string
   enrolled_at?: string | null
   last_seen_at?: string | null

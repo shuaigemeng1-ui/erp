@@ -4,7 +4,14 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { Plus, Refresh, Search } from '@element-plus/icons-vue'
 import { opsApi } from '@/api/ops'
-import type { OpsBackup, OpsJobType, OpsOperation, OpsRelease } from '@/api/ops'
+import type {
+  OpsBackup,
+  OpsBuildStatus,
+  OpsJobType,
+  OpsOperation,
+  OpsRelease,
+  OpsReleaseStatus,
+} from '@/api/ops'
 import { useTableQuery } from '@/composables/useTableQuery'
 import PaginationBar from '@/components/PaginationBar.vue'
 import IdCopy from '@/components/IdCopy.vue'
@@ -97,6 +104,46 @@ function releaseStatusText(status?: string | null): string {
   return textOrDash(status)
 }
 
+function buildStatusType(status?: string | null): TagType {
+  if (status === 'verified') return 'success'
+  if (status === 'built') return 'warning'
+  if (status === 'failed') return 'danger'
+  return 'info'
+}
+
+function buildStatusText(status?: string | null): string {
+  if (status === 'verified') return '已验证'
+  if (status === 'built') return '已构建'
+  if (status === 'failed') return '构建失败'
+  return textOrDash(status)
+}
+
+function rollbackType(compatible?: boolean | null): TagType {
+  if (compatible === true) return 'success'
+  if (compatible === false) return 'danger'
+  return 'info'
+}
+
+function rollbackText(compatible?: boolean | null): string {
+  if (compatible === true) return '旧应用兼容'
+  if (compatible === false) return '不兼容'
+  return '-'
+}
+
+function minAgentProtocolText(value?: number | null): string {
+  const parsed = Number(value ?? 0)
+  return Number.isFinite(parsed) && parsed > 0 ? String(parsed) : '-'
+}
+
+function isFullCommit(commitSha?: string | null): boolean {
+  return /^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test((commitSha ?? '').trim())
+}
+
+function commitShaText(commitSha?: string | null): string {
+  const value = (commitSha ?? '').trim()
+  return value || '-'
+}
+
 function operationStatusType(status?: string | null): TagType {
   if (status === 'succeeded') return 'success'
   if (status === 'leased' || status === 'running') return 'warning'
@@ -182,14 +229,30 @@ const releaseSubmitting = ref(false)
 const releaseFormRef = ref<FormInstance>()
 const releaseForm = reactive({
   version: '',
+  commit_sha: '',
   image_tag: '',
   image_digest: '',
+  status: 'active' as OpsReleaseStatus,
+  build_config_summary: '',
+  min_agent_protocol: 0,
+  center_db_version: '',
+  tenant_db_version: '',
+  rollback_compatible: false,
+  build_status: 'built' as OpsBuildStatus,
   notes: '',
 })
 const releaseRules: FormRules = {
   version: [
     { required: true, message: '请输入版本号', trigger: 'blur' },
     { max: 64, message: '版本号不能超过 64 个字符', trigger: 'blur' },
+  ],
+  commit_sha: [
+    { required: true, message: '请输入完整 Git commit', trigger: 'blur' },
+    {
+      pattern: /^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/,
+      message: '必须是完整 40 或 64 位十六进制 commit',
+      trigger: 'blur',
+    },
   ],
 }
 
@@ -206,8 +269,16 @@ async function loadReleases(): Promise<void> {
 
 function openReleaseCreate(): void {
   releaseForm.version = ''
+  releaseForm.commit_sha = ''
   releaseForm.image_tag = ''
   releaseForm.image_digest = ''
+  releaseForm.status = 'active'
+  releaseForm.build_config_summary = ''
+  releaseForm.min_agent_protocol = 0
+  releaseForm.center_db_version = ''
+  releaseForm.tenant_db_version = ''
+  releaseForm.rollback_compatible = false
+  releaseForm.build_status = 'built'
   releaseForm.notes = ''
   releaseDialogVisible.value = true
 }
@@ -217,12 +288,25 @@ async function submitRelease(): Promise<void> {
   if (!formInstance) return
   const valid = await formInstance.validate().catch(() => false)
   if (!valid) return
+  const commitSha = releaseForm.commit_sha.trim().toLowerCase()
+  if (!isFullCommit(commitSha)) {
+    ElMessage.warning('commit_sha 必须是完整 40/64 位十六进制字符串')
+    return
+  }
   releaseSubmitting.value = true
   try {
     await opsApi.createRelease({
       version: releaseForm.version.trim(),
+      commit_sha: commitSha,
       image_tag: releaseForm.image_tag.trim(),
       image_digest: releaseForm.image_digest.trim(),
+      status: releaseForm.status,
+      build_config_summary: releaseForm.build_config_summary.trim(),
+      min_agent_protocol: Number(releaseForm.min_agent_protocol) || 0,
+      center_db_version: releaseForm.center_db_version.trim(),
+      tenant_db_version: releaseForm.tenant_db_version.trim(),
+      rollback_compatible: releaseForm.rollback_compatible,
+      build_status: releaseForm.build_status,
       notes: releaseForm.notes.trim(),
     })
     ElMessage.success('发布版本已登记')
@@ -372,32 +456,77 @@ onMounted(() => {
           </div>
 
           <el-table v-loading="releaseLoading" :data="releases" border size="small" row-key="id">
-            <el-table-column label="ID" width="110">
+            <el-table-column label="ID" width="100">
               <template #default="{ row }"><IdCopy :id="row.id" /></template>
             </el-table-column>
-            <el-table-column label="版本号" min-width="130">
+            <el-table-column label="版本号" width="130">
               <template #default="{ row }">
                 <span class="mono">{{ textOrDash(row.version) }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="状态" width="95">
+            <el-table-column label="发布状态" width="95">
               <template #default="{ row }">
                 <el-tag :type="releaseStatusType(row.status)" size="small" disable-transitions>
                   {{ releaseStatusText(row.status) }}
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="镜像标签" min-width="200" show-overflow-tooltip>
+            <el-table-column label="构建状态" width="100">
               <template #default="{ row }">
-                <span class="mono">{{ textOrDash(row.image_tag) }}</span>
+                <el-tag
+                  v-if="row.build_status"
+                  :type="buildStatusType(row.build_status)"
+                  size="small"
+                  disable-transitions
+                >
+                  {{ buildStatusText(row.build_status) }}
+                </el-tag>
+                <span v-else class="text-muted">-</span>
               </template>
             </el-table-column>
-            <el-table-column label="镜像摘要" min-width="220" show-overflow-tooltip>
+            <el-table-column label="完整 commit" min-width="300">
               <template #default="{ row }">
-                <span class="mono">{{ textOrDash(row.image_digest) }}</span>
+                <span class="commit-full mono">{{ commitShaText(row.commit_sha) }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="发布说明" min-width="200" show-overflow-tooltip>
+            <el-table-column label="构建配置摘要" min-width="200" show-overflow-tooltip>
+              <template #default="{ row }">{{ textOrDash(row.build_config_summary) }}</template>
+            </el-table-column>
+            <el-table-column label="最低 Agent 协议" width="125">
+              <template #default="{ row }">{{ minAgentProtocolText(row.min_agent_protocol) }}</template>
+            </el-table-column>
+            <el-table-column label="DB 目标版本" min-width="190">
+              <template #default="{ row }">
+                <div class="version-line">
+                  <span class="text-muted">中心库</span>
+                  <span class="mono">{{ textOrDash(row.center_db_version) }}</span>
+                </div>
+                <div class="version-line">
+                  <span class="text-muted">租户库</span>
+                  <span class="mono">{{ textOrDash(row.tenant_db_version) }}</span>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="回退兼容" width="115">
+              <template #default="{ row }">
+                <el-tag
+                  v-if="typeof row.rollback_compatible === 'boolean'"
+                  :type="rollbackType(row.rollback_compatible)"
+                  size="small"
+                  disable-transitions
+                >
+                  {{ rollbackText(row.rollback_compatible) }}
+                </el-tag>
+                <span v-else class="text-muted">-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="镜像" min-width="230" show-overflow-tooltip>
+              <template #default="{ row }">
+                <div class="mono">{{ textOrDash(row.image_tag) }}</div>
+                <div class="version-line text-muted mono">{{ textOrDash(row.image_digest) }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column label="发布说明" min-width="180" show-overflow-tooltip>
               <template #default="{ row }">{{ textOrDash(row.notes) }}</template>
             </el-table-column>
             <el-table-column label="创建时间" width="170">
@@ -582,10 +711,33 @@ onMounted(() => {
   </div>
 
   <!-- 新建发布版本 -->
-  <el-dialog v-model="releaseDialogVisible" title="新建发布版本" width="560px" destroy-on-close>
-    <el-form ref="releaseFormRef" :model="releaseForm" :rules="releaseRules" label-width="90px">
+  <el-dialog v-model="releaseDialogVisible" title="新建发布版本" width="680px" destroy-on-close>
+    <el-form ref="releaseFormRef" :model="releaseForm" :rules="releaseRules" label-width="110px">
       <el-form-item label="版本号" prop="version">
         <el-input v-model="releaseForm.version" maxlength="64" placeholder="如 v1.2.3" />
+      </el-form-item>
+      <el-form-item label="完整 commit" prop="commit_sha">
+        <el-input
+          v-model="releaseForm.commit_sha"
+          maxlength="64"
+          class="mono-input"
+          placeholder="完整 40 或 64 位 Git commit，不允许缩写"
+        />
+        <div class="form-tip">升级仅对完整 commit + active + verified 的发布版本开放。</div>
+      </el-form-item>
+      <el-form-item label="发布状态">
+        <el-select v-model="releaseForm.status" style="width: 100%">
+          <el-option label="草稿" value="draft" />
+          <el-option label="启用" value="active" />
+          <el-option label="已下线" value="retired" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="构建状态">
+        <el-select v-model="releaseForm.build_status" style="width: 100%">
+          <el-option label="已构建（不可升级）" value="built" />
+          <el-option label="已验证（可升级）" value="verified" />
+          <el-option label="构建失败" value="failed" />
+        </el-select>
       </el-form-item>
       <el-form-item label="镜像标签">
         <el-input
@@ -596,6 +748,45 @@ onMounted(() => {
       </el-form-item>
       <el-form-item label="镜像摘要">
         <el-input v-model="releaseForm.image_digest" maxlength="255" placeholder="如 sha256:..." />
+      </el-form-item>
+      <el-form-item label="构建配置摘要">
+        <el-input
+          v-model="releaseForm.build_config_summary"
+          type="textarea"
+          :rows="2"
+          maxlength="1000"
+          show-word-limit
+          placeholder="如 build profile、镜像构建参数、依赖锁定摘要"
+        />
+      </el-form-item>
+      <el-form-item label="最低 Agent 协议">
+        <el-input-number
+          v-model="releaseForm.min_agent_protocol"
+          :min="0"
+          :step="1"
+          :precision="0"
+          controls-position="right"
+          style="width: 180px"
+        />
+        <span class="form-inline-tip">0 表示未声明</span>
+      </el-form-item>
+      <el-form-item label="中心库目标版本">
+        <el-input
+          v-model="releaseForm.center_db_version"
+          maxlength="64"
+          placeholder="如 center_0016"
+        />
+      </el-form-item>
+      <el-form-item label="租户库目标版本">
+        <el-input
+          v-model="releaseForm.tenant_db_version"
+          maxlength="64"
+          placeholder="如 tenant_0014"
+        />
+      </el-form-item>
+      <el-form-item label="回退兼容">
+        <el-switch v-model="releaseForm.rollback_compatible" />
+        <span class="form-inline-tip">允许旧应用继续兼容新库时开启</span>
       </el-form-item>
       <el-form-item label="发布说明">
         <el-input v-model="releaseForm.notes" type="textarea" :rows="3" maxlength="500" show-word-limit />
@@ -703,6 +894,33 @@ onMounted(() => {
 
 .section-title .text-muted {
   font-weight: 400;
+}
+
+.version-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  line-height: 1.6;
+  font-size: 12px;
+}
+
+.commit-full {
+  display: inline-block;
+  max-width: 100%;
+  line-height: 1.5;
+  white-space: normal;
+  word-break: break-all;
+  font-size: 11px;
+}
+
+.mono-input :deep(.el-input__inner) {
+  font-family: Consolas, 'SFMono-Regular', Menlo, monospace;
+}
+
+.form-inline-tip {
+  margin-left: 8px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
 }
 
 .payload-input :deep(.el-textarea__inner) {

@@ -1121,17 +1121,34 @@ def ensure_access_token(
         return access_token
 
     lock_name = f"shopee:token:{tenant_id}:{store_id}"
-    try:
-        lock_token = acquire_lock(lock_name, ttl_seconds=TOKEN_REFRESH_LOCK_TTL_SECONDS)
-    except Exception as exc:  # noqa: BLE001 - 缓存不可用统一转 503
-        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "缓存服务不可用") from exc
-    if lock_token is None:
-        # 其他任务正在刷新：重新读取一次，避免重复刷新
+    from app.modules.channels import gateway_relay
+
+    gateway_lock = gateway_relay.acquire_refresh_lock(
+        tenant_id=tenant_id,
+        store_id=store_id,
+        channel=CHANNEL_SHOPEE,
+        ttl_seconds=TOKEN_REFRESH_LOCK_TTL_SECONDS,
+    )
+    lock_token = None
+    if gateway_lock == "busy":
+        # 网关显示其他执行者正在刷新：重新读取，避免重复刷新
         credential = repo.get_credential(db, tenant_id, store_id)
         access_token, _ = _decrypt_tokens(credential)
         if credential is not None and _token_is_usable(credential, access_token):
             return access_token
         raise AppError(ErrorCode.JOB_IN_PROGRESS, "店铺令牌正在刷新，请稍后重试")
+    if gateway_lock is None:
+        try:
+            lock_token = acquire_lock(lock_name, ttl_seconds=TOKEN_REFRESH_LOCK_TTL_SECONDS)
+        except Exception as exc:  # noqa: BLE001 - 缓存不可用统一转 503
+            raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "缓存服务不可用") from exc
+        if lock_token is None:
+            # 其他任务正在刷新：重新读取一次，避免重复刷新
+            credential = repo.get_credential(db, tenant_id, store_id)
+            access_token, _ = _decrypt_tokens(credential)
+            if credential is not None and _token_is_usable(credential, access_token):
+                return access_token
+            raise AppError(ErrorCode.JOB_IN_PROGRESS, "店铺令牌正在刷新，请稍后重试")
     try:
         credential = repo.get_credential(db, tenant_id, store_id)
         access_token, refresh_token = _decrypt_tokens(credential)
@@ -1185,10 +1202,13 @@ def ensure_access_token(
         db.commit()
         raise AppError(ErrorCode.STORE_REAUTH_REQUIRED, "店铺凭据已失效，请重新授权") from exc
     finally:
-        try:
-            release_lock(lock_name, lock_token)
-        except Exception:  # noqa: BLE001 - 释放锁失败不影响业务结果
-            logger.warning("释放店铺令牌刷新锁失败：%s", lock_name)
+        if gateway_lock is not None:
+            gateway_lock.release()
+        else:
+            try:
+                release_lock(lock_name, lock_token)
+            except Exception:  # noqa: BLE001 - 释放锁失败不影响业务结果
+                logger.warning("释放店铺令牌刷新锁失败：%s", lock_name)
 
 
 def refresh_store_token(
@@ -1259,41 +1279,86 @@ def build_tiktok_client(
 
     if not force_refresh and credential is not None and _token_is_usable(credential, access_token):
         return make_client(access_token)
-    if not refresh_token:
-        mark_store_reauth_required(db, tenant_id, store.id, "刷新令牌缺失")
-        db.commit()
-        raise AppError(ErrorCode.STORE_REAUTH_REQUIRED)
-    refresh_client = TikTokClient(
-        app_key=config.app_key,
-        app_secret=config.app_secret,
-        access_token=access_token,
-        shop_cipher=shop_cipher,
+    from app.modules.channels import gateway_relay
+
+    gateway_enabled = gateway_relay.refresh_lock_enabled()
+    gateway_lock = (
+        gateway_relay.acquire_refresh_lock(
+            tenant_id=tenant_id,
+            store_id=store.id,
+            channel=CHANNEL_TIKTOK,
+            ttl_seconds=TOKEN_REFRESH_LOCK_TTL_SECONDS,
+        )
+        if gateway_enabled
+        else None
     )
+    local_lock = None
+    lock_name = f"tiktok:token:{tenant_id}:{store.id}"
+    if gateway_lock == "busy":
+        credential = repo.get_credential(db, tenant_id, store.id)
+        access_token, _refresh = _decrypt_tokens(credential)
+        if credential is not None and _token_is_usable(credential, access_token):
+            return make_client(access_token)
+        raise AppError(ErrorCode.JOB_IN_PROGRESS, "店铺令牌正在刷新，请稍后重试")
+    if gateway_lock is None and gateway_enabled:
+        try:
+            local_lock = acquire_lock(lock_name, ttl_seconds=TOKEN_REFRESH_LOCK_TTL_SECONDS)
+        except Exception as exc:  # noqa: BLE001 - 缓存不可用统一转 503
+            raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "缓存服务不可用") from exc
+        if local_lock is None:
+            credential = repo.get_credential(db, tenant_id, store.id)
+            access_token, _refresh = _decrypt_tokens(credential)
+            if credential is not None and _token_is_usable(credential, access_token):
+                return make_client(access_token)
+            raise AppError(ErrorCode.JOB_IN_PROGRESS, "店铺令牌正在刷新，请稍后重试")
     try:
-        raw = refresh_client.refresh_token(refresh_token)
-    except TikTokApiError as exc:
-        raise _tiktok_error(exc) from exc
-    finally:
-        refresh_client.close()
-    token = normalize_tiktok_token(raw)
-    if not token["access_token"]:
-        mark_store_reauth_required(db, tenant_id, store.id, "刷新令牌未返回访问令牌")
+        credential = repo.get_credential(db, tenant_id, store.id)
+        access_token, refresh_token = _decrypt_tokens(credential)
+        if not force_refresh and credential is not None and _token_is_usable(credential, access_token):
+            return make_client(access_token)
+        if not refresh_token:
+            mark_store_reauth_required(db, tenant_id, store.id, "刷新令牌缺失")
+            db.commit()
+            raise AppError(ErrorCode.STORE_REAUTH_REQUIRED)
+        refresh_client = TikTokClient(
+            app_key=config.app_key,
+            app_secret=config.app_secret,
+            access_token=access_token,
+            shop_cipher=shop_cipher,
+        )
+        try:
+            raw = refresh_client.refresh_token(refresh_token)
+        except TikTokApiError as exc:
+            raise _tiktok_error(exc) from exc
+        finally:
+            refresh_client.close()
+        token = normalize_tiktok_token(raw)
+        if not token["access_token"]:
+            mark_store_reauth_required(db, tenant_id, store.id, "刷新令牌未返回访问令牌")
+            db.commit()
+            raise AppError(ErrorCode.STORE_REAUTH_REQUIRED)
+        credential = repo.get_credential(db, tenant_id, store.id)
+        if credential is None:  # pragma: no cover
+            raise AppError(ErrorCode.STORE_NOT_CONNECTED)
+        access_expires, refresh_expires = tiktok_token_expiry_times(token)
+        credential.access_token_cipher = encrypt_secret(token["access_token"])
+        if token["refresh_token"]:
+            credential.refresh_token_cipher = encrypt_secret(token["refresh_token"])
+        credential.access_token_expires_at = access_expires
+        credential.refresh_token_expires_at = refresh_expires
+        credential.status = CREDENTIAL_STATUS_ACTIVE
+        credential.refreshed_at = utc_now()
+        credential.last_error = None
         db.commit()
-        raise AppError(ErrorCode.STORE_REAUTH_REQUIRED)
-    credential = repo.get_credential(db, tenant_id, store.id)
-    if credential is None:  # pragma: no cover
-        raise AppError(ErrorCode.STORE_NOT_CONNECTED)
-    access_expires, refresh_expires = tiktok_token_expiry_times(token)
-    credential.access_token_cipher = encrypt_secret(token["access_token"])
-    if token["refresh_token"]:
-        credential.refresh_token_cipher = encrypt_secret(token["refresh_token"])
-    credential.access_token_expires_at = access_expires
-    credential.refresh_token_expires_at = refresh_expires
-    credential.status = CREDENTIAL_STATUS_ACTIVE
-    credential.refreshed_at = utc_now()
-    credential.last_error = None
-    db.commit()
-    return make_client(token["access_token"])
+        return make_client(token["access_token"])
+    finally:
+        if isinstance(gateway_lock, gateway_relay.GatewayRefreshLock):
+            gateway_lock.release()
+        elif local_lock:
+            try:
+                release_lock(lock_name, local_lock)
+            except Exception:  # noqa: BLE001 - 释放锁失败不影响业务结果
+                logger.warning("释放 TikTok 令牌刷新锁失败：%s", lock_name)
 
 
 def _tiktok_listing_status(product: Mapping[str, Any]) -> str:

@@ -97,8 +97,15 @@ class InstanceVerifyIn(BaseModel):
 class OAuthStateIn(BaseModel):
     channel: str = Field(min_length=1, max_length=32)
     environment: str = Field(min_length=1, max_length=16)
-    store_id: int = Field(gt=0)
+    # 0 表示“新建店铺”授权（租户侧稍后落库），>0 时校验实例店铺白名单
+    store_id: int = Field(default=0, ge=0)
     redirect_path: str = Field(default="", max_length=500)
+    # 租户授权上下文（authorization_link_id/member_id 等），网关只做不透明存储与一次性回传
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class OAuthResolveIn(BaseModel):
+    state: str = Field(min_length=1, max_length=256)
 
 
 class RefreshLockIn(BaseModel):
@@ -410,7 +417,12 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
         environment = body.environment.strip().lower()
         _validate_channel_env(cfg, channel, environment)
         scope_check(instance, channel=channel, environment=environment)
-        store_check(instance, body.store_id)
+        if body.store_id > 0:
+            store_check(instance, body.store_id)
+        context = dict(body.context or {})
+        encoded_context = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded_context.encode("utf-8")) > 4096:
+            raise _error(422, "gateway_oauth_context_too_large", "授权上下文超过 4KB")
         state = new_oauth_state()
         state_hash = oauth_state_hash(cfg, state)
         record = store.create_oauth_state(
@@ -422,6 +434,7 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
             environment=environment,
             redirect_path=body.redirect_path,
             ttl_seconds=cfg.oauth_state_ttl_seconds,
+            context=context,
         )
         return {
             "state": state,
@@ -434,6 +447,34 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
             "expires_at_iso": _iso_from_epoch(int(record["expires_at"])),
             "callback_url": instance.get("callback_url") or cfg.legacy_default_callback,
         }
+
+    @application.post("/api/v1/gateway/instance/oauth/resolve")
+    def resolve_oauth_state(body: OAuthResolveIn, request: Request) -> dict[str, Any]:
+        """租户回调凭网关 state 一次性换取绑定上下文（回调完成后，state 已消费）。"""
+        instance = require_instance(request)
+        limit_instance(instance, request)
+        payload, reason = store.resolve_oauth_state(
+            oauth_state_hash(cfg, body.state), instance_id=int(instance["id"])
+        )
+        if payload is None:
+            status = 403 if reason == "instance_mismatch" else 410
+            if reason == "not_found":
+                status = 404
+            elif reason == "not_used":
+                status = 409
+            raise _error(
+                status,
+                f"gateway_oauth_state_{reason}",
+                {
+                    "not_found": "授权 state 不存在",
+                    "instance_mismatch": "授权 state 不属于本实例",
+                    "not_used": "授权回调尚未完成，不能解析 state",
+                    "expired": "授权 state 已过期",
+                    "replayed": "授权 state 已被解析（重放被拒绝）",
+                }.get(reason, "授权 state 无效"),
+            )
+        payload["auth_mode"] = "instance"
+        return payload
 
     # ------------------------------------------------------------------ 刷新锁
     def _lock_key(instance: Mapping[str, Any], key: str) -> str:
@@ -573,6 +614,7 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
             extra = {
                 "gateway_instance_id": str(instance["id"]),
                 "gateway_state": state,
+                "gateway_channel": channel_value,
             }
             location = _append_query(target, {**dict(parse_qsl(request.url.query)), **extra})
             return RedirectResponse(url=location, status_code=302)

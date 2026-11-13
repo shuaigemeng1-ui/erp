@@ -375,6 +375,12 @@ def shopee_oauth_callback(
     code: str | None = Query(default=None), shop_id: str | None = Query(default=None),
     state: str | None = Query(default=None), error: str | None = Query(default=None),
 ) -> RedirectResponse:
+    return _handle_shopee_callback(code=code, shop_id=shop_id, state=state, error=error)
+
+
+def _handle_shopee_callback(
+    *, code: str | None, shop_id: str | None, state: str | None, error: str | None
+) -> RedirectResponse:
     from app.modules.channels.authorization import validate_link, persist_result
     redirect_path = None
     try:
@@ -589,6 +595,12 @@ def tiktok_oauth_callback(
     code: str | None = Query(default=None), state: str | None = Query(default=None),
     error: str | None = Query(default=None),
 ) -> Response:
+    return _handle_tiktok_callback(code=code, state=state, error=error)
+
+
+def _handle_tiktok_callback(
+    *, code: str | None, state: str | None, error: str | None
+) -> Response:
     from app.modules.channels.authorization import validate_link, persist_result, selection_response
     redirect_path = None
     try:
@@ -609,4 +621,26 @@ def tiktok_oauth_callback(
     except Exception:
         logger.exception("保存 TikTok 授权结果失败")
         return RedirectResponse(tiktok_oauth.callback_error_redirect(redirect_path=redirect_path, reason="internal_error"), status_code=302)
+
+
+@router.get("/integrations/gateway/oauth/callback", include_in_schema=False)
+def gateway_oauth_callback(
+    channel: str | None = Query(default=None),
+    gateway_channel: str | None = Query(default=None),
+    code: str | None = Query(default=None),
+    shop_id: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+) -> Response:
+    """网关 OAuth callback 统一落地：按 gateway_channel 分发到 Shopee / TikTok 回调。
+
+    网关实例 callback_url 建议配置为本路径，state 已由网关一次性校验；本端点继续
+    使用 ``consume_state`` 的网关 resolve 分支完成租户侧一次性消费。
+    """
+    selected = (channel or gateway_channel or "").strip().lower()
+    if selected == "shopee":
+        return _handle_shopee_callback(code=code, shop_id=shop_id, state=state, error=error)
+    if selected == "tiktok":
+        return _handle_tiktok_callback(code=code, state=state, error=error)
+    raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "未知的网关授权渠道")
 

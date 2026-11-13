@@ -831,6 +831,79 @@ def test_channels_use_instance_token_first_and_fallback_legacy(monkeypatch) -> N
     assert fake.calls == ["legacy"]
 
 
+def test_oauth_state_context_resolve_once_for_instance(gateway) -> None:
+    client, _app, _cfg = gateway
+    put_channel_app(client, "shopee", "test")
+    a = create_instance(
+        client,
+        tenant_id=1,
+        name="a",
+        callback_url="https://tenant-a.example.com/cb",
+        store_ids=[11],
+        channels=["shopee"],
+    )
+    b = create_instance(
+        client,
+        tenant_id=2,
+        name="b",
+        callback_url="https://tenant-b.example.com/cb",
+        store_ids=[21],
+        channels=["shopee"],
+    )
+    created = client.post(
+        "/api/v1/gateway/instance/oauth/states",
+        headers=instance_headers(a),
+        json={
+            "channel": "shopee",
+            "environment": "test",
+            "store_id": 11,
+            "redirect_path": "/tenants/1/stores",
+            "context": {"authorization_link_id": 91, "member_id": 5, "redirect_path": "/tenants/1/stores"},
+        },
+    )
+    assert created.status_code == 200, created.text
+    state = created.json()["state"]
+    # 未完成网关回调前不能解析
+    not_used = client.post(
+        "/api/v1/gateway/instance/oauth/resolve",
+        headers=instance_headers(a),
+        json={"state": state},
+    )
+    assert not_used.status_code == 409
+    # 其他实例不能解析
+    other = client.post(
+        "/api/v1/gateway/instance/oauth/resolve",
+        headers=instance_headers(b),
+        json={"state": state},
+    )
+    assert other.status_code == 403
+    callback = client.get(
+        "/api/v1/gateway/oauth/shopee/callback",
+        params={"state": state, "code": "CODE-1", "shop_id": "1001"},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302
+    assert "gateway_channel=shopee" in callback.headers["location"]
+    resolved = client.post(
+        "/api/v1/gateway/instance/oauth/resolve",
+        headers=instance_headers(a),
+        json={"state": state},
+    )
+    assert resolved.status_code == 200, resolved.text
+    payload = resolved.json()
+    assert payload["context"]["authorization_link_id"] == 91
+    assert payload["channel"] == "shopee"
+    assert payload["tenant_id"] == "1"
+    # 一次性：重放 410
+    replay = client.post(
+        "/api/v1/gateway/instance/oauth/resolve",
+        headers=instance_headers(a),
+        json={"state": state},
+    )
+    assert replay.status_code == 410
+    assert replay.json()["error"]["code"] == "gateway_oauth_state_replayed"
+
+
 # --------------------------------------------------------------------------- 持久化 / 加密 / 审计
 def test_sqlite_persistence_and_secret_encryption(gateway) -> None:
     client, _app, cfg = gateway

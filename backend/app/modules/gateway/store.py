@@ -89,9 +89,11 @@ CREATE TABLE IF NOT EXISTS gateway_oauth_states (
     channel TEXT NOT NULL,
     environment TEXT NOT NULL,
     redirect_path TEXT NOT NULL DEFAULT '',
+    context_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     expires_at INTEGER NOT NULL,
     used_at TEXT,
+    resolved_at TEXT,
     used_ip TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_gateway_oauth_states_expires ON gateway_oauth_states(expires_at);
@@ -219,6 +221,21 @@ class GatewayStore:
             with self._read() as connection:
                 connection.executescript(SCHEMA)
             with self._write() as connection:
+                # 旧网关 SQLite 升级：oauth_states 增加 context_json/resolved_at。
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(gateway_oauth_states)"
+                    ).fetchall()
+                }
+                if "context_json" not in columns:
+                    connection.execute(
+                        "ALTER TABLE gateway_oauth_states ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}'"
+                    )
+                if "resolved_at" not in columns:
+                    connection.execute(
+                        "ALTER TABLE gateway_oauth_states ADD COLUMN resolved_at TEXT"
+                    )
                 for key, value in DEFAULT_SETTINGS.items():
                     row = connection.execute(
                         "SELECT value FROM gateway_settings WHERE key = ?", (key,)
@@ -508,6 +525,7 @@ class GatewayStore:
         environment: str,
         redirect_path: str,
         ttl_seconds: int,
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._ensure()
         now_epoch = epoch_now()
@@ -516,8 +534,8 @@ class GatewayStore:
             connection.execute(
                 """INSERT INTO gateway_oauth_states
                    (state_hash, instance_id, tenant_id, store_id, channel, environment,
-                    redirect_path, created_at, expires_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    redirect_path, context_json, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     state_hash,
                     int(instance_id),
@@ -526,6 +544,7 @@ class GatewayStore:
                     channel,
                     environment,
                     redirect_path,
+                    json.dumps(context or {}, ensure_ascii=False, separators=(",", ":")),
                     created_at,
                     now_epoch + max(30, int(ttl_seconds)),
                 ),
@@ -576,6 +595,53 @@ class GatewayStore:
                 "channel": row["channel"],
                 "environment": row["environment"],
                 "redirect_path": row["redirect_path"],
+                "created_at": row["created_at"],
+                "expires_at": int(row["expires_at"] or 0),
+            },
+            "",
+        )
+
+    def resolve_oauth_state(
+        self, state_hash: str, *, instance_id: int
+    ) -> tuple[dict[str, Any] | None, str]:
+        """租户实例用 state 解析授权上下文（回调完成后一次性换取）。
+
+        state 必须已被网关回调消费（``used_at`` 非空），且只能由所属实例解析一次；
+        返回 ``(payload, reason)``，reason: not_found/instance_mismatch/not_used/expired/replayed。
+        """
+        self._ensure()
+        now_epoch = epoch_now()
+        with self._write() as connection:
+            row = connection.execute(
+                "SELECT * FROM gateway_oauth_states WHERE state_hash = ?", (state_hash,)
+            ).fetchone()
+            if row is None:
+                return None, "not_found"
+            if str(row["instance_id"]) != str(instance_id):
+                return None, "instance_mismatch"
+            if not row["used_at"]:
+                return None, "not_used"
+            if row["resolved_at"]:
+                return None, "replayed"
+            if int(row["expires_at"] or 0) <= now_epoch:
+                return None, "expired"
+            cursor = connection.execute(
+                """UPDATE gateway_oauth_states SET resolved_at = ?
+                   WHERE state_hash = ? AND used_at IS NOT NULL AND resolved_at IS NULL""",
+                (utc_now(), state_hash),
+            )
+            if cursor.rowcount != 1:
+                return None, "replayed"
+        context = _json_loads(row["context_json"], {})
+        return (
+            {
+                "instance_id": str(row["instance_id"]),
+                "tenant_id": str(row["tenant_id"]),
+                "store_id": str(row["store_id"]),
+                "channel": row["channel"],
+                "environment": row["environment"],
+                "redirect_path": row["redirect_path"],
+                "context": context if isinstance(context, dict) else {},
                 "created_at": row["created_at"],
                 "expires_at": int(row["expires_at"] or 0),
             },

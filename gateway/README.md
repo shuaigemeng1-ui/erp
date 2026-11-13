@@ -104,11 +104,28 @@ POST /api/v1/gateway/instance/deliveries/{id}/retry
 
 > 生产变更要求：先离线/预发验证，再切流量；不要在演练或测试中修改生产密钥。
 
+## 租户 channels 接入（OAuth relay / 刷新锁，默认关闭）
+
+租户实例（channels）通过以下环境变量逐步切换，网关侧无需改配置：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GATEWAY_OAUTH_RELAY_ENABLED` | `false` | OAuth 发起走 `/instance/oauth/states`，回调由网关校验后转实例 callback_url |
+| `GATEWAY_OAUTH_RELAY_LEGACY_FALLBACK_ENABLED` | `true` | 网关 state 解析失败时回退租户本地签名 state（回滚用） |
+| `GATEWAY_REFRESH_LOCK_ENABLED` | `false` | token 刷新使用网关 `/instance/refresh-locks` 互斥（409 视为其他执行者刷新中） |
+| `GATEWAY_REFRESH_LOCK_LEGACY_FALLBACK_ENABLED` | `true` | 网关锁不可用时回退本地 Redis 锁 |
+| `GATEWAY_PUBLIC_URL` | `GATEWAY_BASE_URL` | 浏览器可达的网关地址，用于拼接 `.../api/v1/gateway/oauth/{channel}/callback` |
+
+启用 relay 时，平台需把该实例的 gateway `callback_url` 配为租户统一入口：
+`https://<tenant>/api/v1/integrations/gateway/oauth/callback`；TikTok 应用后台的
+Redirect URI、Shopee 回调地址均指向网关 `GATEWAY_PUBLIC_URL` 下的 OAuth callback。
+回调落到租户统一入口后按 `gateway_channel` 分发到 Shopee/TikTok 原回调逻辑。
+
 ## 测试
 
 ```bash
 cd backend
-python -m pytest tests/unit/test_gateway.py -q
+python -m pytest tests/unit/test_gateway.py tests/unit/test_channels_gateway_relay.py -q
 ```
 
 覆盖双实例授权回调/凭据隔离、state 重放/过期、刷新锁并发、限流、幂等重试、迁移开关、

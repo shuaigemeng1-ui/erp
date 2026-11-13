@@ -1,7 +1,13 @@
-"""长期授权邀请与一次性 OAuth state 分离；不接受旧的无消费记录签名 state。"""
+"""长期授权邀请与一次性 OAuth state 分离；不接受旧的无消费记录签名 state。
+
+批次4：配置 ``GATEWAY_OAUTH_RELAY_ENABLED`` 时，发起改走独立网关一次性 state，
+回调由网关校验后转实例 callback_url，租户回调再用 ``/instance/oauth/resolve`` 换取上下文；
+网关失败可按 legacy fallback 开关回退本地签名 state（默认开启，便于回滚）。
+"""
 from __future__ import annotations
 
 import json
+import logging
 from datetime import timedelta
 from sqlalchemy import select
 
@@ -12,6 +18,7 @@ from app.core.security import random_token, sha256_hex, utc_now, encrypt_secret,
 from app.modules.channels.models_center import AuthorizationLink
 from app.modules.channels.state import build_signed_state, parse_signed_state
 
+logger = logging.getLogger("ventasync.channels.authorization")
 TTL = 600
 
 
@@ -92,6 +99,38 @@ def create_oauth_state(row) -> str:
 
 
 def consume_state(state: str | None, channel: str) -> dict:
+    """消费 OAuth state：优先网关 relay（一次性 state），失败按开关回退本地签名 state。"""
+    from app.modules.channels import gateway_relay
+    from app.modules.gateway.client import GatewayCallError
+
+    if gateway_relay.relay_enabled() and state:
+        try:
+            resolved = gateway_relay.resolve_oauth_state(state)
+            context = dict(resolved.get("context") or {})
+            if str(resolved.get("channel") or "") != channel:
+                raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权 state 与渠道不匹配")
+            # 以网关绑定字段为准覆盖租户上下文，避免上下文被伪造。
+            context["tenant_id"] = int(resolved["tenant_id"])
+            context["channel"] = str(resolved["channel"])
+            context["environment"] = str(resolved["environment"])
+            store_id = int(resolved.get("store_id") or 0)
+            if store_id > 0:
+                context["store_id"] = store_id
+            elif context.get("store_id") in (0, "0", ""):
+                context["store_id"] = None
+            if resolved.get("redirect_path"):
+                context["redirect_path"] = str(resolved["redirect_path"])
+            if not context.get("authorization_link_id"):
+                raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "网关授权上下文缺少授权链接")
+            context["authorization_link_id"] = int(context["authorization_link_id"])
+            return context
+        except (GatewayCallError, AppError) as exc:
+            if not gateway_relay.oauth_legacy_fallback_enabled():
+                logger.warning("网关 OAuth state 解析失败且 legacy fallback 关闭：%s", exc)
+                raise AppError(
+                    ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "授权会话已失效，请重新打开授权链接"
+                ) from exc
+            logger.warning("网关 OAuth state 解析失败，回退本地 state：%s", exc)
     payload = parse_signed_state(state)
     try:
         from datetime import datetime
@@ -197,14 +236,37 @@ def open_authorization_link(token: str):
         config = service.require_channel_app(center, row.context["environment"], channel=row.channel)
         if row.context.get("application_id") != str(config.app_key if row.channel == "tiktok" else config.partner_id):
             raise AppError(ErrorCode.CHANNEL_CALLBACK_UNKNOWN, "平台应用已变更，请重新生成授权链接")
-        state = create_oauth_state(row)
+        from app.modules.channels import gateway_relay
+        from app.modules.gateway.client import GatewayCallError
+
+        gateway_state: str | None = None
+        if gateway_relay.relay_enabled():
+            try:
+                gateway_info = gateway_relay.create_oauth_state(row)
+                gateway_state = str(gateway_info.get("state") or "")
+                if not gateway_state:
+                    raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "网关未返回授权 state")
+            except (GatewayCallError, AppError) as exc:
+                if not gateway_relay.oauth_legacy_fallback_enabled():
+                    logger.warning("创建网关 OAuth state 失败且 legacy fallback 关闭：%s", exc)
+                    raise
+                logger.warning("创建网关 OAuth state 失败，回退本地 state：%s", exc)
+                gateway_state = None
+        state = gateway_state or create_oauth_state(row)
         if row.channel == "tiktok":
             url = build_authorization_url(service_id=config.app_id, state=state, market=config.region or "ROW")
         else:
             from app.modules.channels.shopee.client import resolve_base_url
+            callback_base = (
+                gateway_relay.gateway_callback_url(row.channel)
+                if gateway_state
+                else config.redirect_url
+            )
+            if not callback_base:
+                raise AppError(ErrorCode.CHANNEL_APP_NOT_CONFIGURED, "平台未配置可用的 OAuth 回调地址")
             url = build_authorize_url(auth_base=resolve_base_url(row.context["environment"]),
                 partner_id=int(config.partner_id), partner_key=config.partner_key,
-                redirect_url=append_query_params(config.redirect_url, {"state": state}))
+                redirect_url=append_query_params(callback_base, {"state": state}))
     return RedirectResponse(url, status_code=302, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 

@@ -135,6 +135,7 @@ class GatewayClient:
         environment: str,
         store_id: int | str,
         redirect_path: str = "",
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self._request(
             "POST",
@@ -145,7 +146,23 @@ class GatewayClient:
                 "environment": environment,
                 "store_id": int(store_id),
                 "redirect_path": redirect_path,
+                "context": context or {},
             },
+        )
+
+    def resolve_oauth_state(
+        self,
+        *,
+        instance_id: str,
+        instance_token: str,
+        state: str,
+    ) -> dict[str, Any]:
+        """回调完成后一次性换取绑定上下文（state 重放返回 410）。"""
+        return self._request(
+            "POST",
+            "/api/v1/gateway/instance/oauth/resolve",
+            headers=self._instance_headers(instance_id, instance_token),
+            json_body={"state": state},
         )
 
     def acquire_refresh_lock(
@@ -175,11 +192,34 @@ class GatewayClient:
         lock_key: str,
         owner: str,
     ) -> dict[str, Any]:
+        from urllib.parse import quote
+
         return self._request(
             "POST",
-            f"/api/v1/gateway/instance/refresh-locks/{lock_key}/release",
+            f"/api/v1/gateway/instance/refresh-locks/{quote(lock_key, safe='')}/release",
             headers=self._instance_headers(instance_id, instance_token),
             json_body={"owner": owner},
+        )
+
+    def renew_refresh_lock(
+        self,
+        *,
+        instance_id: str,
+        instance_token: str,
+        lock_key: str,
+        owner: str,
+        ttl_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        from urllib.parse import quote
+
+        body: dict[str, Any] = {"owner": owner}
+        if ttl_seconds is not None:
+            body["ttl_seconds"] = int(ttl_seconds)
+        return self._request(
+            "POST",
+            f"/api/v1/gateway/instance/refresh-locks/{quote(lock_key, safe='')}/renew",
+            headers=self._instance_headers(instance_id, instance_token),
+            json_body=body,
         )
 
     # ------------------------------------------------------------------ 迁移期（旧 admin token）

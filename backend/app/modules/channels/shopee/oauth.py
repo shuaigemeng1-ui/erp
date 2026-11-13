@@ -199,7 +199,10 @@ def _consume_legacy_session(state: str | None) -> dict[str, Any]:
 
 def consume_authorization_session(state: str | None) -> dict[str, Any]:
     from app.modules.channels.authorization import consume_state
-    return validate_authorization_session(consume_state(state, "shopee")) | {"authorization_link_id": parse_signed_state(state)["authorization_link_id"]}
+    payload = consume_state(state, "shopee")
+    return validate_authorization_session(payload) | {
+        "authorization_link_id": int(payload["authorization_link_id"])
+    }
 
 
 # --------------------------------------------------------------------------- 回调

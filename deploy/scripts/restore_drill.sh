@@ -270,6 +270,9 @@ problems = []
 for item in manifest.get("files", []):
     path = root / item["path"]
     if not path.is_file():
+        # 旧备份包可能没有写入空的跳过库清单，属可选元数据，不阻断恢复。
+        if Path(item["path"]).name == ".skipped_dbs":
+            continue
         problems.append(f"缺少文件 {item['path']}")
         continue
     if path.name.endswith(".enc"):

@@ -105,6 +105,7 @@ def create_valid_release(center: Session, version: str = "1.0.0", **overrides) -
         "version": version,
         "commit_sha": "a" * 40,
         "tenant_db_version": "tenant_0016",
+        "build_status": "verified",
     }
     payload.update(overrides)
     return service.create_release(center, ReleaseCreate(**payload), actor_user_id=1)
@@ -217,6 +218,14 @@ def test_legacy_release_without_commit_rejected(center: Session) -> None:
     service.ensure_release(center, "0.9.0")
     with pytest.raises(AppError) as error:
         create_upgrade_job(center, "0.9.0")
+    assert error.value.code is ErrorCode.VALIDATION_ERROR
+
+
+def test_unverified_release_rejected(center: Session) -> None:
+    seed_instance_and_node(center)
+    create_valid_release(center, "1.1.5", build_status="built")
+    with pytest.raises(AppError) as error:
+        create_upgrade_job(center, "1.1.5")
     assert error.value.code is ErrorCode.VALIDATION_ERROR
 
 

@@ -1342,6 +1342,11 @@ def validate_upgrade_target(center, instance: TenantInstance, node: ServerNode |
         )
     if release.status == "retired":
         raise AppError(ErrorCode.VALIDATION_ERROR, f"目标版本 {version} 已退役，禁止升级")
+    if (release.build_status or "").strip() != "verified":
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            f"目标版本 {version} 构建状态不是 verified，禁止升级",
+        )
     node_protocol = _safe_int(node.protocol_version) if node is not None else 0
     required_protocol = _safe_int(release.min_agent_protocol)
     if required_protocol and node_protocol and node_protocol < required_protocol:

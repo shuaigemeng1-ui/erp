@@ -81,6 +81,19 @@ export interface OpsReleaseCreatePayload {
   notes?: string
 }
 
+/** 回填旧发布版本：version/image 不可改，其余字段局部更新。 */
+export interface OpsReleaseUpdatePayload {
+  commit_sha?: string
+  build_config_summary?: string
+  min_agent_protocol?: number
+  center_db_version?: string
+  tenant_db_version?: string
+  rollback_compatible?: boolean
+  build_status?: OpsBuildStatus
+  status?: OpsReleaseStatus
+  notes?: string
+}
+
 /** 登记发布版本返回（后端现返回完整 ReleaseItem） */
 export interface OpsReleaseCreateResult {
   id: EntityId
@@ -250,6 +263,11 @@ export const opsApi = {
 
   createRelease(payload: OpsReleaseCreatePayload): Promise<OpsRelease> {
     return http.post<OpsRelease>('/platform/releases', payload)
+  },
+
+  /** 回填旧发布版本 commit/构建信息；version/image_* 不允许修改。 */
+  updateRelease(releaseId: EntityId, payload: OpsReleaseUpdatePayload): Promise<OpsRelease> {
+    return http.patch<OpsRelease>(`/platform/releases/${segment(releaseId)}`, payload)
   },
 
   operations(query: OpsOperationQuery = {}): Promise<PagedData<OpsOperation>> {

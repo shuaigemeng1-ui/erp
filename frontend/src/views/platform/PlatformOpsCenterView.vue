@@ -317,6 +317,94 @@ async function submitRelease(): Promise<void> {
   }
 }
 
+function releaseNeedsBackfill(release: OpsRelease): boolean {
+  return (
+    !isFullCommit(release.commit_sha) ||
+    release.build_status !== 'verified' ||
+    !release.build_config_summary ||
+    !Number(release.min_agent_protocol ?? 0) ||
+    !release.center_db_version ||
+    !release.tenant_db_version
+  )
+}
+
+/* ------------------------------ 回填旧发布版本 ------------------------------ */
+const releasePatchVisible = ref(false)
+const releasePatchSubmitting = ref(false)
+const releasePatchFormRef = ref<FormInstance>()
+const releasePatchTarget = ref<OpsRelease | null>(null)
+const releasePatchForm = reactive({
+  commit_sha: '',
+  build_config_summary: '',
+  min_agent_protocol: 0,
+  center_db_version: '',
+  tenant_db_version: '',
+  rollback_compatible: false,
+  build_status: 'built' as OpsBuildStatus,
+  status: 'active' as OpsReleaseStatus,
+  notes: '',
+})
+const releasePatchRules: FormRules = {
+  commit_sha: [
+    { required: true, message: '请输入完整 Git commit', trigger: 'blur' },
+    {
+      pattern: /^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/,
+      message: '必须是完整 40 或 64 位十六进制 commit',
+      trigger: 'blur',
+    },
+  ],
+}
+
+function openReleasePatch(release: OpsRelease): void {
+  releasePatchTarget.value = release
+  releasePatchForm.commit_sha = (release.commit_sha ?? '').trim()
+  releasePatchForm.build_config_summary = release.build_config_summary ?? ''
+  releasePatchForm.min_agent_protocol = Number(release.min_agent_protocol ?? 0) || 0
+  releasePatchForm.center_db_version = release.center_db_version ?? ''
+  releasePatchForm.tenant_db_version = release.tenant_db_version ?? ''
+  releasePatchForm.rollback_compatible = release.rollback_compatible === true
+  releasePatchForm.build_status =
+    release.build_status === 'verified' || release.build_status === 'failed'
+      ? release.build_status
+      : 'built'
+  releasePatchForm.status =
+    release.status === 'draft' || release.status === 'retired' ? release.status : 'active'
+  releasePatchForm.notes = release.notes ?? ''
+  releasePatchVisible.value = true
+}
+
+async function submitReleasePatch(): Promise<void> {
+  const target = releasePatchTarget.value
+  const formInstance = releasePatchFormRef.value
+  if (!target || !formInstance) return
+  const valid = await formInstance.validate().catch(() => false)
+  if (!valid) return
+  const commitSha = releasePatchForm.commit_sha.trim().toLowerCase()
+  if (!isFullCommit(commitSha)) {
+    ElMessage.warning('commit_sha 必须是完整 40/64 位十六进制字符串')
+    return
+  }
+  releasePatchSubmitting.value = true
+  try {
+    await opsApi.updateRelease(target.id, {
+      commit_sha: commitSha,
+      build_config_summary: releasePatchForm.build_config_summary.trim(),
+      min_agent_protocol: Number(releasePatchForm.min_agent_protocol) || 0,
+      center_db_version: releasePatchForm.center_db_version.trim(),
+      tenant_db_version: releasePatchForm.tenant_db_version.trim(),
+      rollback_compatible: releasePatchForm.rollback_compatible,
+      build_status: releasePatchForm.build_status,
+      status: releasePatchForm.status,
+      notes: releasePatchForm.notes.trim(),
+    })
+    ElMessage.success('发布版本已回填')
+    releasePatchVisible.value = false
+    await loadReleases()
+  } finally {
+    releasePatchSubmitting.value = false
+  }
+}
+
 /* ------------------------------ 运维任务 ------------------------------ */
 const operationQuery = reactive({
   instance_id: '',
@@ -531,6 +619,20 @@ onMounted(() => {
             </el-table-column>
             <el-table-column label="创建时间" width="170">
               <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="90" fixed="right">
+              <template #default="{ row }">
+                <el-button
+                  v-if="releaseNeedsBackfill(row as OpsRelease)"
+                  text
+                  type="primary"
+                  size="small"
+                  @click="openReleasePatch(row as OpsRelease)"
+                >
+                  回填
+                </el-button>
+                <span v-else class="text-muted">-</span>
+              </template>
             </el-table-column>
             <template #empty>
               <el-empty description="暂无发布版本，请先登记版本" :image-size="72" />
@@ -799,6 +901,103 @@ onMounted(() => {
     </template>
   </el-dialog>
 
+  <!-- 回填旧发布版本 -->
+  <el-dialog v-model="releasePatchVisible" title="回填发布版本" width="680px" destroy-on-close>
+    <el-descriptions v-if="releasePatchTarget" :column="1" border size="small" class="release-patch-meta">
+      <el-descriptions-item label="版本号">
+        <span class="mono">{{ releasePatchTarget.version }}</span>
+      </el-descriptions-item>
+      <el-descriptions-item label="镜像">
+        <span class="mono">{{ textOrDash(releasePatchTarget.image_tag) }}</span>
+        <span v-if="releasePatchTarget.image_digest" class="text-muted">
+          · {{ releasePatchTarget.image_digest }}
+        </span>
+      </el-descriptions-item>
+    </el-descriptions>
+    <el-form
+      ref="releasePatchFormRef"
+      :model="releasePatchForm"
+      :rules="releasePatchRules"
+      label-width="110px"
+    >
+      <el-form-item label="完整 commit" prop="commit_sha">
+        <el-input
+          v-model="releasePatchForm.commit_sha"
+          maxlength="64"
+          class="mono-input"
+          placeholder="回填完整 40 或 64 位 Git commit"
+        />
+        <div class="form-tip">版本号和镜像不可修改；回填后需 active + verified 才可用于升级。</div>
+      </el-form-item>
+      <el-form-item label="发布状态">
+        <el-select v-model="releasePatchForm.status" style="width: 100%">
+          <el-option label="草稿" value="draft" />
+          <el-option label="启用" value="active" />
+          <el-option label="已下线" value="retired" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="构建状态">
+        <el-select v-model="releasePatchForm.build_status" style="width: 100%">
+          <el-option label="已构建（不可升级）" value="built" />
+          <el-option label="已验证（可升级）" value="verified" />
+          <el-option label="构建失败" value="failed" />
+        </el-select>
+      </el-form-item>
+      <el-form-item label="构建配置摘要">
+        <el-input
+          v-model="releasePatchForm.build_config_summary"
+          type="textarea"
+          :rows="2"
+          maxlength="500"
+          show-word-limit
+        />
+      </el-form-item>
+      <el-form-item label="最低 Agent 协议">
+        <el-input-number
+          v-model="releasePatchForm.min_agent_protocol"
+          :min="0"
+          :max="10000"
+          :step="1"
+          :precision="0"
+          controls-position="right"
+          style="width: 180px"
+        />
+      </el-form-item>
+      <el-form-item label="中心库目标版本">
+        <el-input
+          v-model="releasePatchForm.center_db_version"
+          maxlength="64"
+          placeholder="如 center_0016"
+        />
+      </el-form-item>
+      <el-form-item label="租户库目标版本">
+        <el-input
+          v-model="releasePatchForm.tenant_db_version"
+          maxlength="64"
+          placeholder="如 tenant_0016"
+        />
+      </el-form-item>
+      <el-form-item label="回退兼容">
+        <el-switch v-model="releasePatchForm.rollback_compatible" />
+      </el-form-item>
+      <el-form-item label="发布说明">
+        <el-input
+          v-model="releasePatchForm.notes"
+          type="textarea"
+          :rows="2"
+          maxlength="500"
+          show-word-limit
+        />
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <el-button @click="releasePatchVisible = false">取消</el-button>
+      <el-button type="primary" :loading="releasePatchSubmitting" @click="submitReleasePatch">
+        保存回填
+      </el-button>
+    </template>
+  </el-dialog>
+
   <!-- 新建运维任务 -->
   <el-dialog v-model="operationDialogVisible" title="新建运维任务" width="640px" destroy-on-close>
     <el-form ref="operationFormRef" :model="operationForm" :rules="operationRules" label-width="90px">
@@ -922,6 +1121,10 @@ onMounted(() => {
   margin-left: 8px;
   color: var(--el-text-color-secondary);
   font-size: 12px;
+}
+
+.release-patch-meta {
+  margin-bottom: 12px;
 }
 
 .payload-input :deep(.el-textarea__inner) {

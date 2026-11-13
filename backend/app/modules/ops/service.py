@@ -1136,33 +1136,67 @@ def get_release_by_version(center, version: str):
     ).scalar_one_or_none()
 
 
-def ensure_release(center, version: str, *, image_tag: str = "", notes: str = "") -> bool:
-    """启动时按当前构建版本自动登记发布版本；返回是否新建。
-
-    自动登记不包含完整 commit（构建期未知），仅用于展示与历史回填；
-    升级任务要求目标版本必须已登记完整 commit，自动登记版本需重新登记后才能作为升级目标。
-    """
+def ensure_release(
+    center,
+    version: str,
+    *,
+    image_tag: str = "",
+    notes: str = "",
+    commit_sha: str = "",
+    build_config_summary: str = "",
+    min_agent_protocol: int = 0,
+    center_db_version: str = "",
+    tenant_db_version: str = "",
+    rollback_compatible: bool = False,
+    build_status: str = "built",
+) -> bool:
+    """按当前构建版本自动登记/补齐发布版本（启动时调用）。"""
     from app.modules.ops.models_center import ReleaseVersion
 
     version = (version or "").strip()
     if not version:
         return False
+    commit_sha = (commit_sha or "").strip().lower()
     existing = get_release_by_version(center, version)
     if existing is not None:
+        changed = False
+        if commit_sha and existing.commit_sha != commit_sha:
+            existing.commit_sha = commit_sha
+            changed = True
+        for field, value in (
+            ("build_config_summary", build_config_summary),
+            ("center_db_version", center_db_version),
+            ("tenant_db_version", tenant_db_version),
+        ):
+            if value and getattr(existing, field) != value:
+                setattr(existing, field, value)
+                changed = True
+        if min_agent_protocol and existing.min_agent_protocol != min_agent_protocol:
+            existing.min_agent_protocol = min_agent_protocol
+            changed = True
+        if build_status and existing.build_status != build_status:
+            existing.build_status = build_status
+            changed = True
+        if rollback_compatible and not existing.rollback_compatible:
+            existing.rollback_compatible = True
+            changed = True
+        if changed:
+            center.add(existing)
+            center.commit()
         return False
     row = ReleaseVersion(
         version=version,
         image_tag=image_tag or version,
         image_digest="",
         status="active",
-        commit_sha="",
-        build_config_summary="",
-        min_agent_protocol=0,
-        center_db_version="",
-        tenant_db_version="",
-        rollback_compatible=False,
-        build_status="built",
-        notes=notes or f"自动登记：当前部署版本 {version}（缺少完整 commit，需人工登记后才能作为升级目标）",
+        commit_sha=commit_sha,
+        build_config_summary=build_config_summary,
+        min_agent_protocol=min_agent_protocol,
+        center_db_version=center_db_version,
+        tenant_db_version=tenant_db_version,
+        rollback_compatible=rollback_compatible,
+        build_status=build_status or "built",
+        notes=notes or f"自动登记：当前部署版本 {version}",
         created_by=None,
     )
     center.add(row)
@@ -1340,7 +1374,7 @@ def create_operation(center, instance_id: int, payload, *, actor_user_id: int) -
     running = center.execute(
         select(OperationJob).where(
             OperationJob.instance_id == instance.id,
-            OperationJob.status.in_(("pending", "leased", "running")),
+            OperationJob.status.in_(("pending", "leased", "running", "unknown")),
         )
     ).scalars().first()
     if running is not None:
@@ -2121,8 +2155,8 @@ def retry_operation(center, job_id: int, *, actor_user_id: int) -> dict[str, Any
     old = center.get(OperationJob, int(job_id))
     if old is None:
         raise AppError(ErrorCode.NOT_FOUND, "运维任务不存在")
-    if old.status in {"pending", "leased", "running"}:
-        raise ConflictError("任务仍在执行中，不能重试")
+    if old.status in {"pending", "leased", "running", "unknown"}:
+        raise ConflictError("任务仍在执行或待核对，不能直接重试")
     payload = OperationCreate(
         job_type=old.job_type, target_version=old.target_version,
         payload=old.payload_json or {}, idempotency_key="",

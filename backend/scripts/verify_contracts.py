@@ -438,6 +438,15 @@ def check_metadata(
     # docs/data-model.md 约定：每张表都有 BIGINT 自增 id、created_at、updated_at（UTC DATETIME）
     from sqlalchemy import BigInteger, DateTime
 
+    # 追加型表以业务时间字段作为追加时间，不要求 updated_at；规则与 docs/data-model.md 保持一致。
+    append_only_tables = {
+        "node_metric_samples",
+        "node_checks",
+        "operation_job_steps",
+        "backup_records",
+        "node_metric_aggregates",
+    }
+    append_only_time_columns = ("sampled_at", "checked_at", "started_at", "bucket_start", "created_at")
     standard_problems: list[str] = []
     for name, table in metadata.tables.items():
         id_column = table.columns.get("id")
@@ -445,6 +454,10 @@ def check_metadata(
             standard_problems.append(f"{name} 缺少 id")
         elif not isinstance(id_column.type, BigInteger) or not id_column.primary_key:
             standard_problems.append(f"{name}.id 不是 BIGINT 主键")
+        if name in append_only_tables:
+            if not any(column in table.columns for column in append_only_time_columns):
+                standard_problems.append(f"{name} 缺少追加时间字段")
+            continue
         for column_name in ("created_at", "updated_at"):
             column = table.columns.get(column_name)
             if column is None:

@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     app_env: str = "development"  # development | test | production
     app_version: str = ""  # 当前构建版本（Git 短提交号）
     release_bundle_dir: str = "/srv/releases"  # 离线镜像包目录
+    app_commit_sha: str = ""
+    app_build_config_summary: str = ""
+    app_build_status: str = "built"
+    app_min_agent_protocol: int = 0
+    app_center_db_version: str = ""
+    app_tenant_db_version: str = ""
+    app_rollback_compatible: bool = False
     api_prefix: str = "/api/v1"
     # 部署形态：center=统一管理中心，tenant=租户独立实例，gateway=独立集成网关
     deployment_mode: Literal["center", "tenant", "gateway"] = "center"

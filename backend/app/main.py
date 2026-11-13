@@ -203,7 +203,17 @@ def _install_lifecycle(application: FastAPI) -> None:
                 from app.modules.ops import service as ops_service
 
                 with center_session() as center:
-                    ops_service.ensure_release(center, settings.app_version)
+                    ops_service.ensure_release(
+                        center,
+                        settings.app_version,
+                        commit_sha=settings.app_commit_sha,
+                        build_config_summary=settings.app_build_config_summary,
+                        min_agent_protocol=settings.app_min_agent_protocol,
+                        center_db_version=settings.app_center_db_version,
+                        tenant_db_version=settings.app_tenant_db_version,
+                        rollback_compatible=settings.app_rollback_compatible,
+                        build_status=settings.app_build_status,
+                    )
             except Exception:  # noqa: BLE001 - 启动失败不阻断 API
                 pass
 

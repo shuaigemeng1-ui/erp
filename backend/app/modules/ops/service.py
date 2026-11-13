@@ -956,6 +956,29 @@ def list_releases(center) -> list[dict[str, Any]]:
     ]
 
 
+def ensure_release(center, version: str, *, image_tag: str = "", notes: str = "") -> bool:
+    """启动时按当前构建版本自动登记发布版本；返回是否新建。"""
+    from app.modules.ops.models_center import ReleaseVersion
+
+    version = (version or "").strip()
+    if not version:
+        return False
+    existing = center.execute(select(ReleaseVersion).where(ReleaseVersion.version == version)).scalar_one_or_none()
+    if existing is not None:
+        return False
+    row = ReleaseVersion(
+        version=version,
+        image_tag=image_tag or version,
+        image_digest="",
+        status="active",
+        notes=notes or f"自动登记：当前部署版本 {version}",
+        created_by=None,
+    )
+    center.add(row)
+    center.commit()
+    return True
+
+
 def create_release(center, payload, *, actor_user_id: int) -> dict[str, Any]:
     from app.modules.ops.models_center import ReleaseVersion
 

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
-import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
+import { computed, onMounted, reactive, ref } from 'vue'
+import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { CopyDocument, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import { opsApi } from '@/api/ops'
 import { useTableQuery } from '@/composables/useTableQuery'
@@ -386,12 +386,52 @@ async function loadDetail(instanceId: string): Promise<void> {
   }
 }
 
+const latestVersion = ref('')
+const upgradingId = ref('')
+
+function canUpgrade(instance: OpsInstance): boolean {
+  return Boolean(latestVersion.value && instance.app_version && instance.app_version !== latestVersion.value)
+}
+
+async function loadLatestVersion(): Promise<void> {
+  try {
+    const list = await opsApi.releases()
+    latestVersion.value = list.find((item) => item.status === 'active')?.version ?? list[0]?.version ?? ''
+  } catch {
+    latestVersion.value = ''
+  }
+}
+
+async function upgradeInstance(instance: OpsInstance): Promise<void> {
+  if (!latestVersion.value) return
+  await ElMessageBox.confirm(
+    `将实例「${instance.name}」从 ${instance.app_version || '未知版本'} 升级到 ${latestVersion.value}？`,
+    '一键升级',
+    { type: 'warning', confirmButtonText: '开始升级', cancelButtonText: '取消' },
+  ).catch(() => false)
+  if (upgradingId.value) return
+  upgradingId.value = instance.id
+  try {
+    await opsApi.createOperation(instance.id, {
+      job_type: 'upgrade',
+      target_version: latestVersion.value,
+      payload: {},
+    })
+    ElMessage.success(`升级任务已创建：${latestVersion.value}`)
+    await refreshPage()
+  } finally {
+    upgradingId.value = ''
+  }
+}
+
 async function refreshPage(): Promise<void> {
   if (drawerVisible.value && currentInstance.value) {
     await loadDetail(currentInstance.value.id)
   }
   await Promise.all([reloadInstances(), reloadAlerts()])
 }
+
+onMounted(loadLatestVersion)
 
 /* ------------------------------ 编辑实例 ------------------------------ */
 const editVisible = ref(false)
@@ -822,8 +862,18 @@ async function copyText(value: string | null | undefined, label: string): Promis
         <el-table-column label="创建时间" width="170">
           <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="80" fixed="right">
+        <el-table-column label="操作" width="170" fixed="right">
           <template #default="{ row }">
+            <el-button
+              v-if="canUpgrade(row as OpsInstance)"
+              text
+              type="warning"
+              size="small"
+              :loading="upgradingId === row.id"
+              @click.stop="upgradeInstance(row as OpsInstance)"
+            >
+              升级 {{ latestVersion }}
+            </el-button>
             <el-button text type="primary" size="small" @click.stop="openDetail(row as OpsInstance)">详情</el-button>
           </template>
         </el-table-column>

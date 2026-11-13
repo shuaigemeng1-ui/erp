@@ -194,6 +194,19 @@ def _install_exception_handlers(application: FastAPI) -> None:
 
 
 def _install_lifecycle(application: FastAPI) -> None:
+    @application.on_event("startup")
+    async def _startup() -> None:  # pragma: no cover - 进程启动钩子
+        # 中心按构建版本自动登记发布版本，避免手工维护版本列表。
+        if settings.deployment_mode == "center" and settings.app_version:
+            try:
+                from app.db.session import center_session
+                from app.modules.ops import service as ops_service
+
+                with center_session() as center:
+                    ops_service.ensure_release(center, settings.app_version)
+            except Exception:  # noqa: BLE001 - 启动失败不阻断 API
+                pass
+
     @application.on_event("shutdown")
     async def _shutdown() -> None:  # pragma: no cover - 进程退出钩子
         dispose_all()

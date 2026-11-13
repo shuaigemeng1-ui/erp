@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ 基础
     app_name: str = "ERP"
     app_env: str = "development"  # development | test | production
+    app_version: str = ""  # 当前构建版本（Git 短提交号）
     api_prefix: str = "/api/v1"
     # 部署形态：center=统一管理中心，tenant=租户独立实例，gateway=独立集成网关
     deployment_mode: Literal["center", "tenant", "gateway"] = "center"

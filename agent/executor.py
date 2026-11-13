@@ -129,7 +129,18 @@ def execute(job: dict[str, Any], config: dict[str, Any], report) -> dict[str, An
             lines.append(f"APP_IMAGE_TAG={target}")
         temp_env.write_text("\n".join(lines) + "\n", encoding="utf-8")
         compose = _compose(config, str(temp_env))
-        report(2, f"检查版本 {target or '当前版本'}", "succeeded", "")
+        has_registry = any(
+            line.startswith("IMAGE_REGISTRY=") and line.split("=", 1)[1].strip()
+            for line in lines
+        )
+        if target and has_registry:
+            report(2, f"拉取镜像 {target}", "running", "")
+            code, output = _run([*compose, "pull"], deploy_dir, timeout=1800)
+            report(2, "拉取镜像", "succeeded" if code == 0 else "failed", output)
+            if code != 0:
+                return {"ok": False, "exit_code": code, "output": output}
+        else:
+            report(2, f"检查版本 {target or '当前版本'}", "succeeded", "")
         report(3, f"更新服务 {target or '当前版本'}", "running", "")
         code2, output2 = _run([*compose, "up", "-d", "--remove-orphans"], deploy_dir, timeout=1800)
         report(3, "更新服务", "succeeded" if code2 == 0 else "failed", output2)

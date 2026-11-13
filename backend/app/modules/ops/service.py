@@ -155,7 +155,7 @@ def instance_payload(center, instance: TenantInstance, tenant_name: str = "") ->
         "domain": instance.domain,
         "environment": instance.environment,
         "status": instance.status,
-        "app_version": instance.app_version,
+        "app_version": instance.app_version or next((n.app_version for n in nodes if n.app_version), ""),
         "notes": instance.notes,
         "created_at": _iso(instance.created_at),
         "node_count": len(nodes),
@@ -471,6 +471,11 @@ def ingest_telemetry(center, node: ServerNode, payload: TelemetryPayload) -> dic
         node.observed_public_ip = payload.public_ip
     node.agent_version = payload.agent_version or node.agent_version
     node.app_version = payload.app_version or node.app_version
+    if payload.app_version:
+        instance = center.get(TenantInstance, node.instance_id)
+        if instance is not None and instance.app_version != payload.app_version:
+            instance.app_version = payload.app_version
+            instance.updated_at = now
     node.status = "online"
     node.last_seen_at = now
     node.last_metrics_at = now

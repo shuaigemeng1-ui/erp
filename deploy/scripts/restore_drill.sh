@@ -460,11 +460,13 @@ done <<< "${MOUNTED_VOLUMES}"
 log "   容器 ${CONTAINER_NAME} 挂载卷：$(echo "${MOUNTED_VOLUMES}" | tr '\n' ' ')"
 
 mysql_import() {
-    local file="$1"
-    gunzip -c "${file}" | compose exec -T mysql sh -c '
+    local file="$1" db="$2"
+    # dump 由 --databases 生成时通常自带 CREATE DATABASE/USE；显式指定目标库并先建库，兼容不带 USE 的 dump。
+    gunzip -c "${file}" | compose exec -T -e MYSQL_DB="${db}" mysql sh -c '
         set -eu
         export MYSQL_PWD="${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 未设置}"
-        exec mysql -uroot
+        mysql -uroot -e "CREATE DATABASE IF NOT EXISTS \`${MYSQL_DB}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+        exec mysql -uroot "${MYSQL_DB}"
     '
 }
 mysql_query() {
@@ -538,7 +540,7 @@ import_and_verify() {
     db="$(basename "${sql}" .sql.gz)"
     expected="${EXPECTED_TABLES[${db}]:-0}"
     log "   导入 ${db}（预期表数 ${expected}）"
-    if ! mysql_import "${sql}"; then
+    if ! mysql_import "${sql}" "${db}"; then
         print_mysql_diagnostics "${CONTAINER_ID}"
         die "导入 ${db} 失败（ERROR 2002/连接中断等；drill 项目隔离，主项目不受影响）"
     fi

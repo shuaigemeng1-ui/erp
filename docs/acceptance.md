@@ -1,7 +1,30 @@
-# 当前仓库契约状态（批次 3，2026-11-13，离线 3ae757e / 生产试点 3ae757e）
+# 当前仓库状态（批次 4，2026-11-13，HEAD 5c9dd53）
 
-> 本节为批次 3 离线验收 + 生产试点 + 恢复演练事故结论；批次 2/1 记录保留为历史。
-> 批次 3 详细证据见 `docs/batch3-acceptance.md`；备份/恢复约束见 `docs/backup-restore.md` 顶部 STOP。
+> 批次 4 为“第二独立租户接入模板与迁移白名单”：只新增 `deploy/scripts/tenant-onboarding/`、
+> `backend/scripts/tenant_migration_whitelist.py`、`docs/batch4-tenant-onboarding.md`，**未连接/修改任何生产**。
+> 批次 3 及以前记录保留为历史。
+
+| 检查 | 当前结果 |
+| --- | --- |
+| 后端测试 | `cd backend; python -m pytest -q` → **591 passed**，exit 0（1 条上游 Starlette 弃用提示） |
+| Agent 测试 | `cd agent; python -m pytest -q` → **22 passed**，exit 0 |
+| 完整契约检查 | **38/38 通过**，0 失败 0 警告（32 个迁移文件，`center_0018`/`tenant_0014`） |
+| 批次 4 交付 | 第二租户 install/config/migrate/provision 模板、TENANT_ID/INSTANCE_ID/Worker 绑定校验、Agent2/SSH 指纹/备份初始化清单、迁移白名单与停写对账（行数/指纹/关联）、双实例隔离与异常场景验收清单 |
+| 离线校验 | 8 个 shell 模板 `bash -n` 通过；白名单/environment/对账 `self-test` 通过；`config.sh` 渲染+绑定校验通过且会拒绝 Worker 不一致/未登记租户；install/migrate/reconcile/verify/provision 全部 plan 模式输出正常，未改系统 |
+| 真实执行 | **未执行**：第二租户开通/域名切换/OAuth 回调重登记/店铺凭据迁移、`copy_data.sh`/`migrate.sh --apply`、停写恢复、断网/Agent 重启/发布失败/恢复验证真机演练；需 Lead 审批维护窗口 |
+| 剩余风险 | 模板尚未真机验证；恢复演练仍为事故后冻结（禁止 `restore_drill.sh`）；独立网关（task-35）与恢复演练修复（task-34）进行中，不在本模板链路内 |
+
+补充说明：
+
+- 详细接入手册、白名单规则、双实例隔离清单与异常场景见 `docs/batch4-tenant-onboarding.md`。
+- 本批次不宣称第二租户接入完成；模板默认 plan，任何 `--apply` 必须在目标实例、维护窗口、Lead 审批后执行。
+- 恢复演练结论仍为**阻断/未通过**，见下文批次 3 历史记录。
+
+---
+
+# 批次 3 验收状态（历史，2026-11-13，离线 3ae757e / 生产试点 3ae757e）
+
+> 本节为批次 3 历史结论；批次 3 详细证据见 `docs/batch3-acceptance.md`；备份/恢复约束见 `docs/backup-restore.md` 顶部 STOP。
 
 | 检查 | 当前结果 |
 | --- | --- |

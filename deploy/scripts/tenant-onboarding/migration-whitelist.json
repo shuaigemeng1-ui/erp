@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "updated_at": "2026-11-13",
+  "notes": [
+    "租户数据迁移白名单：只允许本文件列出的表/列进入迁移包；默认拒绝中心平台密钥类表与列。",
+    "内部 ID（id/tenant_id）、成员编号（member_no）、来源用户ID（source_user_id）必须原样保留，禁止重新编号。",
+    "示例租户 3（zuhu.alienyan.store）来自第二租户试点；新租户接入时追加/替换 allowed_tenants，并经 Lead 审核。"
+  ],
+  "preserve_columns": ["id", "tenant_id", "member_no", "source_user_id"],
+  "allowed_tenants": [
+    {
+      "tenant_id": 3,
+      "instance_id": 0,
+      "database_name": "vs_tenant_kangkang_shop",
+      "domain": "zuhu.alienyan.store",
+      "note": "第二租户样例；instance_id=0 表示以中心库 tenant_databases/tenant_instances 实际路由为准"
+    }
+  ],
+  "center_tables": {
+    "tenants": {
+      "stable": true,
+      "columns": ["id", "code", "name", "status", "timezone", "plan_id", "owner_user_id", "suspended_at", "next_member_no", "created_at", "updated_at"]
+    },
+    "users": {
+      "stable": true,
+      "columns": ["id", "email", "password_hash", "display_name", "status", "locale", "last_login_at", "created_at", "updated_at"]
+    },
+    "tenant_memberships": {
+      "stable": true,
+      "columns": ["id", "tenant_id", "user_id", "member_no", "status", "is_owner", "joined_at", "created_at", "updated_at"]
+    },
+    "plans": {
+      "stable": true,
+      "columns": ["id", "code", "name", "status", "description", "created_at", "updated_at"]
+    },
+    "plan_features": {
+      "stable": true,
+      "columns": ["id", "plan_id", "feature_code", "limit_value", "created_at", "updated_at"]
+    },
+    "subscriptions": {
+      "stable": true,
+      "columns": ["id", "tenant_id", "plan_id", "status", "starts_at", "ends_at", "created_at", "updated_at"]
+    }
+  },
+  "forbidden_center_tables": {
+    "platform_channel_apps": "平台渠道应用密钥",
+    "channel_account_registry": "平台账号归属登记",
+    "channel_authorization_links": "授权链接令牌摘要",
+    "storage_profiles": "对象存储访问密钥",
+    "platform_system_settings": "系统级密钥引用",
+    "email_profiles": "邮件服务访问密钥",
+    "platform_audit_logs": "平台审计日志（不随租户迁移）",
+    "platform_roles": "平台角色（中心库管理）",
+    "platform_user_roles": "平台管理员授权",
+    "tenant_databases": "数据库路由与凭据密文",
+    "tenant_invitations": "邀请令牌（一次性凭据）",
+    "provisioning_jobs": "开通任务流水（不随租户迁移）",
+    "server_nodes": "服务器节点与 SSH 凭据",
+    "tenant_instances": "实例登记（中心库管理）",
+    "operation_jobs": "运维任务",
+    "operation_job_steps": "运维任务步骤",
+    "release_versions": "发布版本清单",
+    "node_metric_samples": "节点指标样本",
+    "node_metric_aggregates": "节点指标聚合",
+    "node_checks": "公网探测记录",
+    "alert_events": "运维告警",
+    "backup_records": "备份记录",
+    "maintenance_windows": "维护窗口"
+  },
+  "tenant_tables": {
+    "roles": { "stable": true, "note": "租户角色，含系统角色标记" },
+    "role_permissions": { "stable": true },
+    "member_roles": { "stable": true, "note": "member_id 为中心库成员ID，迁移时原样保留" },
+    "role_binding_scopes": { "stable": true },
+    "tenant_settings": { "stable": true, "note": "permission_version/timezone/订单同步与库存推送开关" },
+    "feature_settings": { "stable": true },
+    "products": { "stable": true, "note": "SPU 资料与成本字段" },
+    "product_skus": { "stable": true },
+    "product_images": { "stable": true },
+    "sku_identifiers": { "stable": true },
+    "suppliers": { "stable": true },
+    "catalog_options": { "stable": true },
+    "stock_places": { "stable": true },
+    "stores": { "stable": true },
+    "store_credentials": { "stable": true, "note": "店铺令牌密文，按租户迁移到独立实例本地库" },
+    "channel_listings": { "stable": true },
+    "channel_listing_links": { "stable": true },
+    "sync_schedules": { "stable": true },
+    "order_sync_checkpoints": { "stable": true },
+    "inventory_balances": { "stable": false, "note": "可随交易变化，做数量/末ID校验" },
+    "stock_movements": { "stable": false, "note": "流水追加，只允许目标库增长" },
+    "orders": { "stable": false },
+    "order_items": { "stable": false },
+    "order_status_history": { "stable": false },
+    "platform_order_raw": { "stable": false },
+    "order_stock_effects": { "stable": false },
+    "sync_runs": { "stable": false },
+    "webhook_events": { "stable": false },
+    "outbox_events": { "stable": false },
+    "audit_logs": { "stable": false },
+    "files": { "stable": false },
+    "idempotency_records": { "stable": false },
+    "tenant_local_users": {
+      "migrate": false,
+      "stable": false,
+      "note": "已废弃：非认证来源的历史副本，不随迁移复制；认证以中心库账号/成员关系为准"
+    }
+  },
+  "relation_checks": [
+    { "name": "memberships_without_tenant", "sql": "SELECT COUNT(*) FROM {center_db}.tenant_memberships m LEFT JOIN {center_db}.tenants t ON t.id=m.tenant_id WHERE t.id IS NULL" },
+    { "name": "memberships_without_user", "sql": "SELECT COUNT(*) FROM {center_db}.tenant_memberships m LEFT JOIN {center_db}.users u ON u.id=m.user_id WHERE u.id IS NULL" },
+    { "name": "duplicate_member_no_in_tenant", "sql": "SELECT COUNT(*) FROM (SELECT tenant_id, member_no FROM {center_db}.tenant_memberships WHERE tenant_id={tenant_id} AND member_no IS NOT NULL GROUP BY tenant_id, member_no HAVING COUNT(*)>1) x" },
+    { "name": "member_roles_without_role", "sql": "SELECT COUNT(*) FROM {tenant_db}.member_roles mr LEFT JOIN {tenant_db}.roles r ON r.id=mr.role_id WHERE r.id IS NULL" },
+    { "name": "order_items_without_order", "sql": "SELECT COUNT(*) FROM {tenant_db}.order_items i LEFT JOIN {tenant_db}.orders o ON o.id=i.order_id WHERE o.id IS NULL" },
+    { "name": "stock_effects_without_order", "sql": "SELECT COUNT(*) FROM {tenant_db}.order_stock_effects e LEFT JOIN {tenant_db}.orders o ON o.id=e.order_id WHERE o.id IS NULL" },
+    { "name": "channel_links_without_listing", "sql": "SELECT COUNT(*) FROM {tenant_db}.channel_listing_links l LEFT JOIN {tenant_db}.channel_listings c ON c.id=l.listing_id WHERE c.id IS NULL" },
+    { "name": "negative_inventory_balance", "sql": "SELECT COUNT(*) FROM {tenant_db}.inventory_balances WHERE available_quantity < 0" }
+  ]
+}

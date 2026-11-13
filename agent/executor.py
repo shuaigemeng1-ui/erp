@@ -288,7 +288,29 @@ class Executor:
             return {"ok": False, "exit_code": code, "output": output, "error": "build_failed"}
 
         report(4, "构建镜像", "succeeded", "")
-        report(5, "执行数据库迁移", "running", "迁移必须在启动新应用前完成")
+        deploy_dir = Path(str(config.get("deploy_dir") or "/opt/ventasync/deploy"))
+        backup_script = deploy_dir / "backup.sh"
+        if not backup_script.exists():
+            report(5, "升级前备份", "failed", "backup.sh 不存在")
+            return {"ok": False, "error": "backup_script_missing"}
+        report(5, "升级前备份", "running", str(backup_script))
+        backup_code, backup_output = self._run(
+            ["bash", str(backup_script)],
+            deploy_dir,
+            phase="upgrade:backup",
+            recorder=record,
+            timeout=3600,
+        )
+        if backup_code != 0:
+            report(5, "升级前备份", "failed", backup_output)
+            return {
+                "ok": False,
+                "exit_code": backup_code,
+                "output": (output + "\n" + backup_output)[-6000:],
+                "error": "backup_failed",
+            }
+        report(5, "升级前备份", "succeeded", backup_output[-500:])
+        report(6, "执行数据库迁移", "running", "迁移必须在启动新应用前完成")
         migrate_code, migrate_output = self._run(
             [*compose, "--profile", "release", "run", "--rm", "migrate"],
             version_dir,
@@ -298,41 +320,41 @@ class Executor:
             env=env,
         )
         if migrate_code != 0:
-            report(5, "执行数据库迁移", "failed", migrate_output)
+            report(6, "执行数据库迁移", "failed", migrate_output)
             return {
                 "ok": False,
                 "exit_code": migrate_code,
                 "output": (output + "\n" + migrate_output)[-6000:],
                 "error": "migration_failed",
             }
-        report(5, "执行数据库迁移", "succeeded", "")
-        report(6, "启动服务", "running", f"版本={target_version}")
+        report(6, "执行数据库迁移", "succeeded", "")
+        report(7, "启动服务", "running", f"版本={target_version}")
         code, output2 = self._run(
             [*compose, "up", "-d", "--remove-orphans"], version_dir,
             phase="upgrade:up", recorder=record, timeout=1800, env=env,
         )
         combined = (output + "\n" + output2)[-6000:]
         if code != 0:
-            report(6, "启动服务", "failed", output2)
+            report(7, "启动服务", "failed", output2)
             return {"ok": False, "exit_code": code, "output": combined, "error": "up_failed"}
-        report(6, "启动服务", "succeeded", "")
+        report(7, "启动服务", "succeeded", "")
 
-        report(7, "服务就绪校验", "running", "等待 api/nginx 进入 running")
+        report(8, "服务就绪校验", "running", "等待 api/nginx 进入 running")
         ready, ps_output = versions.wait_services_ready(
             self.runner, compose, timeout_seconds=180, sleep=sleep, clock=clock
         )
         if not ready:
-            report(7, "服务就绪校验", "failed", ps_output[-1000:])
+            report(8, "服务就绪校验", "failed", ps_output[-1000:])
             return {
                 "ok": False,
                 "output": (combined + "\n" + ps_output)[-6000:],
                 "error": "readiness_failed",
             }
-        report(7, "服务就绪校验", "succeeded", "")
+        report(8, "服务就绪校验", "succeeded", "")
 
         runtime_ok, runtime_output = self._check_runtime(compose, version_dir, record)
         if not runtime_ok:
-            report(8, "业务只读检查", "failed", runtime_output[-1000:])
+            report(9, "业务只读检查", "failed", runtime_output[-1000:])
             return {
                 "ok": False,
                 "output": (combined + "\n" + runtime_output)[-6000:],
@@ -343,7 +365,7 @@ class Executor:
                     "business_readonly": {"ok": False, "value": runtime_output[-200:]},
                 },
             }
-        report(8, "业务只读检查", "succeeded", "")
+        report(9, "业务只读检查", "succeeded", "")
 
         env_file = Path(str(config.get("deploy_dir") or "/opt/ventasync/deploy")) / str(
             config.get("env_file") or ".env"
@@ -353,7 +375,7 @@ class Executor:
         except OSError:
             pass
         previous = versions.switch_current(config, version_dir, commit)
-        report(9, "切换当前版本", "succeeded", f"{previous or '(无)'} → {commit}")
+        report(10, "切换当前版本", "succeeded", f"{previous or '(无)'} → {commit}")
         return {
             "ok": True,
             "exit_code": 0,

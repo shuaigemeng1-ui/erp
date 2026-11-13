@@ -363,6 +363,8 @@ def test_executor_upgrade_uses_version_dir_not_reset(tmp_path: Path) -> None:
     import executor
 
     commit = "a" * 40
+    (tmp_path / "deploy").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "deploy" / "backup.sh").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
     calls: list[list[str]] = []
 
     class Runner:

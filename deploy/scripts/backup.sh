@@ -541,9 +541,15 @@ find "${RUN_DIR}" -type d -exec chmod 700 {} +
 find "${RUN_DIR}" -type f -exec chmod 600 {} +
 
 # ---------------------------------------------------------------- 记录中心库
+# 即使没有显式 BACKUP_INSTANCE_ID 也尝试上报：后端会按 local_path/storage_key/run_id
+# 关联 Agent 备份任务已登记的记录并补齐 local_path/checksum/manifest（同名记录不重复）。
 RECORD_STATUS=0
-if [[ "${RECORD}" -eq 1 && -n "${INSTANCE_ID}" ]]; then
-    log "写入中心库 backup_records（instance=${INSTANCE_ID}）"
+if [[ "${RECORD}" -eq 1 ]]; then
+    if [[ -n "${INSTANCE_ID}" ]]; then
+        log "写入中心库 backup_records（instance=${INSTANCE_ID}）"
+    else
+        log "写入中心库 backup_records（未设置 BACKUP_INSTANCE_ID，按 local_path/run_id 关联已有记录）"
+    fi
     RECORD_JSON="$(python3 - "${RUN_DIR}/manifest.json" <<'PY'
 import json
 import sys
@@ -558,13 +564,12 @@ PY
     RECORD_CODE=$?
     set -e
     if [[ "${RECORD_CODE}" -eq 0 ]]; then
-        log "备份记录已写入中心库"
+        log "备份记录已写入中心库：${RECORD_OUTPUT:0:300}"
     else
         RECORD_STATUS=1
         warn "写入中心库备份记录失败（备份本身有效，可事后补录）：${RECORD_OUTPUT:0:300}"
+        warn "若为“缺少 instance_id 且未找到可关联记录”，请在 deploy/.env 设置 BACKUP_INSTANCE_ID 后重试记录步骤"
     fi
-elif [[ "${RECORD}" -eq 1 ]]; then
-    warn "未设置 BACKUP_INSTANCE_ID / --instance-id，跳过中心库备份记录"
 fi
 
 # ---------------------------------------------------------------- 清理过期

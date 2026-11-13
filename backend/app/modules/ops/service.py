@@ -13,7 +13,6 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
-import httpx
 from sqlalchemy import func, or_, select
 
 from app.core.errors import AppError, ConflictError, ErrorCode
@@ -1411,6 +1410,7 @@ BACKUP_DEFAULT_RETENTION_DAYS = 30
 BACKUP_KEY_RE = re.compile(r"BACKUP_KEY=(\S+)")
 BACKUP_SIZE_RE = re.compile(r"BACKUP_SIZE=(\d+)")
 BACKUP_DIR_RE = re.compile(r"BACKUP_DIR=(\S+)")
+BACKUP_CHECKSUM_RE = re.compile(r"^(?:sha256:)?([0-9a-fA-F]{64})$")
 
 
 def _backup_stage(name: str, status: str, *, message: str = "", at: datetime | None = None) -> dict[str, Any]:
@@ -1468,6 +1468,151 @@ def _backup_payload(row: Any) -> dict[str, Any]:
     }
 
 
+def normalize_backup_checksum(value: Any) -> str:
+    """统一校验值格式为 ``sha256:<hex>``；无法识别时原样截断保存（便于人工核对）。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    match = BACKUP_CHECKSUM_RE.match(raw)
+    if match:
+        return f"sha256:{match.group(1).lower()}"
+    return raw[:128]
+
+
+def _backup_manifest_run_id(row: Any) -> str:
+    """读取记录关联的 run_id：优先 manifest_json，其次本地目录/存储键的最后一段。"""
+    manifest = row.manifest_json if isinstance(row.manifest_json, dict) else {}
+    run_id = str((manifest or {}).get("run_id") or "").strip()
+    if run_id:
+        return "/".join(run_id.split("/")[-1:]) if "/" in run_id else run_id
+    for candidate in (row.local_path, row.storage_key):
+        raw = str(candidate or "").strip().rstrip("/\\")
+        if raw:
+            return raw.replace("\\", "/").split("/")[-1]
+    return ""
+
+
+def _normalized_row_local_path(row: Any) -> str:
+    return str(row.local_path or "").strip().rstrip("/\\")
+
+
+def _storage_matches_run_id(row: Any, run_id: str) -> bool:
+    """旧版 Agent 备份记录只写 storage_key（可能是 ``db:<stamp>`` 或备份目录），按后缀关联。"""
+    wanted = str(run_id or "").strip()
+    storage = str(row.storage_key or "").strip().rstrip("/\\")
+    if not wanted or not storage:
+        return False
+    return (
+        storage == wanted
+        or storage.endswith("/" + wanted)
+        or storage.endswith(":" + wanted)
+        or storage.endswith("_" + wanted)
+    )
+
+
+def _backup_row_matches(
+    row: Any,
+    *,
+    run_id: str = "",
+    local_path: str = "",
+    checksum: str = "",
+) -> bool:
+    """精确匹配：给出的条件必须全部满足（run_id/local_path/checksum 至少一个）。"""
+    wanted_checksum = normalize_backup_checksum(checksum)
+    if local_path:
+        wanted = str(local_path).strip().rstrip("/\\")
+        storage = str(row.storage_key or "").strip().rstrip("/\\")
+        if _normalized_row_local_path(row) != wanted and storage != wanted:
+            return False
+    if run_id and not (
+        _backup_manifest_run_id(row) == str(run_id).strip()
+        or _storage_matches_run_id(row, run_id)
+    ):
+        return False
+    if wanted_checksum:
+        row_checksum = normalize_backup_checksum(row.checksum)
+        if not row_checksum or row_checksum != wanted_checksum:
+            return False
+    return True
+
+
+def find_backup_records(
+    center,
+    *,
+    instance_id: int | None = None,
+    run_id: str = "",
+    local_path: str = "",
+    checksum: str = "",
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """按 run_id / local_path / checksum 查找备份记录（全部条件同时满足）。
+
+    扫描最近 ``limit`` 条记录后在 Python 侧比对，兼容旧记录（local_path/checksum 为空）
+    与不同数据库（MySQL/SQLite 测试）的 JSON 取值差异；按 id 倒序返回。
+    """
+    from app.modules.ops.models_center import BackupRecord
+
+    if not any((str(run_id or "").strip(), str(local_path or "").strip(), str(checksum or "").strip())):
+        raise AppError(ErrorCode.VALIDATION_ERROR, "至少提供 run_id / local_path / checksum 之一")
+    stmt = select(BackupRecord).order_by(BackupRecord.id.desc()).limit(max(1, int(limit)))
+    if instance_id:
+        stmt = stmt.where(BackupRecord.instance_id == int(instance_id))
+    rows = center.execute(stmt).scalars().all()
+    return [
+        _backup_payload(row)
+        for row in rows
+        if _backup_row_matches(row, run_id=run_id, local_path=local_path, checksum=checksum)
+    ]
+
+
+def resolve_backup_record(
+    center,
+    *,
+    backup_id: int | None = None,
+    instance_id: int | None = None,
+    run_id: str = "",
+    local_path: str = "",
+    checksum: str = "",
+) -> dict[str, Any]:
+    """解析唯一匹配的备份记录；找不到/不唯一时抛错并给出候选，避免回写错记录。"""
+    if backup_id:
+        payload = get_backup(center, int(backup_id))
+        if any((run_id, local_path, checksum)):
+            from app.modules.ops.models_center import BackupRecord
+
+            row = center.get(BackupRecord, int(backup_id))
+            if row is None or not _backup_row_matches(
+                row, run_id=run_id, local_path=local_path, checksum=checksum
+            ):
+                raise AppError(
+                    ErrorCode.NOT_FOUND,
+                    "备份记录与本次 run_id/local_path/校验值不匹配",
+                    details={"backup": payload},
+                )
+        return payload
+    matches = find_backup_records(
+        center,
+        instance_id=instance_id,
+        run_id=run_id,
+        local_path=local_path,
+        checksum=checksum,
+    )
+    if not matches:
+        raise AppError(
+            ErrorCode.NOT_FOUND,
+            "未找到唯一匹配本次 run_id/local_path/校验值的备份记录",
+            details={
+                "criteria": {"run_id": run_id, "local_path": local_path, "checksum": checksum}
+            },
+        )
+    if len(matches) > 1:
+        raise ConflictError(
+            "匹配到多条备份记录，请用 --record-id 明确指定",
+            details={"candidates": [item["id"] for item in matches]},
+        )
+    return matches[0]
+
+
 def get_backup(center, backup_id: int) -> dict[str, Any]:
     from app.modules.ops.models_center import BackupRecord
 
@@ -1480,20 +1625,57 @@ def get_backup(center, backup_id: int) -> dict[str, Any]:
 def _upsert_backup_record(
     center,
     *,
-    instance_id: int,
+    instance_id: int | None,
     trigger: str,
     storage_key: str,
+    local_path: str = "",
+    run_id: str = "",
+    checksum: str = "",
     node_id: int | None = None,
     job_id: int | None = None,
 ):
-    """按本地备份目录去重：同一目录（或同一存储键）只保留一条记录（幂等）。"""
+    """按 local_path / storage_key / run_id 精确关联已有记录（幂等）。
+
+    * 旧版 Agent 备份任务只登记 ``storage_key``（本地备份目录），没有 local_path/checksum；
+      备份脚本通过 CLI 上报清单时按 ``storage_key == local_path`` 关联并补齐字段，避免重复记录；
+    * 明确提供了 ``instance_id`` 时只匹配同实例记录；
+    * 找不到可关联记录且缺少 instance_id 时报错（提示设置 BACKUP_INSTANCE_ID）。
+    """
     from app.modules.ops.models_center import BackupRecord
 
-    row = None
-    if storage_key:
-        row = center.execute(
-            select(BackupRecord).where(BackupRecord.storage_key == storage_key)
-        ).scalars().first()
+    wanted_local = str(local_path or "").strip().rstrip("/\\")
+    wanted_storage = str(storage_key or "").strip().rstrip("/\\")
+    wanted_run_id = str(run_id or "").strip()
+    wanted_checksum = normalize_backup_checksum(checksum)
+
+    stmt = select(BackupRecord).order_by(BackupRecord.id.desc()).limit(500)
+    if instance_id:
+        stmt = stmt.where(BackupRecord.instance_id == int(instance_id))
+    candidates: list[Any] = []
+    for row in center.execute(stmt).scalars().all():
+        row_local = _normalized_row_local_path(row)
+        row_storage = str(row.storage_key or "").strip().rstrip("/\\")
+        if wanted_local and (row_local == wanted_local or row_storage == wanted_local):
+            candidates.append(row)
+            continue
+        if wanted_storage and row_storage == wanted_storage:
+            candidates.append(row)
+            continue
+        if wanted_run_id and (
+            _backup_manifest_run_id(row) == wanted_run_id
+            or _storage_matches_run_id(row, wanted_run_id)
+        ):
+            candidates.append(row)
+            continue
+        if wanted_checksum and want_local_match_checksum(row, wanted_checksum):
+            candidates.append(row)
+            continue
+    if len(candidates) > 1:
+        raise ConflictError(
+            "匹配到多条已有备份记录，无法安全关联",
+            details={"candidates": [str(row.id) for row in candidates]},
+        )
+    row = candidates[0] if candidates else None
     if row is None and job_id:
         row = center.execute(
             select(BackupRecord).where(
@@ -1501,19 +1683,44 @@ def _upsert_backup_record(
             )
         ).scalars().first()
     if row is None:
+        if instance_id is None:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "缺少 instance_id，且未找到可关联的已有备份记录（请在 deploy/.env 设置 BACKUP_INSTANCE_ID，或由 Agent 备份任务先登记）",
+                details={
+                    "run_id": wanted_run_id,
+                    "local_path": wanted_local or wanted_storage,
+                },
+            )
         row = BackupRecord(instance_id=int(instance_id), node_id=node_id, job_id=job_id)
         center.add(row)
-    if row.instance_id != int(instance_id):
-        row.instance_id = int(instance_id)
+    if instance_id is not None and int(row.instance_id) != int(instance_id):
+        raise ConflictError(
+            "已有备份记录属于其他实例，拒绝关联",
+            details={"backup_id": str(row.id), "record_instance": str(row.instance_id)},
+        )
     if node_id:
         row.node_id = node_id
     if job_id:
         row.job_id = job_id
     if trigger in BACKUP_TRIGGERS:
         row.trigger = trigger
-    if storage_key:
-        row.storage_key = storage_key[:500]
+    if wanted_storage:
+        row.storage_key = wanted_storage[:500]
+    if wanted_local:
+        row.local_path = wanted_local[:500]
+    if wanted_checksum and not row.checksum:
+        row.checksum = wanted_checksum
     return row
+
+
+def want_local_match_checksum(row: Any, wanted_checksum: str) -> bool:
+    """仅在 local_path/storage_key 也一致的场景下用校验值兜底匹配（防止跨记录误关联）。"""
+    row_local = _normalized_row_local_path(row)
+    row_storage = str(row.storage_key or "").strip().rstrip("/\\")
+    if not (row_local or row_storage):
+        return False
+    return normalize_backup_checksum(row.checksum) == wanted_checksum
 
 
 def apply_backup_manifest(
@@ -1541,8 +1748,6 @@ def apply_backup_manifest(
     checks = manifest.get("checks") or {}
     encryption = manifest.get("encryption") or {}
     target_instance = instance_id or manifest.get("instance_id")
-    if not target_instance:
-        raise AppError(ErrorCode.VALIDATION_ERROR, "备份清单缺少 instance_id")
     trigger = str(manifest.get("trigger") or "scheduled")
     if trigger not in BACKUP_TRIGGERS:
         trigger = "scheduled"
@@ -1553,17 +1758,22 @@ def apply_backup_manifest(
     if offsite_status not in BACKUP_OFFSITE_STATUSES:
         offsite_status = "pending"
     now = _now()
+    local_path = str(local.get("dir") or local.get("path") or "")[:500]
+    run_id = str(manifest.get("run_id") or "")[:200]
+    offline_checksum = normalize_backup_checksum(
+        offsite.get("checksum") or offsite.get("checksum_sha256") or local.get("checksum") or ""
+    )
     row = _upsert_backup_record(
         center,
-        instance_id=int(target_instance),
+        instance_id=int(target_instance) if target_instance else None,
         trigger=trigger,
-        storage_key=str(local.get("dir") or manifest.get("run_id") or "")[:500],
+        storage_key=str(local_path or run_id or "")[:500],
+        local_path=local_path,
+        run_id=run_id,
+        checksum=offline_checksum,
         node_id=node_id,
         job_id=job_id,
     )
-    offline_checksum = str(
-        offsite.get("checksum") or offsite.get("checksum_sha256") or local.get("checksum") or ""
-    )[:128]
     checksum_ok = bool(checks.get("sha256_ok", local_status == "verified"))
     checksum_status = "verified" if checksum_ok and offline_checksum else (
         "failed" if local_status == "failed" or checks.get("sha256_ok") is False else "pending"
@@ -1841,20 +2051,37 @@ def _apply_job_event(center, row, payload, now: datetime) -> None:
                     job_id=row.id,
                 )
                 backup_row.status = "succeeded" if payload.status == "succeeded" else "failed"
-                backup_row.size_bytes = int(result.get("size_bytes", 0) or 0)
-                backup_row.local_status = (
-                    "generated" if payload.status == "succeeded" else "failed"
-                )
-                backup_row.offsite_status = str(
-                    result.get("offsite_status") or "pending"
-                )[:16]
-                backup_row.local_path = str(result.get("storage_key") or "")[:500]
-                backup_row.offsite_key = str(result.get("offsite_key") or "")[:500]
-                backup_row.checksum = str(
+                result_size = int(result.get("size_bytes", 0) or 0)
+                if result_size > 0:
+                    backup_row.size_bytes = result_size
+                # 不覆盖备份脚本/CLI 已写入的丰富字段（local_path/checksum/offsite_key 等）：
+                # Agent 任务结果通常只有 storage_key/size；CLI apply 可能已补齐校验值。
+                if payload.status == "succeeded":
+                    if backup_row.local_status != "verified":
+                        backup_row.local_status = "generated"
+                else:
+                    backup_row.local_status = "failed"
+                result_offsite = str(result.get("offsite_status") or "")[:16]
+                if result_offsite:
+                    backup_row.offsite_status = result_offsite
+                elif not backup_row.offsite_status:
+                    backup_row.offsite_status = "pending"
+                result_storage = str(result.get("storage_key") or "")[:500]
+                if result_storage:
+                    backup_row.local_path = result_storage
+                if result.get("offsite_key"):
+                    backup_row.offsite_key = str(result.get("offsite_key"))[:500]
+                result_checksum = normalize_backup_checksum(
                     result.get("checksum") or result.get("checksum_sha256") or ""
-                )[:128]
-                backup_row.checksum_status = "verified" if backup_row.checksum else "pending"
-                backup_row.encryption = str(result.get("encryption") or "")[:32]
+                )
+                if result_checksum:
+                    backup_row.checksum = result_checksum
+                if backup_row.checksum:
+                    backup_row.checksum_status = "verified"
+                elif backup_row.checksum_status != "verified":
+                    backup_row.checksum_status = "pending"
+                if result.get("encryption"):
+                    backup_row.encryption = str(result.get("encryption"))[:32]
                 backup_row.stages = _merge_stages(
                     backup_row.stages,
                     _backup_stage(

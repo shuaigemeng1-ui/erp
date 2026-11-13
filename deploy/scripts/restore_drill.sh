@@ -199,7 +199,8 @@ BUNDLE="$(realpath "$BUNDLE")"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 PROJECT="ventasync-drill-$(date -u +%Y%m%d%H%M%S)-$RANDOM"
 [[ "$PROJECT" != "$MAIN_PROJECT" ]] || die "项目名冲突"
-WORK_DIR="$(mktemp -d "$BACKUP_ROOT/drill-$STAMP-XXXX")"
+mkdir -p "$BACKUP_ROOT" 2>/dev/null || true
+WORK_DIR="$(mktemp -d "$BACKUP_ROOT/drill-$STAMP-XXXX" 2>/dev/null || mktemp -d)"
 CONFIG_JSON="$WORK_DIR/compose.json"
 REPORT_DIR="$BACKUP_ROOT/drill-reports/$PROJECT"
 REPORT="$REPORT_DIR/drill-report.json"
@@ -490,21 +491,88 @@ fi
 write_report "$VALIDATION_RC"
 [[ "$VALIDATION_RC" -eq 0 ]] || die "数据验证存在失败项，详见 $REPORT（不得标记 verified）"
 
-# 显式请求回写时，ID、run_id、加密包校验值必须同时匹配。
+# 显式请求回写时，按 local_path + run_id + 加密包校验值精确定位唯一记录；
+# 若旧版 Agent 备份任务只登记了 storage_key（local_path/checksum 为空），先用本次备份清单
+# 补录/关联（backup_cli apply），再重新匹配；绝不回退到“最新一条记录”。
 if [[ -n "$RECORD_ID" || "$RECORD_LATEST" -eq 1 ]]; then
     [[ "$BACKUP_RECORD" == 1 ]] || die "BACKUP_RECORD 禁止回写"
-    run_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$MANIFEST")"
-    [[ "$run_id" =~ ^[A-Za-z0-9_-]+$ ]] || die "run_id 不合法"
     digest="$(sha256sum "$BUNDLE")"; digest="${digest%% *}"
-    record_filter="JSON_UNQUOTE(JSON_EXTRACT(manifest_json,'$.run_id'))='$run_id' AND checksum='sha256:$digest'"
-    if [[ -n "$RECORD_ID" ]]; then
-        [[ "$RECORD_ID" =~ ^[1-9][0-9]*$ ]] || die "record-id 不合法"
-        record_filter="$record_filter AND id=$RECORD_ID"
-    fi
-    record_target="$(mysql_query_at "$MAIN_CONTAINER_ID" "SELECT id FROM $(quote_identifier "$CENTER_DB_NAME").backup_records WHERE $record_filter")"
-    [[ "$record_target" =~ ^[1-9][0-9]*$ ]] || die "未找到唯一匹配本次 run_id/校验值的备份记录；未回写"
+    RECORD_META_JSON="$(python3 - "$MANIFEST" "$digest" "$WORK_DIR/manifest.record.json" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest_path, digest, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+manifest = json.loads(pathlib.Path(manifest_path).read_text(encoding="utf-8"))
+bundle_dir = pathlib.Path(manifest_path).resolve().parent
+local = manifest.get("local") or {}
+local_path = str(local.get("dir") or local.get("path") or "").strip()
+run_id = str(manifest.get("run_id") or "").strip()
+if not run_id:
+    run_id = bundle_dir.name
+if not local_path:
+    local_path = str(bundle_dir)
+offsite = manifest.get("offsite") or {}
+checksum = str(offsite.get("checksum") or local.get("checksum") or "").strip()
+if checksum and not checksum.startswith("sha256:"):
+    checksum = "sha256:" + checksum
+if not checksum:
+    checksum = "sha256:" + digest
+# 仅修补 drill 临时副本：补齐旧包缺失字段，供 CLI apply 关联旧 Agent 记录；不修改原始备份包
+patched = json.loads(json.dumps(manifest))
+patched["run_id"] = run_id
+patched.setdefault("local", {})["dir"] = local_path
+patched.setdefault("offsite", {})["checksum"] = checksum
+pathlib.Path(out_path).write_text(json.dumps(patched, ensure_ascii=False), encoding="utf-8")
+print(json.dumps({"run_id": run_id, "local_path": local_path, "checksum": checksum, "actual": "sha256:" + digest}))
+PY
+)"
+    read -r run_id local_path manifest_checksum actual_checksum <<< "$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["run_id"], d["local_path"], d["checksum"], d["actual"])' <<< "$RECORD_META_JSON")"
+    [[ "$run_id" =~ ^[A-Za-z0-9_-]+$ ]] || die "run_id 不合法：$run_id"
+    [[ "$manifest_checksum" == "$actual_checksum" ]] || die "备份清单校验值($manifest_checksum)与当前加密包($actual_checksum)不一致；拒绝回写"
+
     api_id="$(docker ps -q --filter "label=com.docker.compose.project=$MAIN_PROJECT" --filter label=com.docker.compose.service=api)"
     [[ -n "$api_id" && "$api_id" != *$'\n'* ]] || die "无法唯一定位用于回写的主 API"
+
+    sql_quote() { printf '%s' "$1" | sed "s/'/''/g"; }
+    build_record_filter() {
+        local run_q local_q checksum_q
+        run_q="$(sql_quote "$run_id")"
+        local_q="$(sql_quote "$local_path")"
+        checksum_q="$(sql_quote "$manifest_checksum")"
+        printf "(COALESCE(local_path,'')='%s' OR COALESCE(storage_key,'')='%s' OR COALESCE(storage_key,'') LIKE '%%%s' OR JSON_UNQUOTE(JSON_EXTRACT(manifest_json,'$.run_id'))='%s') AND checksum IN ('%s','sha256:%s','%s')" \
+            "$local_q" "$local_q" "$run_q" "$run_q" "$checksum_q" "$digest" "$digest"
+    }
+    record_candidates() {
+        mysql_query_at "$MAIN_CONTAINER_ID" \
+            "SELECT id, COALESCE(local_path,''), COALESCE(storage_key,''), COALESCE(checksum,'') FROM $(quote_identifier "$CENTER_DB_NAME").backup_records ORDER BY id DESC LIMIT 5" >&2 || true
+    }
+    lookup_record() {
+        local filter
+        filter="$(build_record_filter)"
+        if [[ -n "$RECORD_ID" ]]; then
+            [[ "$RECORD_ID" =~ ^[1-9][0-9]*$ ]] || die "record-id 不合法"
+            filter="$filter AND id=$RECORD_ID"
+        fi
+        mysql_query_at "$MAIN_CONTAINER_ID" "SELECT id FROM $(quote_identifier "$CENTER_DB_NAME").backup_records WHERE $filter"
+    }
+
+    record_target="$(lookup_record | awk 'NF {print; c++} END {exit (c==1?0:1)}')" || record_target=""
+    if [[ -z "$record_target" && "$RECORD_LATEST" -eq 1 ]]; then
+        log "未找到匹配记录，尝试用本次备份清单补录/关联已有 Agent 备份记录（local_path=$local_path run_id=$run_id）"
+        docker exec -e BACKUP_MANIFEST_JSON="$(cat "$WORK_DIR/manifest.record.json")" "$api_id" \
+            python -m app.modules.ops.backup_cli apply > "$WORK_DIR/record-apply.json" 2>&1 \
+            || { cat "$WORK_DIR/record-apply.json" >&2; die "补录备份记录失败，恢复报告保留"; }
+        python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("ok") is True else 1)' "$WORK_DIR/record-apply.json" \
+            || { cat "$WORK_DIR/record-apply.json" >&2; die "补录备份记录未返回 ok"; }
+        record_target="$(lookup_record | awk 'NF {print; c++} END {exit (c==1?0:1)}')" || record_target=""
+    fi
+    [[ "$record_target" =~ ^[1-9][0-9]*$ ]] || {
+        warn "未找到唯一匹配本次 local_path/run_id/校验值的备份记录；候选（最近 5 条）："
+        record_candidates
+        die "未回写：请确认 BACKUP_INSTANCE_ID 已设置并重试，或用 --record-id 指定候选记录"
+    }
+    log "匹配到备份记录 id=$record_target（local_path=$local_path run_id=$run_id checksum=$manifest_checksum）"
     restore_json="$(python3 -c 'import json,sys; print(json.dumps({"backup_id":int(sys.argv[1]),"status":"verified","notes":"隔离恢复硬校验及数据关联/配置解密全部通过；报告 "+sys.argv[2]}))' "$record_target" "$REPORT")"
     docker exec -e BACKUP_RESTORE_JSON="$restore_json" "$api_id" python -m app.modules.ops.backup_cli restore-check > "$WORK_DIR/record-result.json" || die "回写失败，恢复报告保留"
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("ok") is True and d.get("backup",{}).get("restore_status")=="verified" else 1)' "$WORK_DIR/record-result.json" || die "回写未返回 verified"

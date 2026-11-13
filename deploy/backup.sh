@@ -18,8 +18,12 @@ COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.server.yml --env
 MYSQL_SERVICE="${MYSQL_SERVICE:-mysql}"
 ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 未配置}"
 
+CENTER_DB="${CENTER_DB_NAME:-ventasync_center}"
 DBS=$("${COMPOSE[@]}" exec -T "$MYSQL_SERVICE" mysql -uroot -p"$ROOT_PASSWORD" -N -e \
   "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'ventasync_%';" 2>/dev/null)
+TENANT_DBS=$("${COMPOSE[@]}" exec -T "$MYSQL_SERVICE" mysql -uroot -p"$ROOT_PASSWORD" -N -e \
+  "SELECT database_name FROM ${CENTER_DB}.tenant_databases WHERE status='ready';" 2>/dev/null || true)
+DBS=$(printf '%s\n%s\n' "$DBS" "$TENANT_DBS" | awk 'NF' | sort -u)
 
 for db in $DBS; do
   "${COMPOSE[@]}" exec -T "$MYSQL_SERVICE" mysqldump -uroot -p"$ROOT_PASSWORD" \

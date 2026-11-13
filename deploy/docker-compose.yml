@@ -327,6 +327,21 @@ services:
   # ------------------------------------------------------------------ 发布任务
   # 迁移只在发布时执行：docker compose --profile release run --rm migrate
   # api / worker 启动不会自动迁移（plan.txt 实施约束）。
+  # ------------------------------------------------------------------ 镜像仓库
+  # 仅中心主机启用：docker compose --profile registry up -d registry
+  registry:
+    image: registry:2
+    profiles:
+      - registry
+    volumes:
+      - registry_data:/var/lib/registry
+    networks:
+      - edge
+    expose:
+      - "5000"
+    restart: unless-stopped
+    logging: *default-logging
+
   migrate:
     <<: *backend
     command: ["python", "scripts/migrate_all.py"]

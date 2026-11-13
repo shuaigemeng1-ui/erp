@@ -19,6 +19,7 @@ fi
 python3 --version >/dev/null 2>&1 || { echo "需要 python3" >&2; exit 1; }
 install -d -m 755 "$BASE_DIR"
 install -m 755 "$(dirname "$0")/erp_agent.py" "$BASE_DIR/erp_agent.py"
+install -m 755 "$(dirname "$0")/executor.py" "$BASE_DIR/executor.py"
 
 # Agent 以普通系统用户运行，不直接使用 root。
 if ! id -u erp-agent >/dev/null 2>&1; then

@@ -5,15 +5,24 @@ import type {
   OpsAggregateResolution,
   OpsAlert,
   OpsAlertAckResult,
+  OpsBackupStage,
   OpsInstance,
   OpsInstanceCreatePayload,
   OpsInstanceUpdatePayload,
+  OpsMaintenanceWindow,
+  OpsMaintenanceWindowPayload,
+  OpsMonitoringOverall,
+  OpsMonitoringOverview,
+  OpsMonitorComponent,
+  OpsMonitorComponentStatus,
   OpsNodeAggregates,
   OpsNodeEnrollment,
   OpsNodeMetrics,
   OpsNodeSshConfig,
   OpsNodeSshConfigPayload,
   OpsNodeSshExecResult,
+  OpsPerformanceSummary,
+  OpsProbeLatency,
   OpsProbeResult,
   OpsServerNode,
   OpsTenantOption,
@@ -163,6 +172,24 @@ export interface OpsBackup {
   started_at?: string | null
   finished_at?: string | null
   error: string
+  /* 批次3：本地生成/校验/异地上传/恢复验证，旧后端缺失 */
+  trigger?: string | null
+  local_status?: string | null
+  local_path?: string | null
+  verified_at?: string | null
+  checksum_status?: string | null
+  checksum?: string | null
+  offsite_status?: string | null
+  offsite_key?: string | null
+  offsite_bucket?: string | null
+  encryption?: string | null
+  restore_status?: string | null
+  restore_verified_at?: string | null
+  restore_notes?: string | null
+  failure_reason?: string | null
+  retention_until?: string | null
+  encrypted?: boolean | null
+  stages?: OpsBackupStage[] | null
 }
 
 export interface OpsOperationQuery extends PageParams {
@@ -171,6 +198,157 @@ export interface OpsOperationQuery extends PageParams {
 
 export interface OpsBackupQuery extends PageParams {
   instance_id?: EntityId
+}
+
+/* ------------------------------------------------------------------ *
+ * 批次3：监控分项归一化（兼容 /monitoring/overview 与 /monitoring/status）
+ * ------------------------------------------------------------------ */
+
+const MONITOR_COMPONENT_LABELS: Record<string, string> = {
+  identity_db: '身份库',
+  business_db: '业务库',
+  redis: 'Redis',
+  worker: 'Worker',
+  scheduler: '调度器',
+  api: 'API',
+  nginx: 'Nginx',
+}
+
+const MONITOR_COMPONENT_ALIASES: Record<string, string> = {
+  identitydb: 'identity_db',
+  identity: 'identity_db',
+  center_db: 'identity_db',
+  center: 'identity_db',
+  auth_db: 'identity_db',
+  businessdb: 'business_db',
+  tenant_db: 'business_db',
+  tenant: 'business_db',
+  business: 'business_db',
+  redis_cache: 'redis',
+  cache: 'redis',
+  celery_worker: 'worker',
+  celery_scheduler: 'scheduler',
+  beat: 'scheduler',
+}
+
+const MONITOR_OK_VALUES = new Set([
+  'ok',
+  'up',
+  'healthy',
+  'pass',
+  'passed',
+  'success',
+  'succeeded',
+  'running',
+  'online',
+  'active',
+])
+const MONITOR_DEGRADED_VALUES = new Set(['degraded', 'warning', 'warn', 'stale', 'partial', 'slow'])
+const MONITOR_ERROR_VALUES = new Set([
+  'error',
+  'down',
+  'failed',
+  'fail',
+  'unhealthy',
+  'offline',
+  'critical',
+])
+
+function monitorComponentKey(value: string): string {
+  const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, '_')
+  return MONITOR_COMPONENT_ALIASES[normalized] ?? normalized
+}
+
+function toNullableNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null
+  const parsed = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function nullableString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null
+}
+
+function normalizeComponentStatusValue(value: unknown): OpsMonitorComponentStatus {
+  const text = String(value ?? '').trim().toLowerCase()
+  if (MONITOR_OK_VALUES.has(text)) return 'ok'
+  if (MONITOR_DEGRADED_VALUES.has(text)) return 'degraded'
+  if (MONITOR_ERROR_VALUES.has(text)) return 'error'
+  return 'unknown'
+}
+
+function componentFromRaw(raw: unknown, keyHint = ''): OpsMonitorComponent | null {
+  if (typeof raw === 'string') {
+    const key = monitorComponentKey(keyHint || raw)
+    return {
+      key: key || keyHint || raw,
+      label: MONITOR_COMPONENT_LABELS[key] ?? (keyHint || raw),
+      status: normalizeComponentStatusValue(raw),
+      message: '',
+      latency_ms: null,
+      last_heartbeat_at: null,
+      checked_at: null,
+    }
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const record = raw as Record<string, unknown>
+  const keySource = String(record.key ?? record.name ?? keyHint ?? '').trim()
+  const key = monitorComponentKey(keySource)
+  const explicitLabel = typeof record.label === 'string' ? record.label.trim() : ''
+  const message =
+    typeof record.message === 'string'
+      ? record.message
+      : typeof record.detail === 'string'
+        ? record.detail
+        : ''
+  const status =
+    typeof record.ok === 'boolean'
+      ? record.ok
+        ? 'ok'
+        : 'error'
+      : normalizeComponentStatusValue(record.status)
+  return {
+    key: key || keySource,
+    label: explicitLabel || MONITOR_COMPONENT_LABELS[key] || keySource || '-',
+    status,
+    message,
+    latency_ms: toNullableNumber(record.latency_ms),
+    last_heartbeat_at: nullableString(record.last_heartbeat_at),
+    checked_at: nullableString(record.checked_at),
+  }
+}
+
+/** 把 /overview（数组或对象）与 /status 的 components 统一为可渲染列表；缺失返回空数组。 */
+export function normalizeMonitorComponents(raw: unknown): OpsMonitorComponent[] {
+  if (!raw) return []
+  if (Array.isArray(raw)) {
+    return raw
+      .map((item) => componentFromRaw(item))
+      .filter((item): item is OpsMonitorComponent => item !== null)
+  }
+  if (typeof raw === 'object') {
+    return Object.entries(raw as Record<string, unknown>)
+      .map(([key, value]) => componentFromRaw(value, key))
+      .filter((item): item is OpsMonitorComponent => item !== null)
+  }
+  return []
+}
+
+/** 整体状态：优先后端 overall，缺失时按分项推导。 */
+export function normalizeMonitorOverall(
+  raw: unknown,
+  components: OpsMonitorComponent[] = [],
+): OpsMonitoringOverall {
+  const text = String(raw ?? '').trim().toLowerCase()
+  if (['healthy', 'ok', 'up', 'good', 'normal'].includes(text)) return 'healthy'
+  if (['degraded', 'warning', 'warn', 'stale', 'partial'].includes(text)) return 'degraded'
+  if (['unhealthy', 'error', 'down', 'failed', 'critical', 'offline'].includes(text)) {
+    return 'unhealthy'
+  }
+  if (components.some((item) => item.status === 'error')) return 'unhealthy'
+  if (components.some((item) => item.status === 'degraded')) return 'degraded'
+  if (components.length > 0 && components.every((item) => item.status === 'ok')) return 'healthy'
+  return 'unknown'
 }
 
 export const opsApi = {
@@ -301,5 +479,65 @@ export const opsApi = {
 
   backups(query: OpsBackupQuery = {}): Promise<PagedData<OpsBackup>> {
     return requestPage<OpsBackup>('/platform/backups', query as QueryParams)
+  },
+
+  /* ------------------------------ 监控 / 性能 / 维护窗口 ------------------------------ */
+
+  /** 批次3：HTTP 请求性能（P95/P99/5xx）；window 60~86400 秒。 */
+  httpMetrics(windowSeconds = 300, silent = false): Promise<OpsPerformanceSummary> {
+    return http.get<OpsPerformanceSummary>(
+      '/platform/metrics/http',
+      { window_seconds: windowSeconds },
+      { silent },
+    )
+  },
+
+  /** 批次3：公网探测耗时曲线（root/healthz/api）。 */
+  probeLatency(nodeId: EntityId, hours = 24, silent = false): Promise<OpsProbeLatency> {
+    return http.get<OpsProbeLatency>(
+      `/platform/nodes/${segment(nodeId)}/probe-latency`,
+      { hours },
+      { silent },
+    )
+  },
+
+  /**
+   * 批次3：监控总览。Lead 定稿为 /platform/monitoring/overview，
+   * task-29 契约同时提供 /platform/monitoring/status；先取 overview，404 回退 status。
+   * 旧后端两者都缺失时返回 null，页面按块隐藏。
+   */
+  async monitoringOverview(instanceId?: EntityId): Promise<OpsMonitoringOverview | null> {
+    const query = instanceId ? { instance_id: instanceId } : undefined
+    for (const path of ['/platform/monitoring/overview', '/platform/monitoring/status']) {
+      try {
+        const data = await http.get<OpsMonitoringOverview>(path, query, { silent: true })
+        if (data) return data
+      } catch {
+        // 旧后端没有该接口，继续尝试兼容路径
+      }
+    }
+    return null
+  },
+
+  /** 实例维护窗口（现有接口）：兼容旧后端/空列表。 */
+  async maintenanceWindows(instanceId: EntityId): Promise<OpsMaintenanceWindow[]> {
+    const raw = await http.get<OpsMaintenanceWindow[] | { items?: OpsMaintenanceWindow[] }>(
+      `/platform/instances/${segment(instanceId)}/maintenance-windows`,
+    )
+    return Array.isArray(raw) ? raw : (raw?.items ?? [])
+  },
+
+  createMaintenanceWindow(
+    instanceId: EntityId,
+    payload: OpsMaintenanceWindowPayload,
+  ): Promise<OpsMaintenanceWindow> {
+    return http.post<OpsMaintenanceWindow>(
+      `/platform/instances/${segment(instanceId)}/maintenance-windows`,
+      payload,
+    )
+  },
+
+  deleteMaintenanceWindow(windowId: EntityId): Promise<{ deleted: boolean }> {
+    return http.delete<{ deleted: boolean }>(`/platform/maintenance-windows/${segment(windowId)}`)
   },
 }

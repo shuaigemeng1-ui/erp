@@ -3,7 +3,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, type FormInstance, type FormRules } from 'element-plus'
 import { Plus, Refresh, Search } from '@element-plus/icons-vue'
-import { opsApi } from '@/api/ops'
+import { normalizeMonitorComponents, normalizeMonitorOverall, opsApi } from '@/api/ops'
 import type {
   OpsBackup,
   OpsBuildStatus,
@@ -16,7 +16,14 @@ import { useTableQuery } from '@/composables/useTableQuery'
 import PaginationBar from '@/components/PaginationBar.vue'
 import IdCopy from '@/components/IdCopy.vue'
 import { formatDateTime, parseJsonObject, stringOrUndefined, textOrDash } from '@/utils/format'
-import type { OpsInstance } from '@/types/ops'
+import type {
+  OpsInstance,
+  OpsMonitoringOverall,
+  OpsMonitoringOverview,
+  OpsMonitorComponentStatus,
+  OpsPerformanceSummary,
+  OpsPublicProbeSummary,
+} from '@/types/ops'
 
 type TagType = 'success' | 'warning' | 'info' | 'danger'
 type OpsCenterTab = 'releases' | 'operations' | 'backups'
@@ -188,6 +195,208 @@ function formatSize(bytes?: number | null): string {
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
   if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`
   return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
+/* ------------------------------ 监控总览展示 ------------------------------ */
+function componentStatusType(status: OpsMonitorComponentStatus): TagType {
+  if (status === 'ok') return 'success'
+  if (status === 'degraded') return 'warning'
+  if (status === 'error') return 'danger'
+  return 'info'
+}
+
+function componentStatusText(status: OpsMonitorComponentStatus): string {
+  if (status === 'ok') return '正常'
+  if (status === 'degraded') return '降级'
+  if (status === 'error') return '异常'
+  return '未知'
+}
+
+function overallType(overall: OpsMonitoringOverall): TagType {
+  if (overall === 'healthy') return 'success'
+  if (overall === 'degraded') return 'warning'
+  if (overall === 'unhealthy') return 'danger'
+  return 'info'
+}
+
+function overallText(overall: OpsMonitoringOverall): string {
+  if (overall === 'healthy') return '健康'
+  if (overall === 'degraded') return '降级'
+  if (overall === 'unhealthy') return '异常'
+  return '未知'
+}
+
+function formatCount(value?: number | null): string {
+  if (value === null || value === undefined) return '-'
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed.toLocaleString('zh-CN') : '-'
+}
+
+function formatMs(value?: number | null, digits = 1): string {
+  if (value === null || value === undefined) return '-'
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? `${parsed.toFixed(digits)} ms` : '-'
+}
+
+/** 5xx 比例后端按 0~1 返回；兼容个别接口直接给百分比。 */
+function formatRate(value?: number | null): string {
+  if (value === null || value === undefined) return '-'
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return '-'
+  const percent = parsed <= 1 ? parsed * 100 : parsed
+  return `${percent.toFixed(2)}%`
+}
+
+function performanceWindowText(performance: OpsPerformanceSummary | null): string {
+  const seconds = Number(performance?.window_seconds ?? 0)
+  if (!seconds) return '最近 5 分钟'
+  if (seconds < 60) return `最近 ${seconds} 秒`
+  if (seconds % 3600 === 0) return `最近 ${seconds / 3600} 小时`
+  if (seconds % 60 === 0) return `最近 ${seconds / 60} 分钟`
+  return `最近 ${seconds} 秒`
+}
+
+function isHigh5xx(value?: number | null): boolean {
+  const parsed = Number(value ?? 0)
+  if (!Number.isFinite(parsed)) return false
+  const ratio = parsed <= 1 ? parsed : parsed / 100
+  return ratio > 0.01
+}
+
+function probeTargetText(target?: string | null): string {
+  if (target === 'root') return '首页 /'
+  if (target === 'api') return 'API /readyz'
+  if (target === 'healthz') return '健康检查 /healthz'
+  return textOrDash(target)
+}
+
+function probeStatusType(probe: OpsPublicProbeSummary): TagType {
+  if (probe.ok === true || probe.status === 'ok' || probe.status === 'up') return 'success'
+  if (probe.ok === false || ['failed', 'error', 'down'].includes(probe.status ?? '')) return 'danger'
+  return 'info'
+}
+
+function probeStatusText(probe: OpsPublicProbeSummary): string {
+  if (probe.ok === true || probe.status === 'ok' || probe.status === 'up') return '正常'
+  if (probe.ok === false || ['failed', 'error', 'down'].includes(probe.status ?? '')) return '异常'
+  return '未知'
+}
+
+function performanceDegradedText(performance: OpsPerformanceSummary | null): string {
+  return (
+    performance?.degraded_reason ||
+    'Redis 直方图暂不可用，当前数值可能来自本地样本或为 0。'
+  )
+}
+
+function probeLabel(probe: OpsPublicProbeSummary): string {
+  const label = probeTargetText(probe.target)
+  return probe.domain ? `${label} · ${probe.domain}` : label
+}
+
+/* ------------------------------ 备份阶段展示 ------------------------------ */
+const BACKUP_STAGE_META: Array<{ key: string; label: string; fields: string[] }> = [
+  { key: 'local', label: '本地生成', fields: ['local_status', 'local_generated_status', 'generate_status'] },
+  { key: 'verify', label: '校验', fields: ['checksum_status', 'verify_status', 'checksum_verify_status'] },
+  { key: 'offsite', label: '异地上传', fields: ['offsite_status', 'upload_status', 'remote_status'] },
+  { key: 'restore', label: '恢复验证', fields: ['restore_status', 'restore_verify_status'] },
+]
+
+interface BackupStageView {
+  key: string
+  label: string
+  status: string
+  statusText: string
+  message: string
+  at?: string | null
+}
+
+function backupField(row: OpsBackup, field: string): string {
+  const record = row as unknown as Record<string, unknown>
+  const value = record[field]
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function backupStageStatusText(status: string): string {
+  const normalized = status.trim().toLowerCase()
+  if (['succeeded', 'ok', 'success', 'passed'].includes(normalized)) return '成功'
+  if (normalized === 'generated') return '已生成'
+  if (normalized === 'verified') return '已校验'
+  if (normalized === 'uploaded') return '已上传'
+  if (normalized === 'restored') return '已恢复'
+  if (normalized === 'not_tested') return '未验证'
+  if (['running', 'uploading', 'verifying', 'processing'].includes(normalized)) return '进行中'
+  if (['pending', 'queued'].includes(normalized)) return '待执行'
+  if (['failed', 'error', 'fail'].includes(normalized)) return '失败'
+  if (['skipped', 'disabled'].includes(normalized)) return '跳过'
+  return status || '-'
+}
+
+function backupStageType(status: string): TagType {
+  const normalized = status.trim().toLowerCase()
+  if (
+    ['succeeded', 'ok', 'success', 'passed', 'generated', 'verified', 'uploaded', 'restored'].includes(
+      normalized,
+    )
+  ) {
+    return 'success'
+  }
+  if (['running', 'uploading', 'verifying', 'processing', 'pending', 'queued'].includes(normalized)) {
+    return 'warning'
+  }
+  if (['failed', 'error', 'fail'].includes(normalized)) return 'danger'
+  return 'info'
+}
+
+function backupStages(row: OpsBackup): BackupStageView[] {
+  const explicit = Array.isArray(row.stages) ? row.stages : []
+  if (explicit.length) {
+    return explicit.map((stage, index) => {
+      const key = stage.key ?? stage.name ?? `stage-${index + 1}`
+      const label = stage.label ?? stage.name ?? stage.key ?? `阶段 ${index + 1}`
+      const status = stage.status ?? ''
+      return {
+        key: String(key),
+        label: String(label),
+        status,
+        statusText: backupStageStatusText(status),
+        message: stage.message ?? '',
+        at: stage.at ?? stage.finished_at ?? stage.started_at ?? null,
+      }
+    })
+  }
+  const stages: BackupStageView[] = []
+  for (const meta of BACKUP_STAGE_META) {
+    const status = meta.fields.map((field) => backupField(row, field)).find(Boolean)
+    if (!status) continue
+    stages.push({
+      key: meta.key,
+      label: meta.label,
+      status,
+      statusText: backupStageStatusText(status),
+      message: '',
+    })
+  }
+  return stages
+}
+
+function backupFailureReason(row: OpsBackup): string {
+  return row.failure_reason?.trim() || row.error?.trim() || ''
+}
+
+function backupEncryptionText(row: OpsBackup): string {
+  const encryption = (row.encryption ?? '').trim()
+  if (encryption) return encryption
+  if (typeof row.encrypted === 'boolean') return row.encrypted ? '已加密' : '未加密'
+  return '-'
+}
+
+const backupDetailVisible = ref(false)
+const backupDetail = ref<OpsBackup | null>(null)
+
+function openBackupDetail(row: OpsBackup): void {
+  backupDetail.value = row
+  backupDetailVisible.value = true
 }
 
 /* ------------------------------ 实例下拉 ------------------------------ */
@@ -512,9 +721,62 @@ const {
   }),
 )
 
+/* ------------------------------ 监控总览 ------------------------------ */
+const monitoringLoading = ref(false)
+const monitoringOverview = ref<OpsMonitoringOverview | null>(null)
+const httpMetrics = ref<OpsPerformanceSummary | null>(null)
+const monitoringComponents = computed(() =>
+  normalizeMonitorComponents(monitoringOverview.value?.components),
+)
+const monitoringOverall = computed(() =>
+  normalizeMonitorOverall(monitoringOverview.value?.overall, monitoringComponents.value),
+)
+const businessPerformance = computed<OpsPerformanceSummary | null>(
+  () =>
+    httpMetrics.value ??
+    monitoringOverview.value?.business_requests ??
+    monitoringOverview.value?.performance ??
+    null,
+)
+const performanceRoutes = computed(() =>
+  (businessPerformance.value?.routes ?? [])
+    .slice()
+    .sort((left, right) => (right.request_count ?? 0) - (left.request_count ?? 0))
+    .slice(0, 10),
+)
+const publicProbes = computed(() => monitoringOverview.value?.public_probes ?? [])
+const monitoringCheckedAt = computed(
+  () =>
+    monitoringOverview.value?.checked_at ??
+    monitoringOverview.value?.generated_at ??
+    businessPerformance.value?.generated_at ??
+    null,
+)
+const showMonitoring = computed(
+  () =>
+    monitoringComponents.value.length > 0 ||
+    Boolean(businessPerformance.value) ||
+    publicProbes.value.length > 0,
+)
+
+async function loadMonitoring(): Promise<void> {
+  monitoringLoading.value = true
+  try {
+    const [overview, metrics] = await Promise.all([
+      opsApi.monitoringOverview(),
+      opsApi.httpMetrics(300, true).catch(() => null),
+    ])
+    monitoringOverview.value = overview
+    httpMetrics.value = metrics
+  } finally {
+    monitoringLoading.value = false
+  }
+}
+
 onMounted(() => {
   void loadReleases()
   void loadInstanceOptions()
+  void loadMonitoring()
 })
 </script>
 
@@ -527,6 +789,164 @@ onMounted(() => {
       </div>
       <el-tag type="info" effect="plain">{{ activeTabLabel }}</el-tag>
     </div>
+
+    <el-card
+      v-if="showMonitoring"
+      v-loading="monitoringLoading"
+      shadow="never"
+      class="page-card monitor-card"
+    >
+      <div class="table-toolbar">
+        <div class="section-title">
+          监控总览
+          <el-tag :type="overallType(monitoringOverall)" size="small" disable-transitions>
+            {{ overallText(monitoringOverall) }}
+          </el-tag>
+          <span v-if="monitoringCheckedAt" class="text-muted">
+            检查时间 {{ formatDateTime(monitoringCheckedAt) }}
+          </span>
+        </div>
+        <div class="toolbar-actions">
+          <el-button :icon="Refresh" :loading="monitoringLoading" @click="loadMonitoring">
+            刷新监控
+          </el-button>
+        </div>
+      </div>
+
+      <div v-if="monitoringComponents.length" class="component-grid">
+        <div v-for="component in monitoringComponents" :key="component.key" class="component-card">
+          <div class="component-head">
+            <span class="component-name">{{ component.label }}</span>
+            <el-tag
+              :type="componentStatusType(component.status)"
+              size="small"
+              disable-transitions
+            >
+              {{ componentStatusText(component.status) }}
+            </el-tag>
+          </div>
+          <div class="component-meta">
+            <span
+              v-if="component.latency_ms !== null && component.latency_ms !== undefined"
+              class="mono"
+            >
+              {{ formatMs(component.latency_ms) }}
+            </span>
+            <span v-else-if="component.last_heartbeat_at" class="text-muted">
+              心跳 {{ formatDateTime(component.last_heartbeat_at) }}
+            </span>
+            <span v-else class="text-muted">-</span>
+          </div>
+          <div v-if="component.message" class="component-detail" :title="component.message">
+            {{ component.message }}
+          </div>
+        </div>
+      </div>
+
+      <div class="monitor-columns">
+        <div class="monitor-panel">
+          <div class="mini-title">
+            业务请求耗时
+            <span class="text-muted">{{ performanceWindowText(businessPerformance) }}</span>
+          </div>
+          <template v-if="businessPerformance">
+            <el-alert
+              v-if="businessPerformance.degraded"
+              class="monitor-alert"
+              type="warning"
+              :closable="false"
+              show-icon
+              :title="performanceDegradedText(businessPerformance)"
+            />
+            <div class="monitor-metric-grid">
+              <div class="monitor-metric">
+                <div class="monitor-metric-label">请求量</div>
+                <div class="monitor-metric-value">
+                  {{ formatCount(businessPerformance.request_count) }}
+                </div>
+              </div>
+              <div class="monitor-metric">
+                <div class="monitor-metric-label">5xx 比例</div>
+                <div
+                  class="monitor-metric-value"
+                  :class="{ 'is-danger': isHigh5xx(businessPerformance.rate_5xx) }"
+                >
+                  {{ formatRate(businessPerformance.rate_5xx) }}
+                </div>
+                <div class="monitor-metric-sub">
+                  {{ formatCount(businessPerformance.error_5xx) }} 个 5xx
+                </div>
+              </div>
+              <div class="monitor-metric">
+                <div class="monitor-metric-label">P95 耗时</div>
+                <div class="monitor-metric-value">{{ formatMs(businessPerformance.p95_ms) }}</div>
+              </div>
+              <div class="monitor-metric">
+                <div class="monitor-metric-label">P99 耗时</div>
+                <div class="monitor-metric-value">{{ formatMs(businessPerformance.p99_ms) }}</div>
+              </div>
+            </div>
+
+            <el-table
+              v-if="performanceRoutes.length"
+              :data="performanceRoutes"
+              border
+              size="small"
+              max-height="240"
+              class="route-table"
+            >
+              <el-table-column label="路由" min-width="240" show-overflow-tooltip>
+                <template #default="{ row }"><span class="mono">{{ row.route }}</span></template>
+              </el-table-column>
+              <el-table-column prop="method" label="方法" width="80" />
+              <el-table-column label="请求量" width="95">
+                <template #default="{ row }">{{ formatCount(row.request_count) }}</template>
+              </el-table-column>
+              <el-table-column label="5xx" width="80">
+                <template #default="{ row }">{{ formatCount(row.error_5xx) }}</template>
+              </el-table-column>
+              <el-table-column label="P95" width="100">
+                <template #default="{ row }">{{ formatMs(row.p95_ms) }}</template>
+              </el-table-column>
+              <el-table-column label="P99" width="100">
+                <template #default="{ row }">{{ formatMs(row.p99_ms) }}</template>
+              </el-table-column>
+            </el-table>
+            <el-empty v-else description="暂无路由级指标" :image-size="50" />
+          </template>
+          <el-empty v-else description="暂无业务请求性能数据" :image-size="50" />
+        </div>
+
+        <div class="monitor-panel">
+          <div class="mini-title">公网探测耗时</div>
+          <div v-if="publicProbes.length" class="probe-latency-list">
+            <div
+              v-for="probe in publicProbes"
+              :key="`${probe.node_id ?? ''}-${probe.target}-${probe.domain ?? ''}`"
+              class="probe-latency-row"
+            >
+              <div class="probe-latency-label">
+                <span>{{ probeLabel(probe) }}</span>
+                <el-tag :type="probeStatusType(probe)" size="small" disable-transitions>
+                  {{ probeStatusText(probe) }}
+                </el-tag>
+              </div>
+              <div class="probe-latency-meta">
+                <span class="mono">{{ formatMs(probe.latency_ms) }}</span>
+                <span v-if="typeof probe.total_nodes === 'number'" class="text-muted">
+                  节点 {{ probe.ok_nodes ?? 0 }}/{{ probe.total_nodes }} 正常
+                </span>
+                <span v-else-if="probe.consecutive_failures" class="text-danger">
+                  连续失败 {{ probe.consecutive_failures }} 次
+                </span>
+                <span class="text-muted">{{ formatDateTime(probe.checked_at) }}</span>
+              </div>
+            </div>
+          </div>
+          <el-empty v-else description="暂无公网探测数据" :image-size="50" />
+        </div>
+      </div>
+    </el-card>
 
     <el-tabs v-model="activeTab" class="ops-center-tabs">
       <!-- 发布版本 -->
@@ -778,6 +1198,23 @@ onMounted(() => {
                 </el-tag>
               </template>
             </el-table-column>
+            <el-table-column label="备份阶段" min-width="300">
+              <template #default="{ row }">
+                <div v-if="backupStages(row as OpsBackup).length" class="backup-stages">
+                  <el-tag
+                    v-for="stage in backupStages(row as OpsBackup)"
+                    :key="stage.key"
+                    :type="backupStageType(stage.status)"
+                    size="small"
+                    disable-transitions
+                    :title="stage.message || ''"
+                  >
+                    {{ stage.label }} · {{ stage.statusText }}
+                  </el-tag>
+                </div>
+                <span v-else class="text-muted">-</span>
+              </template>
+            </el-table-column>
             <el-table-column label="存储键" min-width="240" show-overflow-tooltip>
               <template #default="{ row }">
                 <span class="mono">{{ textOrDash(row.storage_key) }}</span>
@@ -792,8 +1229,20 @@ onMounted(() => {
             <el-table-column label="完成时间" width="170">
               <template #default="{ row }">{{ formatDateTime(row.finished_at) }}</template>
             </el-table-column>
-            <el-table-column label="错误" min-width="180" show-overflow-tooltip>
-              <template #default="{ row }">{{ textOrDash(row.error) }}</template>
+            <el-table-column label="失败原因" min-width="200" show-overflow-tooltip>
+              <template #default="{ row }">{{ textOrDash(backupFailureReason(row as OpsBackup)) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="90" fixed="right">
+              <template #default="{ row }">
+                <el-button
+                  text
+                  type="primary"
+                  size="small"
+                  @click="openBackupDetail(row as OpsBackup)"
+                >
+                  详情
+                </el-button>
+              </template>
             </el-table-column>
             <template #empty>
               <el-empty description="暂无备份记录，可新建 backup 运维任务" :image-size="72" />
@@ -1052,6 +1501,99 @@ onMounted(() => {
       <el-button type="primary" :loading="operationSubmitting" @click="submitOperation">创建</el-button>
     </template>
   </el-dialog>
+
+  <!-- 备份详情 -->
+  <el-dialog v-model="backupDetailVisible" title="备份详情" width="760px" destroy-on-close>
+    <template v-if="backupDetail">
+      <el-descriptions :column="2" border size="small" class="detail-descriptions">
+        <el-descriptions-item label="备份 ID">
+          <IdCopy :id="backupDetail.id" />
+        </el-descriptions-item>
+        <el-descriptions-item label="实例">
+          <div>{{ instanceName(backupDetail.instance_id) || '-' }}</div>
+          <IdCopy :id="backupDetail.instance_id" />
+        </el-descriptions-item>
+        <el-descriptions-item label="状态">
+          <el-tag :type="backupStatusType(backupDetail.status)" size="small" disable-transitions>
+            {{ backupStatusText(backupDetail.status) }}
+          </el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item label="触发方式">
+          {{ textOrDash(backupDetail.trigger) }}
+        </el-descriptions-item>
+        <el-descriptions-item label="大小">
+          {{ formatSize(backupDetail.size_bytes) }}
+        </el-descriptions-item>
+        <el-descriptions-item label="开始时间">
+          {{ formatDateTime(backupDetail.started_at) }}
+        </el-descriptions-item>
+        <el-descriptions-item label="完成时间">
+          {{ formatDateTime(backupDetail.finished_at) }}
+        </el-descriptions-item>
+        <el-descriptions-item label="保留到期">
+          {{ formatDateTime(backupDetail.retention_until) }}
+        </el-descriptions-item>
+        <el-descriptions-item label="加密">
+          <span :class="backupEncryptionText(backupDetail) === '-' ? 'text-muted' : 'mono'">
+            {{ backupEncryptionText(backupDetail) }}
+          </span>
+        </el-descriptions-item>
+        <el-descriptions-item label="存储键" :span="2">
+          <span class="mono">{{ textOrDash(backupDetail.storage_key) }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="本地路径" :span="2">
+          <span class="mono">{{ textOrDash(backupDetail.local_path) }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="校验摘要" :span="2">
+          <span class="mono">{{ textOrDash(backupDetail.checksum) }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="校验时间">
+          {{ formatDateTime(backupDetail.verified_at) }}
+        </el-descriptions-item>
+        <el-descriptions-item label="异地存储桶">
+          <span class="mono">{{ textOrDash(backupDetail.offsite_bucket) }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="异地备份键" :span="2">
+          <span class="mono">{{ textOrDash(backupDetail.offsite_key) }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="恢复验证时间">
+          {{ formatDateTime(backupDetail.restore_verified_at) }}
+        </el-descriptions-item>
+        <el-descriptions-item label="恢复说明">
+          {{ textOrDash(backupDetail.restore_notes) }}
+        </el-descriptions-item>
+        <el-descriptions-item label="失败原因" :span="2">
+          {{ textOrDash(backupFailureReason(backupDetail)) }}
+        </el-descriptions-item>
+      </el-descriptions>
+
+      <div class="section-head">阶段状态</div>
+      <el-table :data="backupStages(backupDetail)" border size="small">
+        <el-table-column label="阶段" width="120">
+          <template #default="{ row }">{{ row.label }}</template>
+        </el-table-column>
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <el-tag :type="backupStageType(row.status)" size="small" disable-transitions>
+              {{ row.statusText }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="时间" width="170">
+          <template #default="{ row }">{{ formatDateTime(row.at) }}</template>
+        </el-table-column>
+        <el-table-column label="说明" min-width="220">
+          <template #default="{ row }">{{ textOrDash(row.message) }}</template>
+        </el-table-column>
+        <template #empty>
+          <el-empty description="旧备份记录未返回分阶段状态" :image-size="60" />
+        </template>
+      </el-table>
+    </template>
+    <template #footer>
+      <el-button @click="backupDetailVisible = false">关闭</el-button>
+    </template>
+  </el-dialog>
 </template>
 
 <style scoped>
@@ -1130,6 +1672,179 @@ onMounted(() => {
 .payload-input :deep(.el-textarea__inner) {
   font-family: Consolas, 'SFMono-Regular', Menlo, monospace;
   font-size: 12px;
+}
+
+.monitor-card .section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.component-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.component-card {
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--el-fill-color-lighter);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+}
+
+.component-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.component-name {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.component-meta {
+  margin-top: 6px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.component-detail {
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.monitor-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.monitor-panel {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+}
+
+.mini-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.mini-title .text-muted {
+  font-weight: 400;
+}
+
+.monitor-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.monitor-metric {
+  padding: 8px 10px;
+  background: var(--el-fill-color-lighter);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 4px;
+}
+
+.monitor-metric-label {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.monitor-metric-value {
+  margin-top: 2px;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.monitor-metric-value.is-danger {
+  color: var(--el-color-danger);
+}
+
+.monitor-metric-sub {
+  margin-top: 2px;
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+}
+
+.monitor-alert {
+  margin-bottom: 8px;
+}
+
+.route-table {
+  margin-top: 8px;
+}
+
+.probe-latency-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.probe-latency-row {
+  padding: 8px 10px;
+  background: var(--el-fill-color-lighter);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 4px;
+}
+
+.probe-latency-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.probe-latency-meta {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.text-danger {
+  color: var(--el-color-danger);
+}
+
+.backup-stages {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 1000px) {
+  .monitor-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .monitor-metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 900px) {

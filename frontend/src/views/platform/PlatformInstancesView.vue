@@ -5,7 +5,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { CopyDocument, Plus, Refresh, Search } from '@element-plus/icons-vue'
-import { opsApi } from '@/api/ops'
+import { normalizeMonitorComponents, normalizeMonitorOverall, opsApi } from '@/api/ops'
 import type { OpsRelease } from '@/api/ops'
 import { isApiError } from '@/api/http'
 import { useTableQuery } from '@/composables/useTableQuery'
@@ -18,12 +18,20 @@ import type {
   OpsEnvironment,
   OpsInstance,
   OpsInstanceStatus,
+  OpsMaintenanceWindow,
+  OpsMonitoringOverall,
+  OpsMonitoringOverview,
+  OpsMonitorComponent,
+  OpsMonitorComponentStatus,
   OpsNodeAggregates,
   OpsNodeEnrollment,
   OpsNodeMetric,
   OpsNodeMetrics,
   OpsNodeSshConfig,
+  OpsPerformanceSummary,
+  OpsProbeLatency,
   OpsProbeResult,
+  OpsPublicProbeSummary,
   OpsServerNode,
   OpsTenantOption,
 } from '@/types/ops'
@@ -39,6 +47,9 @@ const ALERT_TYPE_LABELS: Record<string, string> = {
   disk_high: '磁盘过高',
   agent_offline: 'Agent 离线',
   public_unreachable: '公网不可达',
+  api_unreachable: 'API 不可达',
+  cert_expiring: '证书即将过期',
+  backup_overdue: '备份超期',
 }
 
 type TrendRangeKey = '1h' | '24h' | '7d' | '30d'
@@ -196,6 +207,119 @@ function alertStatusText(status?: string | null): string {
 function alertTypeText(alertType?: string | null): string {
   if (!alertType) return '-'
   return ALERT_TYPE_LABELS[alertType] ?? alertType
+}
+
+function alertSuppressTitle(alert: OpsAlert): string {
+  const parts: string[] = []
+  if (alert.maintenance_reason) parts.push(`维护原因：${alert.maintenance_reason}`)
+  if (alert.suppress_until) parts.push(`下次可通知：${formatDateTime(alert.suppress_until)}`)
+  return parts.join('；') || '处于维护窗口或重复告警抑制期'
+}
+
+/* ------------------------------ 监控 / 性能展示 ------------------------------ */
+function componentStatusType(status: OpsMonitorComponentStatus): TagType {
+  if (status === 'ok') return 'success'
+  if (status === 'degraded') return 'warning'
+  if (status === 'error') return 'danger'
+  return 'info'
+}
+
+function componentStatusText(status: OpsMonitorComponentStatus): string {
+  if (status === 'ok') return '正常'
+  if (status === 'degraded') return '降级'
+  if (status === 'error') return '异常'
+  return '未知'
+}
+
+function overallType(overall: OpsMonitoringOverall): TagType {
+  if (overall === 'healthy') return 'success'
+  if (overall === 'degraded') return 'warning'
+  if (overall === 'unhealthy') return 'danger'
+  return 'info'
+}
+
+function overallText(overall: OpsMonitoringOverall): string {
+  if (overall === 'healthy') return '健康'
+  if (overall === 'degraded') return '降级'
+  if (overall === 'unhealthy') return '异常'
+  return '未知'
+}
+
+function formatCount(value?: number | null): string {
+  if (value === null || value === undefined) return '-'
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed.toLocaleString('zh-CN') : '-'
+}
+
+function formatMs(value?: number | null, digits = 1): string {
+  if (value === null || value === undefined) return '-'
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? `${parsed.toFixed(digits)} ms` : '-'
+}
+
+/** 5xx 比例后端按 0~1 返回；兼容个别接口直接给百分比。 */
+function formatRate(value?: number | null): string {
+  if (value === null || value === undefined) return '-'
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return '-'
+  const percent = parsed <= 1 ? parsed * 100 : parsed
+  return `${percent.toFixed(2)}%`
+}
+
+function isHigh5xx(value?: number | null): boolean {
+  const parsed = Number(value ?? 0)
+  if (!Number.isFinite(parsed)) return false
+  const ratio = parsed <= 1 ? parsed : parsed / 100
+  return ratio > 0.01
+}
+
+function formatThroughput(bytes?: number | null): string {
+  const value = Number(bytes ?? 0)
+  if (!Number.isFinite(value) || value <= 0) return '0 B/s'
+  if (value < 1024) return `${value.toFixed(0)} B/s`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB/s`
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB/s`
+  return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB/s`
+}
+
+function performanceWindowText(performance: OpsPerformanceSummary | null): string {
+  const seconds = Number(performance?.window_seconds ?? 0)
+  if (!seconds) return '最近 5 分钟'
+  if (seconds < 60) return `最近 ${seconds} 秒`
+  if (seconds % 3600 === 0) return `最近 ${seconds / 3600} 小时`
+  if (seconds % 60 === 0) return `最近 ${seconds / 60} 分钟`
+  return `最近 ${seconds} 秒`
+}
+
+function probeTargetText(target?: string | null): string {
+  if (target === 'root') return '首页 /'
+  if (target === 'api') return 'API /readyz'
+  if (target === 'healthz') return '健康检查 /healthz'
+  return textOrDash(target)
+}
+
+function probeStatusType(probe: OpsPublicProbeSummary): TagType {
+  if (probe.ok === true || probe.status === 'ok' || probe.status === 'up') return 'success'
+  if (probe.ok === false || ['failed', 'error', 'down'].includes(probe.status ?? '')) return 'danger'
+  return 'info'
+}
+
+function probeStatusText(probe: OpsPublicProbeSummary): string {
+  if (probe.ok === true || probe.status === 'ok' || probe.status === 'up') return '正常'
+  if (probe.ok === false || ['failed', 'error', 'down'].includes(probe.status ?? '')) return '异常'
+  return '未知'
+}
+
+function performanceDegradedText(performance: OpsPerformanceSummary | null): string {
+  return (
+    performance?.degraded_reason ||
+    'Redis 直方图暂不可用，当前数值可能来自本地样本或为 0。'
+  )
+}
+
+function probeLabel(probe: OpsPublicProbeSummary): string {
+  const label = probeTargetText(probe.target)
+  return probe.domain ? `${label} · ${probe.domain}` : label
 }
 
 function percentText(value?: number | null, digits = 1): string {
@@ -405,6 +529,7 @@ function openDetail(row: OpsInstance): void {
   drawerVisible.value = true
   currentInstance.value = row
   nodes.value = []
+  maintenanceWindows.value = []
   selectedNode.value = null
   metricsData.value = null
   metricsLoading.value = false
@@ -423,6 +548,7 @@ async function loadDetail(instanceId: string): Promise<void> {
     if (seq !== detailRequestSeq) return
     currentInstance.value = detail
     nodes.value = nodeList
+    void loadMaintenanceWindows(detail.id)
     if (selectedNode.value) {
       selectedNode.value = nodeList.find((node) => node.id === selectedNode.value?.id) ?? selectedNode.value
     }
@@ -431,6 +557,123 @@ async function loadDetail(instanceId: string): Promise<void> {
   } finally {
     if (seq === detailRequestSeq) detailLoading.value = false
   }
+}
+
+/* ------------------------------ 维护窗口 ------------------------------ */
+type MaintenanceWindowStatus = 'active' | 'upcoming' | 'past' | 'unknown'
+
+const maintenanceWindows = ref<OpsMaintenanceWindow[]>([])
+const maintenanceLoading = ref(false)
+const maintenanceDialogVisible = ref(false)
+const maintenanceSubmitting = ref(false)
+const maintenanceWindowFormRef = ref<FormInstance>()
+const maintenanceWindowForm = ref({
+  starts_at: '',
+  ends_at: '',
+  reason: '',
+})
+const maintenanceRules: FormRules = {
+  starts_at: [{ required: true, message: '请选择开始时间', trigger: 'change' }],
+  ends_at: [{ required: true, message: '请选择结束时间', trigger: 'change' }],
+}
+
+function maintenanceWindowStatus(window: OpsMaintenanceWindow): MaintenanceWindowStatus {
+  if (!window.starts_at || !window.ends_at) return 'unknown'
+  const start = Date.parse(window.starts_at)
+  const end = Date.parse(window.ends_at)
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return 'unknown'
+  const now = Date.now()
+  if (now < start) return 'upcoming'
+  if (now <= end) return 'active'
+  return 'past'
+}
+
+function maintenanceWindowStatusType(window: OpsMaintenanceWindow): TagType {
+  const status = maintenanceWindowStatus(window)
+  if (status === 'active') return 'warning'
+  if (status === 'upcoming') return 'info'
+  if (status === 'past') return 'success'
+  return 'info'
+}
+
+function maintenanceWindowStatusText(window: OpsMaintenanceWindow): string {
+  const status = maintenanceWindowStatus(window)
+  if (status === 'active') return '进行中'
+  if (status === 'upcoming') return '未开始'
+  if (status === 'past') return '已结束'
+  return '未知'
+}
+
+const activeMaintenanceWindow = computed(
+  () =>
+    maintenanceWindows.value.find((window) => maintenanceWindowStatus(window) === 'active') ?? null,
+)
+
+async function loadMaintenanceWindows(instanceId?: string): Promise<void> {
+  const target = instanceId ?? currentInstance.value?.id
+  if (!target) {
+    maintenanceWindows.value = []
+    return
+  }
+  maintenanceLoading.value = true
+  try {
+    maintenanceWindows.value = await opsApi.maintenanceWindows(target)
+  } catch {
+    maintenanceWindows.value = []
+  } finally {
+    maintenanceLoading.value = false
+  }
+}
+
+function openMaintenanceCreate(): void {
+  maintenanceWindowForm.value.starts_at = ''
+  maintenanceWindowForm.value.ends_at = ''
+  maintenanceWindowForm.value.reason = ''
+  maintenanceDialogVisible.value = true
+}
+
+async function submitMaintenanceWindow(): Promise<void> {
+  const instance = currentInstance.value
+  const formInstance = maintenanceWindowFormRef.value
+  if (!instance || !formInstance) return
+  const valid = await formInstance.validate().catch(() => false)
+  if (!valid) return
+  const start = Date.parse(maintenanceWindowForm.value.starts_at)
+  const end = Date.parse(maintenanceWindowForm.value.ends_at)
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    ElMessage.warning('结束时间必须晚于开始时间')
+    return
+  }
+  maintenanceSubmitting.value = true
+  try {
+    await opsApi.createMaintenanceWindow(instance.id, {
+      starts_at: maintenanceWindowForm.value.starts_at,
+      ends_at: maintenanceWindowForm.value.ends_at,
+      reason: maintenanceWindowForm.value.reason.trim(),
+    })
+    ElMessage.success('维护窗口已创建')
+    maintenanceDialogVisible.value = false
+    await loadMaintenanceWindows(instance.id)
+    await reloadAlerts()
+  } finally {
+    maintenanceSubmitting.value = false
+  }
+}
+
+async function deleteMaintenanceWindow(window: OpsMaintenanceWindow): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `删除 ${formatDateTime(window.starts_at)} 至 ${formatDateTime(window.ends_at)} 的维护窗口？`,
+      '删除维护窗口',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  await opsApi.deleteMaintenanceWindow(window.id)
+  ElMessage.success('维护窗口已删除')
+  await loadMaintenanceWindows()
+  await reloadAlerts()
 }
 
 const releases = ref<OpsRelease[]>([])
@@ -794,9 +1037,13 @@ async function refreshPage(): Promise<void> {
     await loadDetail(currentInstance.value.id)
   }
   await Promise.all([reloadInstances(), reloadAlerts(), loadReleases()])
+  void loadMonitoring()
 }
 
-onMounted(loadReleases)
+onMounted(() => {
+  void loadReleases()
+  void loadMonitoring()
+})
 
 /* ------------------------------ 启用实例 ------------------------------ */
 const enablingId = ref('')
@@ -919,24 +1166,68 @@ async function generateEnrollment(): Promise<void> {
 const probingNodeId = ref('')
 const probeVisible = ref(false)
 const probeResult = ref<OpsProbeResult | null>(null)
+const probeLatency = ref<OpsProbeLatency | null>(null)
+const probeLatencyLoading = ref(false)
 const probeAllOk = computed(() => {
   const checks = probeResult.value?.checks ?? []
   return checks.length > 0 && checks.every((check) => check.ok)
 })
+const probeApiFailed = computed(() => {
+  const result = probeResult.value
+  if (!result) return false
+  return result.targets?.api?.ok === false || result.api_ok === false
+})
+const probeApiFailures = computed(() =>
+  Number(
+    probeResult.value?.targets?.api?.consecutive_failures ??
+      probeResult.value?.api_consecutive_failures ??
+      0,
+  ),
+)
 const probeSummary = computed(() => {
   const result = probeResult.value
   if (!result) return ''
+  const home = result.targets?.root?.ok ?? result.home_ok ?? null
+  const api = result.targets?.api?.ok ?? result.api_ok ?? null
+  if (home !== null || api !== null) {
+    const parts: string[] = []
+    if (home !== null) parts.push(home ? '首页正常' : '首页异常')
+    if (api !== null) {
+      parts.push(api ? 'API 正常' : `API 异常（连续失败 ${probeApiFailures.value} 次）`)
+    }
+    return `公网探测：${parts.join('，')}`
+  }
   if (!result.checks.length) return '探测未返回检查项'
   return probeAllOk.value
     ? `公网访问正常，${result.checks.length} 项检查全部通过`
     : '公网访问异常，请检查域名解析、证书与服务状态'
 })
 
+function probeTargetConsecutiveFailures(target?: string | null): string {
+  if (!target) return '-'
+  const value = probeResult.value?.targets?.[target]?.consecutive_failures
+  return value === null || value === undefined ? '-' : String(value)
+}
+
+async function loadProbeLatency(node: OpsServerNode): Promise<void> {
+  probeLatencyLoading.value = true
+  try {
+    probeLatency.value = await opsApi.probeLatency(node.id, 24, true)
+  } catch {
+    probeLatency.value = null
+  } finally {
+    probeLatencyLoading.value = false
+  }
+}
+
 async function probeNode(node: OpsServerNode): Promise<void> {
   probingNodeId.value = node.id
+  probeResult.value = null
+  probeLatency.value = null
   try {
     probeResult.value = await opsApi.probeNode(node.id)
     probeVisible.value = true
+    void loadProbeLatency(node)
     await refreshPage()
   } finally {
     probingNodeId.value = ''
@@ -965,6 +1256,153 @@ const latestDiskPercent = computed(() => maxDiskPercent(latestMetric.value))
 const metricRows = computed<OpsNodeMetric[]>(() => {
   const items = metricsData.value?.items ?? []
   return items.slice().reverse().slice(0, 30)
+})
+
+/* ------------------------------ 监控总览 / 请求性能 ------------------------------ */
+const monitoringLoading = ref(false)
+const monitoringOverview = ref<OpsMonitoringOverview | null>(null)
+const httpMetrics = ref<OpsPerformanceSummary | null>(null)
+const monitoringExplicitComponents = computed(() =>
+  normalizeMonitorComponents(monitoringOverview.value?.components),
+)
+const monitoringInstanceComponents = computed(() =>
+  normalizeMonitorComponents(currentInstance.value?.components),
+)
+const monitoringDerivedComponents = computed(() => deriveTelemetryComponents(latestMetric.value))
+const monitoringComponents = computed<OpsMonitorComponent[]>(() => {
+  if (monitoringExplicitComponents.value.length) return monitoringExplicitComponents.value
+  if (monitoringInstanceComponents.value.length) return monitoringInstanceComponents.value
+  return monitoringDerivedComponents.value
+})
+const monitoringDerived = computed(
+  () =>
+    monitoringExplicitComponents.value.length === 0 &&
+    monitoringInstanceComponents.value.length === 0 &&
+    monitoringDerivedComponents.value.length > 0,
+)
+const monitoringOverall = computed(() =>
+  normalizeMonitorOverall(monitoringOverview.value?.overall, monitoringComponents.value),
+)
+const businessPerformance = computed<OpsPerformanceSummary | null>(
+  () =>
+    httpMetrics.value ??
+    monitoringOverview.value?.business_requests ??
+    monitoringOverview.value?.performance ??
+    currentInstance.value?.performance ??
+    null,
+)
+const publicProbes = computed(() => monitoringOverview.value?.public_probes ?? [])
+const monitoringCheckedAt = computed(
+  () =>
+    monitoringOverview.value?.checked_at ??
+    monitoringOverview.value?.generated_at ??
+    businessPerformance.value?.generated_at ??
+    null,
+)
+const showMonitoring = computed(
+  () =>
+    monitoringComponents.value.length > 0 ||
+    Boolean(businessPerformance.value) ||
+    publicProbes.value.length > 0,
+)
+const performanceRoutes = computed(() =>
+  (businessPerformance.value?.routes ?? [])
+    .slice()
+    .sort((left, right) => (right.request_count ?? 0) - (left.request_count ?? 0))
+    .slice(0, 10),
+)
+
+const TELEMETRY_COMPONENT_LABELS: Record<string, string> = {
+  identity_db: '身份库',
+  business_db: '业务库',
+  redis: 'Redis',
+  worker: 'Worker',
+  scheduler: '调度器',
+  api: 'API',
+  nginx: 'Nginx',
+}
+
+function telemetryComponentKey(name: string): string {
+  const lowered = name.toLowerCase()
+  if (lowered.includes('identity') || lowered.includes('center')) return 'identity_db'
+  if (lowered.includes('tenant') || lowered.includes('business')) return 'business_db'
+  if (lowered.includes('mysql') || lowered.includes('mariadb')) return 'business_db'
+  if (lowered.includes('redis')) return 'redis'
+  if (lowered.includes('worker')) return 'worker'
+  if (lowered.includes('scheduler') || lowered.includes('beat')) return 'scheduler'
+  if (lowered.includes('nginx')) return 'nginx'
+  if (lowered.includes('api')) return 'api'
+  return ''
+}
+
+function telemetryComponentStatus(state: string, health: string): OpsMonitorComponentStatus {
+  if (health === 'unhealthy') return 'error'
+  if (state === 'running') return 'ok'
+  if (['exited', 'dead', 'removing'].includes(state)) return 'error'
+  if (['paused', 'restarting', 'created'].includes(state)) return 'degraded'
+  return 'unknown'
+}
+
+/** 旧后端没有监控接口时，按节点最新指标里的 Docker 容器状态推导分项。 */
+function deriveTelemetryComponents(metric?: OpsNodeMetric | null): OpsMonitorComponent[] {
+  const services = metric?.services
+  if (!services || typeof services !== 'object') return []
+  const docker = (services as Record<string, unknown>).docker
+  if (!docker || typeof docker !== 'object') return []
+  const containers = (docker as Record<string, unknown>).containers
+  if (!Array.isArray(containers)) return []
+  const components: OpsMonitorComponent[] = []
+  const seen = new Set<string>()
+  for (const item of containers) {
+    if (!item || typeof item !== 'object') continue
+    const record = item as Record<string, unknown>
+    const name = String(record.name ?? '').trim()
+    if (!name) continue
+    const key = telemetryComponentKey(name)
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    const state = String(record.state ?? '').trim().toLowerCase()
+    const health = String(record.health ?? '').trim().toLowerCase()
+    components.push({
+      key,
+      label: TELEMETRY_COMPONENT_LABELS[key] ?? name,
+      status: telemetryComponentStatus(state, health),
+      message: `${name} · ${String(record.status ?? state ?? '').trim() || '状态未知'}`,
+      latency_ms: null,
+      last_heartbeat_at: null,
+      checked_at: metric?.sampled_at ?? null,
+    })
+  }
+  return components
+}
+
+async function loadMonitoring(): Promise<void> {
+  monitoringLoading.value = true
+  try {
+    const [overview, metrics] = await Promise.all([
+      opsApi.monitoringOverview(),
+      opsApi.httpMetrics(300, true).catch(() => null),
+    ])
+    monitoringOverview.value = overview
+    httpMetrics.value = metrics
+  } finally {
+    monitoringLoading.value = false
+  }
+}
+
+const latestDataDisk = computed(() => latestMetric.value?.data_disk ?? null)
+const networkRate = computed(() => {
+  const network = latestMetric.value?.network
+  if (!network || typeof network !== 'object') return null
+  const record = network as Record<string, unknown>
+  const rx = Number(record.rx_bytes_per_sec ?? NaN)
+  const tx = Number(record.tx_bytes_per_sec ?? NaN)
+  if (!Number.isFinite(rx) && !Number.isFinite(tx)) return null
+  return {
+    rx: Number.isFinite(rx) ? rx : 0,
+    tx: Number.isFinite(tx) ? tx : 0,
+    interval: Number(record.interval_seconds ?? 0) || null,
+  }
 })
 
 const trendPoints = computed<TrendPoint[]>(() => {
@@ -1443,11 +1881,31 @@ async function copyText(value: string | null | undefined, label: string): Promis
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="90">
+        <el-table-column label="状态" width="170">
           <template #default="{ row }">
-            <el-tag :type="alertStatusType(row.status)" size="small" disable-transitions>
-              {{ alertStatusText(row.status) }}
-            </el-tag>
+            <div class="alert-status-tags">
+              <el-tag :type="alertStatusType(row.status)" size="small" disable-transitions>
+                {{ alertStatusText(row.status) }}
+              </el-tag>
+              <el-tag
+                v-if="row.in_maintenance"
+                type="info"
+                size="small"
+                disable-transitions
+                :title="row.maintenance_reason || '处于维护窗口'"
+              >
+                维护中
+              </el-tag>
+              <el-tag
+                v-if="row.suppressed"
+                type="warning"
+                size="small"
+                disable-transitions
+                :title="alertSuppressTitle(row as OpsAlert)"
+              >
+                已抑制
+              </el-tag>
+            </div>
           </template>
         </el-table-column>
         <el-table-column prop="message" label="告警内容" min-width="220" show-overflow-tooltip />
@@ -1460,6 +1918,15 @@ async function copyText(value: string | null | undefined, label: string): Promis
           <template #default="{ row }">
             <div>首次 {{ formatDateTime(row.first_seen_at) }}</div>
             <div class="text-muted">最近 {{ formatDateTime(row.last_seen_at) }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="恢复" width="180">
+          <template #default="{ row }">
+            <div v-if="row.resolved_at">恢复 {{ formatDateTime(row.resolved_at) }}</div>
+            <div v-else class="text-muted">未恢复</div>
+            <div v-if="row.recovery_notified_at" class="text-muted">
+              通知 {{ formatDateTime(row.recovery_notified_at) }}
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="90" fixed="right">
@@ -1658,6 +2125,249 @@ async function copyText(value: string | null | undefined, label: string): Promis
 
         <div class="section-head">
           <span>
+            维护窗口
+            <span class="text-muted">（{{ maintenanceWindows.length }} 个）</span>
+          </span>
+          <div class="section-actions">
+            <el-button
+              size="small"
+              :icon="Refresh"
+              :loading="maintenanceLoading"
+              @click="loadMaintenanceWindows()"
+            >
+              刷新
+            </el-button>
+            <el-button type="primary" size="small" @click="openMaintenanceCreate">
+              新建维护窗口
+            </el-button>
+          </div>
+        </div>
+        <el-alert
+          v-if="activeMaintenanceWindow"
+          class="maintenance-active-alert"
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="`当前处于维护窗口${activeMaintenanceWindow.reason ? `：${activeMaintenanceWindow.reason}` : ''}（至 ${formatDateTime(activeMaintenanceWindow.ends_at)}）`"
+        />
+        <el-table
+          v-loading="maintenanceLoading"
+          :data="maintenanceWindows"
+          border
+          size="small"
+          row-key="id"
+          max-height="240"
+        >
+          <el-table-column label="开始时间" width="170">
+            <template #default="{ row }">{{ formatDateTime(row.starts_at) }}</template>
+          </el-table-column>
+          <el-table-column label="结束时间" width="170">
+            <template #default="{ row }">{{ formatDateTime(row.ends_at) }}</template>
+          </el-table-column>
+          <el-table-column label="状态" width="95">
+            <template #default="{ row }">
+              <el-tag
+                :type="maintenanceWindowStatusType(row as OpsMaintenanceWindow)"
+                size="small"
+                disable-transitions
+              >
+                {{ maintenanceWindowStatusText(row as OpsMaintenanceWindow) }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="原因" min-width="200" show-overflow-tooltip>
+            <template #default="{ row }">{{ textOrDash(row.reason) }}</template>
+          </el-table-column>
+          <el-table-column label="操作" width="80" fixed="right">
+            <template #default="{ row }">
+              <el-button
+                text
+                type="danger"
+                size="small"
+                @click="deleteMaintenanceWindow(row as OpsMaintenanceWindow)"
+              >
+                删除
+              </el-button>
+            </template>
+          </el-table-column>
+          <template #empty>
+            <el-empty description="暂无维护窗口" :image-size="60" />
+          </template>
+        </el-table>
+
+        <div class="section-head">
+          <span>
+            监控分项与请求性能
+            <el-tag
+              v-if="monitoringComponents.length"
+              :type="overallType(monitoringOverall)"
+              size="small"
+              disable-transitions
+            >
+              {{ overallText(monitoringOverall) }}
+            </el-tag>
+            <span v-if="monitoringCheckedAt" class="text-muted">
+              检查时间 {{ formatDateTime(monitoringCheckedAt) }}
+            </span>
+          </span>
+          <el-button
+            text
+            type="primary"
+            size="small"
+            :loading="monitoringLoading"
+            @click="loadMonitoring"
+          >
+            刷新监控
+          </el-button>
+        </div>
+        <template v-if="showMonitoring">
+          <div v-if="monitoringComponents.length" class="monitor-grid">
+            <div
+              v-for="component in monitoringComponents"
+              :key="component.key"
+              class="monitor-card-item"
+            >
+              <div class="monitor-card-head">
+                <span class="monitor-card-name">{{ component.label }}</span>
+                <el-tag
+                  :type="componentStatusType(component.status)"
+                  size="small"
+                  disable-transitions
+                >
+                  {{ componentStatusText(component.status) }}
+                </el-tag>
+              </div>
+              <div class="monitor-card-meta">
+                <span
+                  v-if="component.latency_ms !== null && component.latency_ms !== undefined"
+                  class="mono"
+                >
+                  {{ formatMs(component.latency_ms) }}
+                </span>
+                <span v-else-if="component.last_heartbeat_at" class="text-muted">
+                  心跳 {{ formatDateTime(component.last_heartbeat_at) }}
+                </span>
+                <span v-else class="text-muted">-</span>
+              </div>
+              <div v-if="component.message" class="monitor-card-detail" :title="component.message">
+                {{ component.message }}
+              </div>
+            </div>
+          </div>
+          <div v-if="monitoringDerived" class="form-tip">
+            监控分项接口未返回数据，当前按节点 Docker 容器状态推导（点击「查看指标」后更新）。
+          </div>
+
+          <div class="monitor-detail-grid">
+            <div class="monitor-detail-card">
+              <div class="monitor-detail-title">
+                业务请求耗时
+                <span class="text-muted">{{ performanceWindowText(businessPerformance) }}</span>
+              </div>
+              <template v-if="businessPerformance">
+                <el-alert
+                  v-if="businessPerformance.degraded"
+                  class="monitor-alert"
+                  type="warning"
+                  :closable="false"
+                  show-icon
+                  :title="performanceDegradedText(businessPerformance)"
+                />
+                <div class="monitor-metric-grid">
+                  <div class="monitor-metric">
+                    <div class="monitor-metric-label">请求量</div>
+                    <div class="monitor-metric-value">
+                      {{ formatCount(businessPerformance.request_count) }}
+                    </div>
+                  </div>
+                  <div class="monitor-metric">
+                    <div class="monitor-metric-label">5xx 比例</div>
+                    <div
+                      class="monitor-metric-value"
+                      :class="{ 'is-danger': isHigh5xx(businessPerformance.rate_5xx) }"
+                    >
+                      {{ formatRate(businessPerformance.rate_5xx) }}
+                    </div>
+                    <div class="monitor-metric-sub">
+                      {{ formatCount(businessPerformance.error_5xx) }} 个 5xx
+                    </div>
+                  </div>
+                  <div class="monitor-metric">
+                    <div class="monitor-metric-label">P95 耗时</div>
+                    <div class="monitor-metric-value">{{ formatMs(businessPerformance.p95_ms) }}</div>
+                  </div>
+                  <div class="monitor-metric">
+                    <div class="monitor-metric-label">P99 耗时</div>
+                    <div class="monitor-metric-value">{{ formatMs(businessPerformance.p99_ms) }}</div>
+                  </div>
+                </div>
+                <el-table
+                  v-if="performanceRoutes.length"
+                  :data="performanceRoutes"
+                  border
+                  size="small"
+                  max-height="220"
+                >
+                  <el-table-column label="路由" min-width="220" show-overflow-tooltip>
+                    <template #default="{ row }"><span class="mono">{{ row.route }}</span></template>
+                  </el-table-column>
+                  <el-table-column prop="method" label="方法" width="80" />
+                  <el-table-column label="请求量" width="90">
+                    <template #default="{ row }">{{ formatCount(row.request_count) }}</template>
+                  </el-table-column>
+                  <el-table-column label="5xx" width="75">
+                    <template #default="{ row }">{{ formatCount(row.error_5xx) }}</template>
+                  </el-table-column>
+                  <el-table-column label="P95" width="95">
+                    <template #default="{ row }">{{ formatMs(row.p95_ms) }}</template>
+                  </el-table-column>
+                  <el-table-column label="P99" width="95">
+                    <template #default="{ row }">{{ formatMs(row.p99_ms) }}</template>
+                  </el-table-column>
+                </el-table>
+                <div v-else class="text-muted">暂无路由级指标</div>
+              </template>
+              <div v-else class="text-muted">暂无业务请求性能数据</div>
+            </div>
+
+            <div class="monitor-detail-card">
+              <div class="monitor-detail-title">公网探测耗时</div>
+              <div v-if="publicProbes.length" class="probe-latency-list">
+                <div
+                  v-for="probe in publicProbes"
+                  :key="`${probe.node_id ?? ''}-${probe.target}-${probe.domain ?? ''}`"
+                  class="probe-latency-row"
+                >
+                  <div class="probe-latency-label">
+                    <span>{{ probeLabel(probe) }}</span>
+                    <el-tag :type="probeStatusType(probe)" size="small" disable-transitions>
+                      {{ probeStatusText(probe) }}
+                    </el-tag>
+                  </div>
+                  <div class="probe-latency-meta">
+                    <span class="mono">{{ formatMs(probe.latency_ms) }}</span>
+                    <span v-if="typeof probe.total_nodes === 'number'" class="text-muted">
+                      节点 {{ probe.ok_nodes ?? 0 }}/{{ probe.total_nodes }} 正常
+                    </span>
+                    <span v-else-if="probe.consecutive_failures" class="text-danger">
+                      连续失败 {{ probe.consecutive_failures }} 次
+                    </span>
+                    <span class="text-muted">{{ formatDateTime(probe.checked_at) }}</span>
+                  </div>
+                </div>
+              </div>
+              <div v-else class="text-muted">暂无公网探测数据</div>
+            </div>
+          </div>
+        </template>
+        <el-empty
+          v-else-if="!monitoringLoading"
+          description="后端未提供监控/性能接口，或暂无数据"
+          :image-size="60"
+        />
+
+        <div class="section-head">
+          <span>
             服务器节点
             <span class="text-muted">（{{ nodes.length }} 个）</span>
           </span>
@@ -1802,6 +2512,27 @@ async function copyText(value: string | null | undefined, label: string): Promis
                 </div>
                 <div class="metric-sub">
                   {{ selectedNode.latest_metric ? '节点最近上报' : '本次样本' }}
+                </div>
+              </div>
+              <div v-if="latestDataDisk" class="metric-card">
+                <div class="metric-label">数据盘使用率</div>
+                <div
+                  class="metric-value"
+                  :class="{ 'is-danger': Number(latestDataDisk.percent ?? 0) >= 85 }"
+                >
+                  {{ percentText(latestDataDisk.percent) }}
+                </div>
+                <div class="metric-sub">
+                  {{ latestDataDisk.mount || '/' }} ·
+                  {{ numberText(latestDataDisk.used_gb, 1) }} / {{ numberText(latestDataDisk.total_gb, 1) }} GB
+                </div>
+              </div>
+              <div v-if="networkRate" class="metric-card">
+                <div class="metric-label">网络入站速率</div>
+                <div class="metric-value">{{ formatThroughput(networkRate.rx) }}</div>
+                <div class="metric-sub">
+                  出站 {{ formatThroughput(networkRate.tx) }}
+                  <span v-if="networkRate.interval"> · {{ networkRate.interval }}s</span>
                 </div>
               </div>
             </div>
@@ -2016,6 +2747,53 @@ async function copyText(value: string | null | undefined, label: string): Promis
     </template>
   </el-dialog>
 
+  <!-- 新建维护窗口 -->
+  <el-dialog v-model="maintenanceDialogVisible" title="新建维护窗口" width="560px" destroy-on-close>
+    <el-form
+      ref="maintenanceWindowFormRef"
+      :model="maintenanceWindowForm"
+      :rules="maintenanceRules"
+      label-width="90px"
+    >
+      <el-form-item label="开始时间" prop="starts_at">
+        <el-date-picker
+          v-model="maintenanceWindowForm.starts_at"
+          type="datetime"
+          format="YYYY-MM-DD HH:mm"
+          value-format="YYYY-MM-DDTHH:mm:ssZ"
+          placeholder="选择开始时间"
+          style="width: 100%"
+        />
+      </el-form-item>
+      <el-form-item label="结束时间" prop="ends_at">
+        <el-date-picker
+          v-model="maintenanceWindowForm.ends_at"
+          type="datetime"
+          format="YYYY-MM-DD HH:mm"
+          value-format="YYYY-MM-DDTHH:mm:ssZ"
+          placeholder="选择结束时间"
+          style="width: 100%"
+        />
+      </el-form-item>
+      <el-form-item label="维护原因">
+        <el-input
+          v-model="maintenanceWindowForm.reason"
+          maxlength="255"
+          placeholder="如 版本升级 / 数据库维护"
+        />
+      </el-form-item>
+      <div class="form-tip">
+        维护窗口内暂停告警邮件，告警列表会标记「维护中」；升级等变更任务不受影响。
+      </div>
+    </el-form>
+    <template #footer>
+      <el-button @click="maintenanceDialogVisible = false">取消</el-button>
+      <el-button type="primary" :loading="maintenanceSubmitting" @click="submitMaintenanceWindow">
+        保存
+      </el-button>
+    </template>
+  </el-dialog>
+
   <!-- 一次性接入令牌 -->
   <el-dialog v-model="enrollmentVisible" title="服务器接入令牌" width="680px" destroy-on-close>
     <template v-if="enrollment">
@@ -2058,13 +2836,23 @@ async function copyText(value: string | null | undefined, label: string): Promis
   </el-dialog>
 
   <!-- 公网探测结果 -->
-  <el-dialog v-model="probeVisible" title="节点探测结果" width="780px" destroy-on-close>
+  <el-dialog v-model="probeVisible" title="节点探测结果" width="820px" destroy-on-close>
     <template v-if="probeResult">
       <el-alert :type="probeAllOk ? 'success' : 'error'" :title="probeSummary" :closable="false" show-icon />
+      <el-alert
+        v-if="probeApiFailed"
+        class="probe-api-alert"
+        type="error"
+        :closable="false"
+        show-icon
+        :title="`API 探测连续失败 ${probeApiFailures} 次；首页成功不会消除 API 告警。`"
+      />
       <div class="probe-domain text-muted">探测域名：<span class="mono">{{ probeResult.domain }}</span></div>
       <el-table :data="probeResult.checks" border size="small">
-        <el-table-column label="目标" prop="target" width="90" />
-        <el-table-column label="URL" min-width="220" show-overflow-tooltip>
+        <el-table-column label="目标" width="120">
+          <template #default="{ row }">{{ probeTargetText(row.target) }}</template>
+        </el-table-column>
+        <el-table-column label="URL" min-width="200" show-overflow-tooltip>
           <template #default="{ row }"><span class="mono">{{ row.url }}</span></template>
         </el-table-column>
         <el-table-column label="结果" width="80">
@@ -2080,13 +2868,56 @@ async function copyText(value: string | null | undefined, label: string): Promis
         <el-table-column label="耗时" width="90">
           <template #default="{ row }">{{ row.latency_ms }} ms</template>
         </el-table-column>
-        <el-table-column label="错误" min-width="140" show-overflow-tooltip>
+        <el-table-column label="连续失败" width="90">
+          <template #default="{ row }">{{ probeTargetConsecutiveFailures(row.target) }}</template>
+        </el-table-column>
+        <el-table-column label="错误" min-width="120" show-overflow-tooltip>
           <template #default="{ row }">{{ textOrDash(row.error) }}</template>
         </el-table-column>
         <el-table-column label="检测时间" width="170">
           <template #default="{ row }">{{ formatDateTime(row.checked_at) }}</template>
         </el-table-column>
       </el-table>
+
+      <div class="section-head probe-latency-head">近 24 小时探测耗时</div>
+      <div v-loading="probeLatencyLoading">
+        <el-table v-if="probeLatency?.targets?.length" :data="probeLatency.targets" border size="small">
+          <el-table-column label="目标" width="120">
+            <template #default="{ row }">{{ probeTargetText(row.target) }}</template>
+          </el-table-column>
+          <el-table-column label="样本数" width="85">
+            <template #default="{ row }">{{ formatCount(row.samples) }}</template>
+          </el-table-column>
+          <el-table-column label="成功率" width="90">
+            <template #default="{ row }">{{ formatRate(row.ok_rate) }}</template>
+          </el-table-column>
+          <el-table-column label="平均" width="95">
+            <template #default="{ row }">{{ formatMs(row.avg_ms) }}</template>
+          </el-table-column>
+          <el-table-column label="P95" width="95">
+            <template #default="{ row }">{{ formatMs(row.p95_ms) }}</template>
+          </el-table-column>
+          <el-table-column label="最大" width="95">
+            <template #default="{ row }">{{ formatMs(row.max_ms) }}</template>
+          </el-table-column>
+          <el-table-column label="最近" width="95">
+            <template #default="{ row }">{{ formatMs(row.last_latency_ms) }}</template>
+          </el-table-column>
+          <el-table-column label="最后检测" width="170">
+            <template #default="{ row }">{{ formatDateTime(row.last_checked_at) }}</template>
+          </el-table-column>
+        </el-table>
+        <el-empty
+          v-else-if="!probeLatencyLoading"
+          description="暂无探测耗时聚合数据"
+          :image-size="50"
+        />
+      </div>
+      <div v-if="businessPerformance" class="probe-compare">
+        业务请求耗时：P95 {{ formatMs(businessPerformance?.p95_ms) }} / P99
+        {{ formatMs(businessPerformance?.p99_ms) }}（{{ performanceWindowText(businessPerformance) }}）；
+        公网探测耗时见上表。
+      </div>
     </template>
     <template #footer>
       <el-button @click="probeVisible = false">关闭</el-button>
@@ -2330,6 +3161,183 @@ async function copyText(value: string | null | undefined, label: string): Promis
   font-size: 11px;
 }
 
+.section-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.maintenance-active-alert {
+  margin-bottom: 8px;
+}
+
+.monitor-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.monitor-card-item {
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--el-fill-color-lighter);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+}
+
+.monitor-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.monitor-card-name {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.monitor-card-meta {
+  margin-top: 6px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.monitor-card-detail {
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.monitor-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.monitor-detail-card {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+}
+
+.monitor-detail-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.monitor-detail-title .text-muted {
+  font-weight: 400;
+}
+
+.monitor-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.monitor-metric {
+  padding: 8px 10px;
+  background: var(--el-fill-color-lighter);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 4px;
+}
+
+.monitor-metric-label {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.monitor-metric-value {
+  margin-top: 2px;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.monitor-metric-value.is-danger {
+  color: var(--el-color-danger);
+}
+
+.monitor-metric-sub {
+  margin-top: 2px;
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+}
+
+.monitor-alert {
+  margin-bottom: 8px;
+}
+
+.probe-latency-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.probe-latency-row {
+  padding: 8px 10px;
+  background: var(--el-fill-color-lighter);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 4px;
+}
+
+.probe-latency-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.probe-latency-meta {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.text-danger {
+  color: var(--el-color-danger);
+}
+
+.alert-status-tags {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.probe-api-alert {
+  margin-top: 8px;
+}
+
+.probe-latency-head {
+  margin-top: 12px;
+}
+
+.probe-compare {
+  margin-top: 8px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 .metric-meta {
   margin: 8px 0 12px;
   color: var(--el-text-color-secondary);
@@ -2554,6 +3562,14 @@ async function copyText(value: string | null | undefined, label: string): Promis
 
   .trend-head {
     flex-direction: column;
+  }
+
+  .monitor-detail-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .monitor-metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 </style>

@@ -41,6 +41,10 @@ export interface OpsInstance {
   executor_version?: string | null
   db_version?: string | null
   upgrade_status?: string | null
+  /** 批次3：实例详情可能内联监控分项/业务性能；缺失时回退监控总览接口或节点指标 */
+  components?: OpsMonitorComponentRaw[] | Record<string, OpsMonitorComponentRaw | string> | null
+  performance?: OpsPerformanceSummary | null
+  monitoring?: OpsMonitoringOverview | null
   notes: string
   created_at?: string | null
   node_count: number
@@ -73,6 +77,8 @@ export interface OpsNodeMetric {
   swap_total_mb: number
   swap_used_mb: number
   disks: OpsMetricDisk[]
+  /** 批次3：服务端按真实数据盘汇总（排除 /boot 等），旧样本缺失 */
+  data_disk?: OpsMetricDisk | null
   network: Record<string, unknown>
   services: Record<string, unknown>
   public_ip?: string
@@ -117,7 +123,21 @@ export interface OpsProbeCheck {
   ok: boolean
   status_code?: number | null
   latency_ms: number
+  /** HTTPS 证书剩余天数（后端已有；旧字段） */
+  cert_days_left?: number | null
+  /** 批次3：该目标连续失败次数（若后端内联到 checks） */
+  consecutive_failures?: number | null
   error: string
+  checked_at?: string | null
+}
+
+/** 批次3：probe 响应按 root/api 汇总的目标摘要，旧后端缺失 */
+export interface OpsProbeTargetSummary {
+  ok?: boolean | null
+  url?: string | null
+  status?: string | null
+  latency_ms?: number | null
+  consecutive_failures?: number | null
   checked_at?: string | null
 }
 
@@ -126,6 +146,11 @@ export interface OpsProbeResult {
   instance_id: EntityId
   domain: string
   checks: OpsProbeCheck[]
+  /** 批次3：target → 摘要；旧后端缺失 */
+  targets?: Record<string, OpsProbeTargetSummary> | null
+  home_ok?: boolean | null
+  api_ok?: boolean | null
+  api_consecutive_failures?: number | null
 }
 
 export interface OpsNodeMetrics {
@@ -180,6 +205,12 @@ export interface OpsAlert {
   last_seen_at?: string | null
   acknowledged_at?: string | null
   resolved_at?: string | null
+  /** 批次3：维护窗口/抑制/恢复通知字段，旧后端缺失 */
+  in_maintenance?: boolean | null
+  maintenance_reason?: string | null
+  suppressed?: boolean | null
+  suppress_until?: string | null
+  recovery_notified_at?: string | null
 }
 
 export interface OpsInstanceCreatePayload {
@@ -233,4 +264,165 @@ export interface OpsNodeSshExecResult {
   output: string
   exit_status: number
   host: string
+}
+
+/* ------------------------------------------------------------------ *
+ * 批次3：监控分项 / 请求性能 / 公网探测耗时 / 维护窗口 / 备份阶段
+ * ------------------------------------------------------------------ */
+
+/** 监控分项状态（归一化）：ok=正常，degraded=降级，error=异常，unknown=未知 */
+export type OpsMonitorComponentStatus = 'ok' | 'degraded' | 'error' | 'unknown'
+
+/** 监控分项（归一化后，页面直接渲染） */
+export interface OpsMonitorComponent {
+  key: string
+  label: string
+  status: OpsMonitorComponentStatus
+  message: string
+  latency_ms?: number | null
+  last_heartbeat_at?: string | null
+  checked_at?: string | null
+}
+
+/** 后端原始监控分项：/overview 用 name/status/message，/status 用 key/label/status/detail */
+export interface OpsMonitorComponentRaw {
+  key?: string | null
+  name?: string | null
+  label?: string | null
+  status?: string | null
+  message?: string | null
+  detail?: string | null
+  latency_ms?: number | null
+  last_heartbeat_at?: string | null
+  checked_at?: string | null
+}
+
+export type OpsMonitoringOverall = 'healthy' | 'degraded' | 'unhealthy' | 'unknown'
+
+/** 路由级请求性能 */
+export interface OpsPerformanceRoute {
+  route: string
+  method?: string | null
+  request_count?: number | null
+  error_count?: number | null
+  error_5xx?: number | null
+  rate_5xx?: number | null
+  p95_ms?: number | null
+  p99_ms?: number | null
+}
+
+/** GET /platform/metrics/http；同时用于 overview.performance / business_requests */
+export interface OpsPerformanceSummary {
+  window_seconds?: number | null
+  generated_at?: string | null
+  checked_at?: string | null
+  enabled?: boolean | null
+  degraded?: boolean | null
+  degraded_reason?: string | null
+  status?: string | null
+  request_count?: number | null
+  error_count?: number | null
+  error_5xx?: number | null
+  rate_5xx?: number | null
+  rate_error?: number | null
+  avg_ms?: number | null
+  p50_ms?: number | null
+  p95_ms?: number | null
+  p99_ms?: number | null
+  slow_count?: number | null
+  slow_threshold_ms?: number | null
+  route_count?: number | null
+  thresholds?: Record<string, number> | null
+  routes?: OpsPerformanceRoute[] | null
+}
+
+/** overview.public_probes 项：每 target 的最新探测汇总 */
+export interface OpsPublicProbeSummary {
+  node_id?: EntityId | null
+  instance_id?: EntityId | null
+  domain?: string | null
+  target: string
+  url?: string | null
+  ok?: boolean | null
+  status?: string | null
+  status_code?: number | null
+  latency_ms?: number | null
+  consecutive_failures?: number | null
+  ok_nodes?: number | null
+  failed_nodes?: number | null
+  total_nodes?: number | null
+  checked_at?: string | null
+  error?: string | null
+}
+
+/** 监控总览：GET /platform/monitoring/overview（定稿）或 /status（task-29 兼容） */
+export interface OpsMonitoringOverview {
+  overall?: string | null
+  checked_at?: string | null
+  generated_at?: string | null
+  components?: OpsMonitorComponentRaw[] | Record<string, OpsMonitorComponentRaw | string> | null
+  performance?: OpsPerformanceSummary | null
+  business_requests?: OpsPerformanceSummary | null
+  public_probes?: OpsPublicProbeSummary[] | null
+}
+
+/** GET /platform/nodes/{id}/probe-latency：公网探测耗时汇总 */
+export interface OpsProbeLatencyTarget {
+  target: string
+  url?: string | null
+  samples?: number | null
+  ok_count?: number | null
+  ok_rate?: number | null
+  avg_ms?: number | null
+  p95_ms?: number | null
+  min_ms?: number | null
+  max_ms?: number | null
+  last_checked_at?: string | null
+  last_latency_ms?: number | null
+  last_ok?: boolean | null
+}
+
+export interface OpsProbeLatencyPoint {
+  checked_at?: string | null
+  target: string
+  ok?: boolean | null
+  latency_ms?: number | null
+}
+
+export interface OpsProbeLatency {
+  node_id: EntityId
+  instance_id: EntityId
+  domain: string
+  hours: number
+  generated_at?: string | null
+  targets: OpsProbeLatencyTarget[]
+  series: OpsProbeLatencyPoint[]
+}
+
+/** 实例维护窗口（现有接口） */
+export interface OpsMaintenanceWindow {
+  id: EntityId
+  instance_id: EntityId
+  starts_at?: string | null
+  ends_at?: string | null
+  reason: string
+  created_by?: EntityId | null
+}
+
+export interface OpsMaintenanceWindowPayload {
+  starts_at: string
+  ends_at: string
+  reason?: string
+}
+
+/** 备份阶段（本地生成/校验/异地上传/恢复验证） */
+export interface OpsBackupStage {
+  key?: string | null
+  name?: string | null
+  label?: string | null
+  status?: string | null
+  message?: string | null
+  at?: string | null
+  started_at?: string | null
+  finished_at?: string | null
 }

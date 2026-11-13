@@ -103,6 +103,12 @@ class Settings(BaseSettings):
 
     # ------------------------------------------------------------------ TikTok Shop
     tiktok_auth_base: str = "https://auth.tiktok-shops.com"
+    # 独立集成网关（租户实例可选的渠道配置来源）
+    gateway_base_url: str = ""
+    gateway_admin_token: str = ""
+    gateway_channel_config: bool = False
+    gateway_timeout_seconds: float = 5.0
+
     tiktok_api_base: str = "https://open-api.tiktokglobalshop.com"
     tiktok_auth_redirect_url: str = ""
     tiktok_http_timeout_seconds: float = 20.0

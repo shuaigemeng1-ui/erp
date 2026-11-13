@@ -332,6 +332,61 @@ def _config_from_row(row: PlatformChannelApp) -> ChannelAppConfig:
     )
 
 
+def _load_gateway_channel_app(channel: str, environment: str) -> ChannelAppConfig | None:
+    """从独立集成网关拉取渠道应用配置（仅租户实例启用时）。"""
+    from app.core.config import settings
+    import json
+    import httpx
+
+    if not settings.gateway_base_url or not settings.gateway_admin_token:
+        return None
+    base = settings.gateway_base_url.rstrip("/")
+    try:
+        response = httpx.get(
+            f"{base}/api/v1/gateway/channel-apps/{channel}/{environment}/internal",
+            headers={"X-Gateway-Token": settings.gateway_admin_token},
+            timeout=settings.gateway_timeout_seconds,
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+    except Exception:  # noqa: BLE001 - 网关不可用时回退本地配置
+        return None
+    extra = payload.get("extra") or {}
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except ValueError:
+            extra = {}
+    status = str(extra.get("status") or "active")
+    redirect_url = str(extra.get("redirect_url") or "")
+    app_key = str(payload.get("app_key") or "")
+    app_secret = str(payload.get("app_secret") or "")
+    region = str(payload.get("region") or "ROW")
+    updated_at = None
+    if payload.get("updated_at"):
+        from datetime import datetime
+        try:
+            updated_at = datetime.fromisoformat(str(payload["updated_at"]).replace("Z", "+00:00"))
+        except ValueError:
+            updated_at = None
+    if channel == CHANNEL_TIKTOK:
+        return ChannelAppConfig(
+            channel=channel, environment=environment, partner_id=None,
+            partner_key="", partner_secret="", redirect_url=redirect_url,
+            status=status, updated_at=updated_at,
+            app_id=str(extra.get("app_id") or ""), region=region,
+            app_key=app_key, app_secret=app_secret,
+        )
+    return ChannelAppConfig(
+        channel=channel, environment=environment,
+        partner_id=int(extra.get("partner_id") or 0) or None,
+        partner_key=app_key, partner_secret=app_secret,
+        redirect_url=redirect_url, status=status, updated_at=updated_at,
+        region=region,
+    )
+
+
 def load_channel_app(
     center: Session, channel: str, environment: str
 ) -> ChannelAppConfig | None:
@@ -339,6 +394,12 @@ def load_channel_app(
 
     平台 GET 接口必须使用 :func:`channel_app_public_view`，不得回显密钥。
     """
+    from app.core.config import settings
+
+    if settings.gateway_channel_config:
+        gateway_config = _load_gateway_channel_app(channel, environment)
+        if gateway_config is not None:
+            return gateway_config
     row = repo.get_channel_app(center, channel, environment)
     if row is None:
         return None

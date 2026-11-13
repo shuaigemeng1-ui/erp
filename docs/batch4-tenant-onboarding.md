@@ -148,7 +148,8 @@ sudo bash deploy/scripts/tenant-onboarding/migrate.sh --apply --stop-write \
 ### 4.6 切换与验证
 
 1. 域名/DNS 指向新实例；`APP_ORIGIN`、CORS、TRUSTED_HOSTS、OAuth 回调全部使用新域名；
-2. 平台登记店铺凭据/渠道回调（独立于中心；网关如启用按批次 5 处理）；
+2. 平台登记店铺凭据/渠道回调（独立于中心）；网关已按过渡方案部署（与中心同机），
+   新租户接入需在网关登记实例并获取实例 token，详见 `docs/gateway-deployment.md`；
 3. `verify_isolation.sh --run` + 第 6 节人工清单；
 4. 旧实例保持停机/只读，确认无回切需求后再下线；回切必须先冻结新实例、反向核对，
    不得双写。
@@ -286,7 +287,8 @@ python backend/scripts/tenant_migration_whitelist.py compare-tsv \
 - 第二租户真实开通、域名切换、OAuth 回调重登记、店铺凭据迁移；**第二租户仍未部署**；
 - `copy_data.sh --apply`、`migrate.sh --apply`、stop-write/resume 真机演练；
 - 中心断网、Agent 重启、发布失败、恢复验证的真实演练；
-- 独立网关（task-35）代码已合入但**未部署**，且不纳入本模板链路；恢复演练记录关联已由 b485bee 修复并闭环。
+- 独立网关已按过渡方案部署（`gateway.alienyan.store`，与中心**同机**，不满足故障隔离；详见
+  `docs/gateway-deployment.md`）；第二租户仍未部署；恢复演练记录关联已由 b485bee 修复并闭环。
 
 生产现状补充（2026-11-13 17:40 CST）：
 

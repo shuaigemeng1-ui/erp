@@ -1,9 +1,9 @@
-# 当前仓库状态（批次 4，2026-11-13，HEAD b485bee）
+# 当前仓库状态（批次 4，2026-11-13，HEAD 623c481）
 
 > 批次 4 为“第二独立租户接入模板与迁移白名单”：只新增 `deploy/scripts/tenant-onboarding/`、
 > `backend/scripts/tenant_migration_whitelist.py`、`docs/batch4-tenant-onboarding.md`，**未连接/修改任何生产**。
-> 当前 HEAD 另含 task-34（恢复演练修复）、task-35（独立网关代码）与 b485bee（备份记录关联修复）；
-> 批次 3 及以前记录保留为历史。
+> 当前 HEAD 另含 task-34（恢复演练修复）、task-35/7fbce73（独立网关部署包）、623c481（租户网关环境变量）与
+> b485bee（备份记录关联修复）；批次 3 及以前记录保留为历史。
 
 | 检查 | 当前结果 |
 | --- | --- |
@@ -14,8 +14,9 @@
 | 离线校验 | 8 个 shell 模板 `bash -n` 通过；白名单/environment/对账 `self-test` 通过；`config.sh` 渲染+绑定校验通过且会拒绝 Worker 不一致/未登记租户；install/migrate/reconcile/verify/provision 全部 plan 模式输出正常，未改系统 |
 | 生产业务库恢复 | 8.163.80.17 从 `/var/lib/ventasync-backups/releases/20261113T075322Z/vs_tenant_kangkang_shop.sql.gz` 恢复 `vs_tenant_kangkang_shop`：**34 表**、schema `tenant_0014`；创建/授权 `vs_t_3`；`.env` 修正 `TENANT_ID=3`/`ERP_WORKER_TENANT_ID=3` 并重启 api/worker/scheduler；登录 200、products 200、tenant HTTP 200；新备份 `093925Z` |
 | 恢复演练（批次3） | **记录链已闭环**：093801Z 演练 passed=true/failed=0/**28 checks**；094919Z 以 `--latest --record-latest --yes` 通过并自动匹配 **`backup_records id=2`**，`restore_status=verified`、`restore_verified_at=2026-11-13 09:49:54`，报告 `ventasync-drill-20261113094923-23419`；主 center 30/业务 34 表不变、租户 200、主容器未重启 |
-| 真实执行 | **第二租户/网关仍未部署**：第二租户开通/域名切换/OAuth 回调重登记/店铺凭据迁移、`copy_data.sh`/`migrate.sh --apply`、停写恢复、断网/Agent 重启/发布失败/恢复验证真机演练均未执行；需 Lead 审批维护窗口 |
-| 剩余风险 | 模板尚未真机验证；**`BACKUP_INSTANCE_ID` 必配**（等于中心 `tenant_instances.id`，本次=1）；独立网关（task-35）已合入代码但未部署；第二租户未部署 |
+| 独立网关（过渡） | `gateway.alienyan.store` DNS→`121.37.45.132`，Caddy TLS 反代 `127.0.0.1:8101`；`erp-gateway-v2`（`erp-gateway:7fbce73`，卷 `erp-gateway-v2-data`）健康 200；实例 id=1/tenant_id=3 active verified、channel_apps=1；TikTok 回调已切网关；租户 b485bee 配置实例 token/relay+lock，移除 admin token；旧容器停止、旧卷保留 |
+| 真实执行 | **第二租户仍未部署**：第二租户开通/域名切换/OAuth 回调重登记/店铺凭据迁移、`copy_data.sh`/`migrate.sh --apply`、停写恢复、断网/Agent 重启/发布失败/恢复验证真机演练均未执行；需 Lead 审批维护窗口。独立网关已同机过渡部署 |
+| 剩余风险 | 模板尚未真机验证；**`BACKUP_INSTANCE_ID` 必配**（等于中心 `tenant_instances.id`，本次=1）；网关同中心机不满足故障隔离、TikTok 后台 Redirect URI 未改、旧 8100/旧容器未清理；第二租户未部署 |
 
 补充说明：
 
@@ -68,7 +69,7 @@
 | 完整契约检查 | **38/38 通过**，0 失败 0 警告：补齐 `center_0017` 迁移基线后恢复全绿；表清单/中文注释/权限码/94 条文档路由全部通过 |
 | 批次 2 交付 | 租户模式边界（center/tenant/gateway、固定 TENANT_ID/INSTANCE_ID）、任务固定实例/租户绑定、迁移租户调度隔离、升级前强制备份、SSH 主机指纹 TOFU/审计/会话复核、实例部署/迁移状态展示 |
 | 批次 2 生产试点 | **通过**：中心 `1da80c2` + `center_0017`；release 自动登记 verified/协议2/center_0017/tenant_0014；8.163.80.17 升级 job 42 成功（checks passed、actual=1da80c2、db=tenant_0014）；tenant 模式 TENANT_ID=1/INSTANCE_ID=1 登录/runtime/healthz 200、`/platform/releases` 404；SSH 首指纹已记录并 verified（SHA256:T2cB1vQn5bvCsJ9BPqmui5IIb+7vR/n1tuseQFY8LYE） |
-| 剩余风险 | tenant 模式第二租户/多实例配置待验证；SSH 首指纹需纳入运维核对、mismatch 真实演练待补；审计标签待核对；升级前备份步骤因旧 executor 未在 job 42 生效（待 Agent 升级后补验）；备份恢复演练、维护状态、监控、独立网关、第二租户未完成（详见 `docs/batch2-acceptance.md` 第 5 节） |
+| 剩余风险 | tenant 模式第二租户/多实例配置待验证；SSH 首指纹需纳入运维核对、mismatch 真实演练待补；审计标签待核对；升级前备份步骤因旧 executor 未在 job 42 生效（待 Agent 升级后补验）；备份恢复演练、维护状态、第二租户未完成（独立网关已于 2026-11-13 过渡部署、同中心机；详见 `docs/batch2-acceptance.md` 第 5 节） |
 
 补充说明：
 

@@ -16,8 +16,20 @@
 
 独立网关健康检查：`GET /api/v1/gateway/health`。
 
+## 独立网关实际部署（2026-11-13，过渡方案）
+
+- 域名 `gateway.alienyan.store` DNS → `121.37.45.132`，Caddy TLS 已签发并反代 `127.0.0.1:8101`；
+- 容器 `erp-gateway-v2`（镜像 `erp-gateway:7fbce73`），卷 `erp-gateway-v2-data`，健康检查 200；
+- 实例 `id=1 / tenant_id=3 / active / verified`，`channel_apps=1`（TikTok）；
+- 租户 `b485bee` 已配置 `GATEWAY_INSTANCE_ID=1`/实例 token、`GATEWAY_OAUTH_RELAY_ENABLED=true`、
+  `GATEWAY_REFRESH_LOCK_ENABLED=true`，并移除 `GATEWAY_ADMIN_TOKEN`；
+- ⚠️ 网关与中心**同机**，是过渡方案，不满足“中心故障网关仍活”；TikTok 后台 Redirect URI 仍需改为网关回调；
+- 旧容器 `erp-gateway` 已停止、旧卷保留回滚；旧 8100 未删除；
+- 详见 `docs/gateway-deployment.md`。
+
 当前中心已按 `center` 模式部署；租户独立实例的数据库、备份与接入模板已在批次 2/3/4 交付，
-账号仍以中心库账号/成员关系为唯一认证来源；独立网关与本地认证仍按后续批次推进。
+账号仍以中心库账号/成员关系为唯一认证来源；独立网关已按过渡方案部署（同中心机），
+本地认证与独立故障域网关仍按后续批次推进。
 
 ## 独立租户实例接入（批次 4）
 

@@ -22,6 +22,8 @@ import type {
 export interface OpsInstanceQuery extends PageParams {
   q?: string
   status?: string
+  deployment_mode?: string
+  migration_status?: string
 }
 
 export interface OpsAlertQuery extends PageParams {
@@ -207,6 +209,13 @@ export const opsApi = {
 
   saveNodeSshConfig(nodeId: EntityId, payload: OpsNodeSshConfigPayload): Promise<OpsNodeSshConfig> {
     return http.put<OpsNodeSshConfig>(`/platform/nodes/${segment(nodeId)}/ssh`, payload)
+  },
+
+  /** 管理员确认服务器变更后重置 SSH 主机指纹；必须显式 confirm=true。 */
+  resetNodeSshFingerprint(nodeId: EntityId): Promise<OpsNodeSshConfig> {
+    return http.post<OpsNodeSshConfig>(`/platform/nodes/${segment(nodeId)}/ssh/fingerprint/reset`, {
+      confirm: true,
+    })
   },
 
   execNodeSsh(nodeId: EntityId, command: string): Promise<OpsNodeSshExecResult> {

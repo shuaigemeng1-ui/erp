@@ -27,6 +27,12 @@ export interface OpsInstance {
   domain: string
   environment: OpsEnvironment | string
   status: OpsInstanceStatus | string
+  /** 批次2新增：共享中心 / 独立部署 */
+  deployment_mode?: 'shared' | 'independent' | string | null
+  /** 批次2新增迁移状态 */
+  migration_status?: 'registered' | 'migrating' | 'migrated' | 'rollback' | string | null
+  /** 后端派生只读：独立部署/迁移相关状态下拒绝中心写操作 */
+  write_blocked?: boolean | null
   app_version: string
   /** 批次1新增发布/升级展示字段；旧接口可能缺失 */
   target_version?: string | null
@@ -86,6 +92,11 @@ export interface OpsServerNode {
   internal_ips: string[]
   configured_public_ip: string
   observed_public_ip: string
+  /** SSH 指纹只读摘要（task-25） */
+  ssh_host?: string | null
+  ssh_host_fingerprint?: string | null
+  ssh_fingerprint_algorithm?: string | null
+  ssh_host_fingerprint_verified_at?: string | null
   agent_version: string
   app_version: string
   /** 节点实际上报的应用版本（批次1新增） */
@@ -199,6 +210,16 @@ export interface OpsNodeSshConfig {
   port: number
   username: string
   has_password: boolean
+  host_configured?: boolean
+  credentials_configured?: boolean
+  /** SSH 主机指纹字段，旧后端缺失 */
+  ssh_host_fingerprint?: string | null
+  ssh_fingerprint_algorithm?: string | null
+  ssh_host_fingerprint_verified_at?: string | null
+  /** verified / unverified */
+  fingerprint_status?: string | null
+  /** 重置接口返回标记 */
+  reset?: boolean
 }
 
 export interface OpsNodeSshConfigPayload {

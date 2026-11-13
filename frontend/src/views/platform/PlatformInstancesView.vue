@@ -7,6 +7,7 @@ import '@xterm/xterm/css/xterm.css'
 import { CopyDocument, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import { opsApi } from '@/api/ops'
 import type { OpsRelease } from '@/api/ops'
+import { isApiError } from '@/api/http'
 import { useTableQuery } from '@/composables/useTableQuery'
 import PaginationBar from '@/components/PaginationBar.vue'
 import IdCopy from '@/components/IdCopy.vue'
@@ -21,6 +22,7 @@ import type {
   OpsNodeEnrollment,
   OpsNodeMetric,
   OpsNodeMetrics,
+  OpsNodeSshConfig,
   OpsProbeResult,
   OpsServerNode,
   OpsTenantOption,
@@ -114,6 +116,43 @@ function instanceStatusText(status?: string | null): string {
   if (status === 'suspended') return '已暂停'
   if (status === 'pending') return '待接入'
   return textOrDash(status)
+}
+
+function deploymentModeType(mode?: string | null): TagType {
+  return mode === 'independent' ? 'success' : 'info'
+}
+
+function deploymentModeText(mode?: string | null): string {
+  if (mode === 'shared') return '共享中心'
+  if (mode === 'independent') return '独立部署'
+  return textOrDash(mode)
+}
+
+function migrationStatusType(status?: string | null): TagType {
+  if (status === 'migrating') return 'warning'
+  if (status === 'migrated') return 'success'
+  if (status === 'rollback') return 'danger'
+  return 'info'
+}
+
+function migrationStatusText(status?: string | null): string {
+  if (status === 'registered') return '已登记'
+  if (status === 'migrating') return '迁移中'
+  if (status === 'migrated') return '已迁出'
+  if (status === 'rollback') return '回滚'
+  return textOrDash(status)
+}
+
+/** 迁移中/已迁出/回滚/独立部署均不允许旧中心写操作。 */
+function centerOperationsBlockedReason(instance: OpsInstance): string {
+  if (instance.deployment_mode === 'independent') {
+    return '实例为独立部署，请通过迁移流程操作'
+  }
+  if (instance.migration_status === 'migrating') return '实例迁移中，旧中心操作已暂停'
+  if (instance.migration_status === 'migrated') return '实例已迁出到独立部署，旧中心操作不可用'
+  if (instance.migration_status === 'rollback') return '实例处于迁移回滚状态，旧中心操作已暂停'
+  if (instance.write_blocked) return '实例当前禁止旧中心写操作，请通过迁移流程处理'
+  return ''
 }
 
 function nodeTagType(status?: string | null): TagType {
@@ -228,6 +267,8 @@ function environmentText(environment?: string | null): string {
 const instanceQuery = reactive({
   q: '',
   status: '',
+  deployment_mode: '',
+  migration_status: '',
 })
 
 const {
@@ -246,6 +287,8 @@ const {
     page_size: params.page_size,
     q: stringOrUndefined(instanceQuery.q),
     status: stringOrUndefined(instanceQuery.status),
+    deployment_mode: stringOrUndefined(instanceQuery.deployment_mode),
+    migration_status: stringOrUndefined(instanceQuery.migration_status),
   }),
 )
 
@@ -400,6 +443,10 @@ const sshNode = ref<OpsServerNode | null>(null)
 const sshLoading = ref(false)
 const sshSaving = ref(false)
 const sshRunning = ref(false)
+const sshFingerprintResetting = ref(false)
+const sshConfig = ref<OpsNodeSshConfig | null>(null)
+const sshFingerprintWarning = ref('')
+const terminalFingerprintWarning = ref('')
 const sshHost = ref('')
 const sshPort = ref(22)
 const sshUsername = ref('')
@@ -407,18 +454,51 @@ const sshPassword = ref('')
 const sshCommand = ref('')
 const sshOutput = ref('')
 
+function sshFingerprintStatusType(status?: string | null): TagType {
+  return status === 'verified' ? 'success' : 'warning'
+}
+
+function sshFingerprintStatusText(status?: string | null): string {
+  if (status === 'verified') return '已验证'
+  if (status === 'unverified') return '未验证'
+  return textOrDash(status)
+}
+
+function fingerprintWarningFromError(error: unknown): string {
+  if (!isApiError(error)) return ''
+  const details =
+    error.details && typeof error.details === 'object'
+      ? (error.details as Record<string, unknown>)
+      : null
+  if (details?.reason !== 'fingerprint_mismatch') return ''
+  const expected = typeof details.expected === 'string' ? details.expected : '-'
+  const actual = typeof details.actual === 'string' ? details.actual : '-'
+  const algorithm = typeof details.algorithm === 'string' ? details.algorithm : '-'
+  return `SSH 主机指纹不匹配（${algorithm}）：预期 ${expected}，实际 ${actual}。如确认服务器已变更，请核对后重置指纹。`
+}
+
 async function openSsh(node: OpsServerNode): Promise<void> {
   sshNode.value = node
   sshVisible.value = true
   sshLoading.value = true
   sshOutput.value = ''
   sshCommand.value = ''
+  sshConfig.value = null
+  sshFingerprintWarning.value = ''
+  terminalFingerprintWarning.value = ''
+  sshHost.value = ''
+  sshPort.value = 22
+  sshUsername.value = ''
+  sshPassword.value = ''
   try {
     const config = await opsApi.nodeSshConfig(node.id)
-    sshHost.value = config.host || config.detected_host || ''
+    sshConfig.value = config
+    sshHost.value = config.host || ''
     sshPort.value = Number(config.port || 22)
     sshUsername.value = config.username || ''
     sshPassword.value = ''
+  } catch {
+    // 统一请求层已经展示错误
   } finally {
     sshLoading.value = false
   }
@@ -434,10 +514,38 @@ async function saveSsh(): Promise<void> {
       username: sshUsername.value.trim(),
       password: sshPassword.value ? sshPassword.value : undefined,
     })
+    sshConfig.value = config
+    sshHost.value = config.host || ''
     sshPassword.value = ''
+    sshFingerprintWarning.value = ''
     ElMessage.success(config.has_password ? 'SSH 配置已保存' : 'SSH 配置已保存，但密码为空')
   } finally {
     sshSaving.value = false
+  }
+}
+
+async function resetSshFingerprint(): Promise<void> {
+  if (!sshNode.value) return
+  try {
+    await ElMessageBox.confirm(
+      '重置后下次成功连接会重新记录主机指纹。请确认已核对服务器主机密钥变更，避免中间人风险。',
+      '重置 SSH 主机指纹',
+      { type: 'warning', confirmButtonText: '确认重置', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  sshFingerprintResetting.value = true
+  try {
+    const config = await opsApi.resetNodeSshFingerprint(sshNode.value.id)
+    sshConfig.value = config
+    sshFingerprintWarning.value = ''
+    terminalFingerprintWarning.value = ''
+    ElMessage.success('SSH 主机指纹已重置')
+  } catch {
+    // 统一请求层已经展示错误
+  } finally {
+    sshFingerprintResetting.value = false
   }
 }
 
@@ -448,6 +556,9 @@ async function runSsh(): Promise<void> {
   try {
     const result = await opsApi.execNodeSsh(sshNode.value.id, sshCommand.value.trim())
     sshOutput.value = `$ ${sshCommand.value.trim()}\n${result.output}\n[exit ${result.exit_status}]`
+  } catch (error) {
+    const warning = fingerprintWarningFromError(error)
+    if (warning) sshFingerprintWarning.value = warning
   } finally {
     sshRunning.value = false
   }
@@ -481,6 +592,7 @@ function closeTerminal(): void {
 async function openTerminal(): Promise<void> {
   if (!sshNode.value) return
   terminalVisible.value = true
+  terminalFingerprintWarning.value = ''
   await nextTick()
   if (!terminalHost.value) return
   closeTerminal()
@@ -509,6 +621,18 @@ async function openTerminal(): Promise<void> {
   socket.onmessage = (event) => term?.write(String(event.data))
   socket.onerror = () => term?.writeln('\r\n[连接错误]')
   socket.onclose = (event) => {
+    if (event.code === 4409) {
+      const message =
+        'SSH 主机指纹不匹配，连接已被拒绝。请核对服务器主机密钥，确认变更后在 SSH 配置中重置指纹。'
+      terminalFingerprintWarning.value = message
+      sshFingerprintWarning.value = message
+      ElMessage.error('SSH 主机指纹不匹配，已拒绝连接')
+      return
+    }
+    if (event.code === 4410) {
+      term?.writeln('\r\n[空闲超时，连接已断开]')
+      return
+    }
     if (event.code !== 1000) term?.writeln(`\r\n[连接已关闭 ${event.code}]`)
   }
   term.onData((data) => {
@@ -578,6 +702,8 @@ function preferredRelease(instance: OpsInstance): OpsRelease | null {
 
 /** 空串表示可升级；否则用于禁用按钮 tooltip。 */
 function upgradeBlockedReason(instance: OpsInstance): string {
+  const centerBlocked = centerOperationsBlockedReason(instance)
+  if (centerBlocked) return centerBlocked
   if (releasesLoading.value) return '正在加载发布清单'
   const release = preferredRelease(instance)
   if (!release) {
@@ -671,6 +797,40 @@ async function refreshPage(): Promise<void> {
 }
 
 onMounted(loadReleases)
+
+/* ------------------------------ 启用实例 ------------------------------ */
+const enablingId = ref('')
+
+function enableBlockedReason(instance: OpsInstance): string {
+  return centerOperationsBlockedReason(instance)
+}
+
+async function enableInstance(instance: OpsInstance): Promise<void> {
+  const reason = enableBlockedReason(instance)
+  if (reason) {
+    ElMessage.warning(reason)
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `确认重新启用实例「${instance.name}」？启用后将恢复中心侧状态为运行中。`,
+      '启用实例',
+      { type: 'warning', confirmButtonText: '确认启用', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  enablingId.value = instance.id
+  try {
+    await opsApi.updateInstance(instance.id, { status: 'active' })
+    ElMessage.success('实例已启用')
+    await refreshPage()
+  } catch {
+    // 统一请求层已经展示错误
+  } finally {
+    enablingId.value = ''
+  }
+}
 
 /* ------------------------------ 编辑实例 ------------------------------ */
 const editVisible = ref(false)
@@ -1049,6 +1209,28 @@ async function copyText(value: string | null | undefined, label: string): Promis
           <el-option label="运行中" value="active" />
           <el-option label="已暂停" value="suspended" />
         </el-select>
+        <el-select
+          v-model="instanceQuery.deployment_mode"
+          placeholder="部署模式"
+          clearable
+          style="width: 145px"
+          @change="searchInstances()"
+        >
+          <el-option label="共享中心" value="shared" />
+          <el-option label="独立部署" value="independent" />
+        </el-select>
+        <el-select
+          v-model="instanceQuery.migration_status"
+          placeholder="迁移状态"
+          clearable
+          style="width: 145px"
+          @change="searchInstances()"
+        >
+          <el-option label="已登记" value="registered" />
+          <el-option label="迁移中" value="migrating" />
+          <el-option label="已迁出" value="migrated" />
+          <el-option label="回滚" value="rollback" />
+        </el-select>
         <el-button type="primary" :icon="Search" @click="searchInstances()">查询</el-button>
         <div class="filter-spacer" />
         <span class="text-muted">共 {{ instanceTotal }} 个实例</span>
@@ -1082,6 +1264,32 @@ async function copyText(value: string | null | undefined, label: string): Promis
             <el-tag :type="instanceTagType(row.status)" size="small" disable-transitions>
               {{ instanceStatusText(row.status) }}
             </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="部署模式" width="110">
+          <template #default="{ row }">
+            <el-tag
+              v-if="row.deployment_mode"
+              :type="deploymentModeType(row.deployment_mode)"
+              size="small"
+              disable-transitions
+            >
+              {{ deploymentModeText(row.deployment_mode) }}
+            </el-tag>
+            <span v-else class="text-muted">-</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="迁移状态" width="110">
+          <template #default="{ row }">
+            <el-tag
+              v-if="row.migration_status"
+              :type="migrationStatusType(row.migration_status)"
+              size="small"
+              disable-transitions
+            >
+              {{ migrationStatusText(row.migration_status) }}
+            </el-tag>
+            <span v-else class="text-muted">-</span>
           </template>
         </el-table-column>
         <el-table-column label="目标版本" width="125">
@@ -1134,8 +1342,27 @@ async function copyText(value: string | null | undefined, label: string): Promis
         <el-table-column label="创建时间" width="170">
           <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="230" fixed="right">
+        <el-table-column label="操作" width="330" fixed="right">
           <template #default="{ row }">
+            <el-tooltip
+              v-if="row.status === 'suspended'"
+              :disabled="!enableBlockedReason(row as OpsInstance)"
+              :content="enableBlockedReason(row as OpsInstance)"
+              placement="top"
+            >
+              <span class="upgrade-disabled" @click.stop>
+                <el-button
+                  text
+                  type="success"
+                  size="small"
+                  :disabled="Boolean(enableBlockedReason(row as OpsInstance))"
+                  :loading="enablingId === row.id"
+                  @click.stop="enableInstance(row as OpsInstance)"
+                >
+                  启用
+                </el-button>
+              </span>
+            </el-tooltip>
             <el-button
               v-if="canUpgrade(row as OpsInstance)"
               text
@@ -1363,6 +1590,41 @@ async function copyText(value: string | null | undefined, label: string): Promis
         </el-descriptions>
 
         <div class="section-head">
+          <span>部署与迁移</span>
+        </div>
+        <el-descriptions :column="2" border size="small" class="detail-descriptions">
+          <el-descriptions-item label="部署模式">
+            <el-tag
+              v-if="currentInstance.deployment_mode"
+              :type="deploymentModeType(currentInstance.deployment_mode)"
+              size="small"
+              disable-transitions
+            >
+              {{ deploymentModeText(currentInstance.deployment_mode) }}
+            </el-tag>
+            <span v-else class="text-muted">-</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="迁移状态">
+            <el-tag
+              v-if="currentInstance.migration_status"
+              :type="migrationStatusType(currentInstance.migration_status)"
+              size="small"
+              disable-transitions
+            >
+              {{ migrationStatusText(currentInstance.migration_status) }}
+            </el-tag>
+            <span v-else class="text-muted">-</span>
+          </el-descriptions-item>
+        </el-descriptions>
+        <el-alert
+          v-if="centerOperationsBlockedReason(currentInstance)"
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="`${centerOperationsBlockedReason(currentInstance)}；升级与启用按钮已禁用。`"
+        />
+
+        <div class="section-head">
           <span>发布与升级</span>
         </div>
         <el-descriptions :column="2" border size="small" class="detail-descriptions">
@@ -1415,6 +1677,12 @@ async function copyText(value: string | null | undefined, label: string): Promis
               <div class="node-name">{{ textOrDash(row.hostname) }}</div>
               <div class="node-sub mono" :title="row.node_uuid">{{ row.node_uuid }}</div>
               <div class="node-id"><IdCopy :id="row.id" /></div>
+            </template>
+          </el-table-column>
+          <el-table-column label="所属实例" width="170">
+            <template #default="{ row }">
+              <div>{{ textOrDash(currentInstance.name) }}</div>
+              <IdCopy :id="row.instance_id" />
             </template>
           </el-table-column>
           <el-table-column label="状态" width="90">
@@ -1827,9 +2095,61 @@ async function copyText(value: string | null | undefined, label: string): Promis
 
   <el-dialog v-model="sshVisible" :title="`SSH · ${sshNode?.hostname || sshNode?.node_uuid || ''}`" width="760px" destroy-on-close>
     <div v-loading="sshLoading">
+      <el-alert
+        v-if="sshFingerprintWarning"
+        class="ssh-fingerprint-alert"
+        type="error"
+        :title="sshFingerprintWarning"
+        :closable="false"
+        show-icon
+      />
+      <el-descriptions v-if="sshConfig" :column="2" border size="small" class="ssh-fingerprint">
+        <el-descriptions-item label="连接目标">
+          <span class="mono">{{ textOrDash(sshConfig.host) }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="探测 IP">
+          <span class="mono">{{ textOrDash(sshConfig.detected_host) }}</span>
+          <span class="form-tip">（仅展示，不用于连接）</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="指纹状态">
+          <el-tag
+            v-if="sshConfig.fingerprint_status"
+            :type="sshFingerprintStatusType(sshConfig.fingerprint_status)"
+            size="small"
+            disable-transitions
+          >
+            {{ sshFingerprintStatusText(sshConfig.fingerprint_status) }}
+          </el-tag>
+          <span v-else class="text-muted">-</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="指纹确认时间">
+          {{ formatDateTime(sshConfig.ssh_host_fingerprint_verified_at) }}
+        </el-descriptions-item>
+        <el-descriptions-item label="算法">
+          {{ textOrDash(sshConfig.ssh_fingerprint_algorithm) }}
+        </el-descriptions-item>
+        <el-descriptions-item label="主机指纹" :span="2">
+          <span v-if="sshConfig.ssh_host_fingerprint" class="ssh-fingerprint-value mono">
+            {{ sshConfig.ssh_host_fingerprint }}
+          </span>
+          <span v-else class="text-muted">未记录（首次成功连接后自动记录并验证）</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="指纹操作" :span="2">
+          <el-button
+            size="small"
+            type="warning"
+            :loading="sshFingerprintResetting"
+            :disabled="!sshConfig.ssh_host_fingerprint"
+            @click="resetSshFingerprint"
+          >
+            重置主机指纹
+          </el-button>
+          <span class="form-tip">仅限确认服务器主机密钥变更后操作；重置后下次连接重新记录。</span>
+        </el-descriptions-item>
+      </el-descriptions>
       <el-form label-width="90px" size="small">
         <el-form-item label="SSH 地址">
-          <el-input v-model="sshHost" placeholder="留空自动使用探测到的公网/内网 IP" />
+          <el-input v-model="sshHost" placeholder="留空表示禁用 SSH；不会自动使用 Agent 上报 IP" />
         </el-form-item>
         <el-form-item label="端口">
           <el-input-number v-model="sshPort" :min="1" :max="65535" controls-position="right" />
@@ -1862,6 +2182,14 @@ async function copyText(value: string | null | undefined, label: string): Promis
     destroy-on-close
     @closed="closeTerminal"
   >
+    <el-alert
+      v-if="terminalFingerprintWarning"
+      class="ssh-fingerprint-alert"
+      type="error"
+      :title="terminalFingerprintWarning"
+      :closable="false"
+      show-icon
+    />
     <div ref="terminalHost" class="ssh-terminal" />
   </el-dialog>
 </template>
@@ -2160,6 +2488,26 @@ async function copyText(value: string | null | undefined, label: string): Promis
 
 .enrollment-detail {
   margin-top: 12px;
+}
+
+.ssh-fingerprint-alert {
+  margin-bottom: 12px;
+}
+
+.ssh-fingerprint {
+  margin-bottom: 12px;
+}
+
+.ssh-fingerprint-value {
+  display: block;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  font-size: 12px;
+}
+
+.ssh-fingerprint .form-tip {
+  display: block;
+  margin-top: 4px;
 }
 
 .ssh-terminal {

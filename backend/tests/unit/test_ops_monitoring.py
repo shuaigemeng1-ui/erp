@@ -354,6 +354,71 @@ def test_historical_sample_does_not_resolve_existing_alerts(center):
     assert alerts(center, monitoring.ALERT_CPU)[0].status == "open"
 
 
+def test_agent_batch_historical_duplicate_does_not_fake_health(center):
+    """telemetry 补报（boot_id/sample_seq 去重）历史样本不改变实时在线/心跳/告警。"""
+    from sqlalchemy import func
+
+    from app.modules.ops import agent_protocol
+
+    old_seen = _now() - timedelta(seconds=3600)
+    old_metrics = old_seen
+    node = seed_node(center, last_seen=old_seen)
+    node.status = "offline"
+    node.last_metrics_at = old_metrics
+    center.commit()
+    historical_at = (_now() - timedelta(minutes=20)).isoformat()
+    batch = {
+        "boot_id": "boot-1",
+        "protocol_version": 2,
+        "samples": [
+            {
+                "boot_id": "boot-1",
+                "sample_seq": 1,
+                "sampled_at": historical_at,
+                "cpu_percent": 99,
+                "memory_percent": 99,
+                "disks": [{"mount": "/", "total_gb": 100, "percent": 99}],
+            }
+        ],
+    }
+    first = agent_protocol.ingest_telemetry(center, node, batch)
+    assert first["accepted"] == 1
+    assert node.status == "offline"
+    assert node.last_seen_at == old_seen
+    assert node.last_metrics_at == old_metrics
+    assert alerts(center, monitoring.ALERT_CPU) == []
+    assert alerts(center, monitoring.ALERT_MEMORY) == []
+    assert alerts(center, monitoring.ALERT_DISK) == []
+
+    duplicate = agent_protocol.ingest_telemetry(center, node, batch)
+    assert duplicate["duplicates"] == 1
+    assert duplicate["accepted"] == 0
+    assert node.status == "offline"
+    assert node.last_seen_at == old_seen
+    assert (
+        center.execute(select(func.count()).select_from(NodeMetricSample)).scalar_one() == 1
+    )
+
+    live_batch = {
+        "boot_id": "boot-1",
+        "samples": [
+            {
+                "boot_id": "boot-1",
+                "sample_seq": 2,
+                "sampled_at": _now().isoformat(),
+                "cpu_percent": 12,
+                "memory_percent": 20,
+                "disks": [{"mount": "/", "total_gb": 100, "percent": 20}],
+            }
+        ],
+    }
+    live = agent_protocol.ingest_telemetry(center, node, live_batch)
+    assert live["accepted"] == 1
+    assert node.status == "online"
+    assert node.last_seen_at is not None and node.last_seen_at > old_seen
+    assert alerts(center, monitoring.ALERT_CPU) == []
+
+
 # --------------------------------------------------------------------------- 数据盘/网络
 def test_data_disk_and_network_use_actual_sampled_delta(center):
     node = seed_node(center)

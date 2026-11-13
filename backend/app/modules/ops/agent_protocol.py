@@ -1153,12 +1153,10 @@ def ingest_telemetry(
         value = payload.get(field)
         if value and hasattr(node, field):
             setattr(node, field, str(value)[:64])
-    _touch_node(node, now)
-    node.last_metrics_at = now
-    node.updated_at = now
 
     results: list[dict[str, Any]] = []
     accepted = duplicates = invalid = 0
+    has_live_sample = False
     for index, raw in enumerate(samples):
         if not isinstance(raw, dict):
             invalid += 1
@@ -1182,7 +1180,13 @@ def ingest_telemetry(
             continue
         if boot_id and sample_seq is not None:
             _record_sample_seq(telemetry, boot_id, int(sample_seq))
-        _absorb_versions_from_sample(node, sample, state)
+        from app.modules.ops.monitoring import is_historical_sample
+
+        live_sample = not is_historical_sample(getattr(sample, "sampled_at", None), now=now)
+        if live_sample:
+            # 心跳与历史样本分离：历史补报不改版本/在线状态，新样本才更新心跳。
+            has_live_sample = True
+            _absorb_versions_from_sample(node, sample, state)
         _save_protocol_state(node, state)
         try:
             service.ingest_telemetry(center, node, sample)
@@ -1194,7 +1198,9 @@ def ingest_telemetry(
             {"index": index, "sample_seq": sample_seq, "boot_id": boot_id, "status": "accepted"}
         )
     _save_protocol_state(node, state)
-    _touch_node(node, now)
+    if has_live_sample:
+        _touch_node(node, now)
+        node.last_metrics_at = now
     node.updated_at = now
     center.commit()
     return {
@@ -1225,9 +1231,14 @@ def _ingest_single(center: Session, node: ServerNode, payload: dict[str, Any]) -
     state, telemetry = _telemetry_state(node)
     boot_id = str(getattr(sample, "boot_id", "") or "")[:64]
     sample_seq = getattr(sample, "sample_seq", None)
+    from app.modules.ops.monitoring import is_historical_sample
+
+    live_sample = not is_historical_sample(getattr(sample, "sampled_at", None), now=now)
     duplicate = _is_duplicate_sample(telemetry, boot_id, sample_seq)
     if duplicate:
-        _touch_node(node, now)
+        if live_sample:
+            _touch_node(node, now)
+            node.last_metrics_at = now
         center.commit()
         return {
             "ok": True,
@@ -1240,7 +1251,8 @@ def _ingest_single(center: Session, node: ServerNode, payload: dict[str, Any]) -
         }
     if boot_id and sample_seq is not None:
         _record_sample_seq(telemetry, boot_id, int(sample_seq))
-    _absorb_versions_from_sample(node, sample, state)
+    if live_sample:
+        _absorb_versions_from_sample(node, sample, state)
     _save_protocol_state(node, state)
     result = service.ingest_telemetry(center, node, sample)
     data = dict(result) if isinstance(result, dict) else {}

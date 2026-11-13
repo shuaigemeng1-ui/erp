@@ -754,7 +754,7 @@ onMounted(() => {
           v-model="releaseForm.build_config_summary"
           type="textarea"
           :rows="2"
-          maxlength="1000"
+          maxlength="500"
           show-word-limit
           placeholder="如 build profile、镜像构建参数、依赖锁定摘要"
         />
@@ -763,6 +763,7 @@ onMounted(() => {
         <el-input-number
           v-model="releaseForm.min_agent_protocol"
           :min="0"
+          :max="10000"
           :step="1"
           :precision="0"
           controls-position="right"

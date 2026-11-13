@@ -9,16 +9,13 @@
 # 显式卷名会覆盖 `docker compose -p <project>` 的项目前缀，旧版演练仅加
 # `-p ventasync-drill-*`，仍挂载主项目 MySQL 卷，导致导入写坏主库、清理删除主卷。
 #
-# 现行保护（层层断言，任何一步不满足立即中止，且中止前不会启动/删除任何主项目资源）：
-#   1. 项目名必须是 `ventasync-drill-*`；与主项目名不同；
-#   2. compose 调用同时设置 `COMPOSE_PROJECT_NAME=<drill 项目>` 与 `-p <drill 项目>`，
-#      override 再显式把 mysql/redis/catalog 卷名改为 `<drill 项目>_*`；
-#   3. 启动前用 `docker compose config --format json` 解析最终配置，由
-#      check_drill_isolation.py 断言所有卷名/挂载都属于 drill 项目、mysql 无端口发布；
-#   4. 交互确认（必须输入 drill 项目名）或显式 --yes；--dry-run 只做只读校验；
-#   5. 容器启动后再次用 docker inspect 校验容器名与挂载卷名；
-#   6. 清理只执行 `docker compose -p <drill 项目> down -v`，且项目名必须匹配 drill；
-#      任何失败都不会对主项目执行 down/rm。
+# 当前流程：
+#   1. 解密并检查清单、dump schema、最终 BASE TABLE 表名；保留原 schema。
+#   2. 仅用主 MySQL 已有镜像生成独立、冻结的 Compose 配置；随机密码、无发布端口。
+#   3. 禁止复用既有 drill 卷；运行时核对容器/卷标签及实际 Source 与主库不同。
+#   4. PID 1 mysqld + TCP SELECT 1 连续成功后，docker cp SQL，再容器内文件重定向导入。
+#   5. 表数、表名、账号、权限、商品关联、归档密钥解密及租户备份范围均通过才 passed。
+#   6. 清理前重复运行时隔离断言；仅清理本次独立 MySQL，报告保留在 drill-reports。
 #
 # 用法：
 #   bash deploy/scripts/restore_drill.sh --self-test                 # 无服务器自测（加密+安全断言）
@@ -37,8 +34,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${DEPLOY_DIR}/.." && pwd)"
-COMPOSE_FILE="${DEPLOY_DIR}/docker-compose.yml"
-COMPOSE_SERVER="${DEPLOY_DIR}/docker-compose.server.yml"
 SAFETY_CHECKER="${SCRIPT_DIR}/check_drill_isolation.py"
 
 if [[ -f "${DEPLOY_DIR}/.env" ]]; then
@@ -66,14 +61,8 @@ RECORD_ID=""
 RECORD_LATEST=0
 WORK_DIR=""
 PROJECT=""
-OVERRIDE_FILE=""
 CONFIG_JSON=""
 REPORT=""
-# 仅在「compose config 安全断言通过」后置 1；cleanup 用它决定是否允许执行 down -v
-SAFETY_VERIFIED=0
-# 演练目标信息（写入报告，供证据核对；由 validate_drill_datadir 填充）
-DRILL_DATADIR=""
-DRILL_DATA_VOLUME=""
 
 log() { printf '[drill] %s\n' "$*"; }
 warn() { printf '[drill] 警告：%s\n' "$*" >&2; }
@@ -90,7 +79,7 @@ usage() {
   --dry-run           只读：解密校验 + 解析 compose 最终配置并做安全断言，不启动任何容器
   --yes               非交互确认（输入项目名确认的替代；自动化/远程执行用）
   --record-id <ID>    演练成功后回写该 backup_records 记录
-  --record-latest     回写该实例最新一条备份记录
+  --record-latest     回写与本次包 run_id/校验值匹配的唯一记录
   --keep              保留演练容器与解压目录（默认演练结束后清理 drill 项目）
   -h, --help          显示帮助
 EOF
@@ -147,7 +136,7 @@ JSON
 self_test() {
     local tmp key bundle src
     tmp="$(mktemp -d)"
-    trap 'rm -rf "${tmp}"' EXIT
+    trap "rm -rf -- $(printf '%q' "$tmp")" EXIT
     chmod 700 "${tmp}"
     mkdir -p "${tmp}/src/config"
     printf 'CREATE TABLE users (id BIGINT);\nCREATE TABLE tenants (id BIGINT);\n' | gzip > "${tmp}/src/${CENTER_DB_NAME}.sql.gz"
@@ -185,527 +174,340 @@ if [[ "${SELF_TEST}" -eq 1 ]]; then
     self_test
 fi
 
-# ---------------------------------------------------------------- 依赖与定位备份包
-command -v docker >/dev/null 2>&1 || die "未找到 docker 命令"
-command -v openssl >/dev/null 2>&1 || die "未找到 openssl 命令"
-command -v gzip >/dev/null 2>&1 || die "未找到 gzip 命令"
-command -v python3 >/dev/null 2>&1 || die "未找到 python3 命令"
-docker compose version >/dev/null 2>&1 || die "docker compose v2 不可用"
-[[ -f "${SAFETY_CHECKER}" ]] || die "缺少安全断言脚本：${SAFETY_CHECKER}"
-[[ -f "${COMPOSE_FILE}" ]] || die "找不到 Compose 文件：${COMPOSE_FILE}"
-[[ -f "${COMPOSE_SERVER}" ]] || die "找不到 Compose 覆盖文件：${COMPOSE_SERVER}"
-
-# 项目名：drill 专属 + 单调唯一；同时把 COMPOSE_PROJECT_NAME 固定为 drill 项目，
-# 从根上避免 base compose 中 ${COMPOSE_PROJECT_NAME}_* 的显式卷名落到主项目。
+# ---------------------------------------------------------------- 隔离演练：只创建 MySQL，不继承生产 Compose 的卷/网络/服务
+umask 077
+for cmd in docker openssl gzip python3 sha256sum; do
+    command -v "$cmd" >/dev/null || die "未找到 $cmd"
+done
+docker compose version >/dev/null
+for helper in check_drill_isolation.py check_drill_runtime.py check_drill_dump.py validate_drill_data.py; do
+    [[ -f "$SCRIPT_DIR/$helper" ]] || die "缺少 $helper"
+done
+[[ "$CENTER_DB_NAME" =~ ^[A-Za-z0-9_]+$ ]] || die "中心库名称不合法"
+[[ "$MAIN_PROJECT" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "主项目名称不合法"
+if [[ "$USE_LATEST" -eq 1 && -z "$BUNDLE" ]]; then
+    BUNDLE="$(python3 - "$BACKUP_ROOT" <<'PY'
+import pathlib,sys
+files=sorted(pathlib.Path(sys.argv[1]).glob("releases/*/bundle.tar.gz.enc"))
+print(files[-1] if files else "")
+PY
+)"
+fi
+[[ -f "$BUNDLE" ]] || die "请指定存在的 --bundle，或使用 --latest"
+[[ -r "$BACKUP_ENCRYPTION_KEY_FILE" ]] || die "备份加密密钥不可读"
+BUNDLE="$(realpath "$BUNDLE")"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 PROJECT="ventasync-drill-$(date -u +%Y%m%d%H%M%S)-$RANDOM"
-[[ "${PROJECT}" =~ ^ventasync-drill-[a-z0-9-]+$ ]] || die "生成的 drill 项目名不合法：${PROJECT}"
-[[ "${PROJECT}" != "${MAIN_PROJECT}" ]] || die "drill 项目名不能等于主项目名：${PROJECT}"
-# 供报告写入演练目标（drill-report.json 的 target 字段）
-export MAIN_PROJECT DRILL_PROJECT="${PROJECT}"
+[[ "$PROJECT" != "$MAIN_PROJECT" ]] || die "项目名冲突"
+WORK_DIR="$(mktemp -d "$BACKUP_ROOT/drill-$STAMP-XXXX")"
+CONFIG_JSON="$WORK_DIR/compose.json"
+REPORT_DIR="$BACKUP_ROOT/drill-reports/$PROJECT"
+REPORT="$REPORT_DIR/drill-report.json"
+MANIFEST="$WORK_DIR/bundle/manifest.json"
+CONTAINER_ID=""
+MAIN_CONTAINER_ID=""
+START_ATTEMPTED=0
+VALIDATION_RC=1
+RECORD_WRITTEN=false
+CLEANUP_STATUS=pending
+mkdir -p "$WORK_DIR/bundle" "$WORK_DIR/inventory" "$WORK_DIR/sql" "$REPORT_DIR"
+chmod 700 "$WORK_DIR" "$REPORT_DIR"
+: > "$WORK_DIR/imports.jsonl"
+export MAIN_PROJECT DRILL_PROJECT="$PROJECT"
 
 compose() {
-    COMPOSE_PROJECT_NAME="${PROJECT}" docker compose -p "${PROJECT}" \
-        -f "${COMPOSE_FILE}" -f "${COMPOSE_SERVER}" -f "${OVERRIDE_FILE}" "$@"
+    # 唯一配置为本次生成且已检查的文件；不重新读取生产 YAML/.env。
+    docker compose --project-directory "$WORK_DIR" -p "$PROJECT" -f "$CONFIG_JSON" "$@"
 }
-
-if [[ "${USE_LATEST}" -eq 1 && -z "${BUNDLE}" ]]; then
-    BUNDLE="$(ls -1dt "${BACKUP_ROOT}"/releases/*/bundle.tar.gz.enc 2>/dev/null | head -n1 || true)"
-    [[ -n "${BUNDLE}" ]] || die "未找到本地备份包：${BACKUP_ROOT}/releases/*/bundle.tar.gz.enc"
-fi
-[[ -n "${BUNDLE}" ]] || die "请用 --bundle 指定加密备份包，或使用 --latest / --self-test"
-[[ -f "${BUNDLE}" ]] || die "备份包不存在：${BUNDLE}"
-[[ -r "${BACKUP_ENCRYPTION_KEY_FILE}" ]] || die "备份加密密钥不可读：${BACKUP_ENCRYPTION_KEY_FILE}"
-
-WORK_DIR="$(mktemp -d "${BACKUP_ROOT}/drill-${STAMP}-XXXX" 2>/dev/null || mktemp -d)"
-chmod 700 "${WORK_DIR}"
-OVERRIDE_FILE="${WORK_DIR}/docker-compose.drill.yml"
-CONFIG_JSON="${WORK_DIR}/compose.resolved.json"
-REPORT="${WORK_DIR}/drill-report.json"
-mkdir -p "${WORK_DIR}/bundle"
-
+mysql_container_id() {
+    docker ps -aq --filter "label=com.docker.compose.project=$PROJECT" --filter label=com.docker.compose.service=mysql
+}
+mysql_query_at() {
+    local cid="$1" sql="$2"
+    docker exec "$cid" sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec mysql --protocol=TCP -h127.0.0.1 -P3306 --connect-timeout=5 --skip-reconnect -uroot --batch --raw --skip-column-names -e "$1"' sh "$sql"
+}
+mysql_query() { mysql_query_at "$CONTAINER_ID" "$1"; }
+quote_identifier() { printf '\140%s\140' "$1"; }
+validate_runtime() {
+    [[ -n "$CONTAINER_ID" && "$CONTAINER_ID" != *$'\n'* ]] || return 1
+    docker inspect "$CONTAINER_ID" > "$WORK_DIR/drill-container.json" || return 1
+    docker inspect "$MAIN_CONTAINER_ID" > "$WORK_DIR/main-container.json" || return 1
+    docker volume inspect "${PROJECT}_mysql_data" > "$WORK_DIR/drill-volume.json" || return 1
+    python3 "$SCRIPT_DIR/check_drill_runtime.py" --config "$CONFIG_JSON" \
+        --project "$PROJECT" --main-project "$MAIN_PROJECT" \
+        --container "$WORK_DIR/drill-container.json" --volume "$WORK_DIR/drill-volume.json" \
+        --main-container "$WORK_DIR/main-container.json" > "$WORK_DIR/isolation.json"
+}
+write_report() {
+    local exit_code="$1"
+    python3 - "$WORK_DIR" "$REPORT" "$BUNDLE" "$PROJECT" "$MAIN_PROJECT" "$exit_code" "$RECORD_WRITTEN" "$CLEANUP_STATUS" <<'PY'
+import hashlib,json,sys
+from pathlib import Path
+from datetime import datetime,timezone
+work,report,bundle,project,main,rc,recorded,cleanup_status=sys.argv[1:]
+work=Path(work)
+def load(name,default):
+    path=work/name
+    try:
+        return json.loads(path.read_text()) if path.is_file() else default
+    except (ValueError,OSError):
+        return default
+manifest=load("bundle/manifest.json",{})
+validation=load("validation.json",{"checks":[],"passed":False})
+imports=[json.loads(line) for line in (work/"imports.jsonl").read_text().splitlines() if line]
+checks=validation.get("checks",[])
+checks += [{"name":"import:"+i["database"],"ok":i["before"]==0 and i["after"]==i["expected"] and i["table_names_match"],"detail":i} for i in imports]
+isolation=load("isolation.json",{})
+checks.append({"name":"isolated_mysql_volume","ok":isolation.get("ok") is True})
+checks.append({"name":"all_archive_databases_imported","ok":bool(imports) and sorted(i["database"] for i in imports)==sorted(manifest.get("databases",[]))})
+checks.append({"name":"script_completed","ok":int(rc)==0})
+with open(bundle,"rb") as f: digest=hashlib.file_digest(f,"sha256").hexdigest()
+payload={"drill_at":datetime.now(timezone.utc).isoformat(),"run_id":manifest.get("run_id"),"bundle":bundle,
+ "bundle_sha256":digest,
+ "target":{**isolation,"project":project,"main_project":main,"readiness":"PID 1 mysqld + TCP SELECT 1 连续三次成功","schema_policy":"保留 dump 原 schema，仅写 drill 独立卷"},
+ "imports":imports,"checks":checks,"failed":sum(c.get("ok") is not True for c in checks),
+ "passed":bool(validation.get("passed")) and bool(checks) and all(c.get("ok") is True for c in checks),
+ "record_written":recorded=="true",
+ "cleanup_status":cleanup_status,
+ "scope":"数据库恢复、账号/权限/商品关联及配置解密；未启动业务服务，未做交互登录或云服务连通测试"}
+Path(report).write_text(json.dumps(payload,ensure_ascii=False,indent=2))
+print(json.dumps({"report":report,"passed":payload["passed"],"failed":payload["failed"]},ensure_ascii=False))
+PY
+}
 cleanup() {
-    # 只允许清理 drill 项目；任何情况下不触碰主项目；dry-run 不执行任何 docker 命令
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-        rm -rf "${WORK_DIR:-}" 2>/dev/null || true
-        return
+    local result=$? cleanup_ok=0
+    trap - EXIT
+    set +e
+    if [[ "$KEEP" -eq 1 && "$DRY_RUN" -ne 1 ]]; then
+        CLEANUP_STATUS=kept
+        log "保留 drill：project=$PROJECT work=$WORK_DIR"
+    elif [[ "$START_ATTEMPTED" -eq 1 ]]; then
+        if validate_runtime; then
+            compose down --volumes --timeout 10 && cleanup_ok=1
+        fi
+        if [[ "$cleanup_ok" -eq 1 ]]; then
+            CLEANUP_STATUS=removed
+        else
+            CLEANUP_STATUS=failed_or_refused
+            warn "自动清理未完成；保留本次 drill 现场 $WORK_DIR，不扩大删除范围"
+            result=1
+        fi
+    else
+        CLEANUP_STATUS=not_started
     fi
-    if [[ -z "${PROJECT}" || ! "${PROJECT}" =~ ^ventasync-drill- ]]; then
-        warn "项目名异常，跳过自动清理（请人工检查：${PROJECT:-<空>}）"
-        return
+    if [[ "$DRY_RUN" -ne 1 ]]; then
+        write_report "$result" || { warn "报告写入失败"; result=1; }
     fi
-    if [[ "${SAFETY_VERIFIED}" -ne 1 ]]; then
-        warn "安全断言未通过，跳过自动 docker 清理（只删除临时目录；请人工核对 drill 资源：project=${PROJECT}）"
-        rm -rf "${WORK_DIR:-}" 2>/dev/null || true
-        return
+    if [[ "$CLEANUP_STATUS" == removed || "$CLEANUP_STATUS" == not_started ]]; then
+        rm -rf -- "$WORK_DIR"
     fi
-    if [[ "${KEEP}" -eq 1 ]]; then
-        log "保留演练环境以便人工核查：project=${PROJECT} work=${WORK_DIR}"
-        return
-    fi
-    log "清理 drill 项目与临时卷：${PROJECT}"
-    # 再次固定 COMPOSE_PROJECT_NAME：避免 base compose 中 ${COMPOSE_PROJECT_NAME}_* 回退到主项目卷名
-    COMPOSE_PROJECT_NAME="${PROJECT}" docker compose -p "${PROJECT}" \
-        -f "${COMPOSE_FILE}" -f "${COMPOSE_SERVER}" -f "${OVERRIDE_FILE}" down -v --remove-orphans \
-        >/dev/null 2>&1 || true
-    rm -rf "${WORK_DIR}"
+    exit "$result"
 }
 trap cleanup EXIT
 
-# ---------------------------------------------------------------- 校验与解密
-log "1/7 校验加密包：${BUNDLE}"
-if [[ -f "${BUNDLE}.sha256" ]]; then
-    ( cd "$(dirname "${BUNDLE}")" && sha256sum -c "$(basename "${BUNDLE}").sha256" >/dev/null ) \
-        || die "加密包 SHA-256 校验失败"
+log "1/7 校验、解密备份包 $BUNDLE"
+if [[ -f "$BUNDLE.sha256" ]]; then
+    (cd "$(dirname "$BUNDLE")" && sha256sum -c "$(basename "$BUNDLE").sha256" >/dev/null) || die "加密包校验失败"
 fi
-log "2/7 解密并解包到隔离目录"
-openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "${BUNDLE}" -pass "file:${BACKUP_ENCRYPTION_KEY_FILE}" \
-    | tar -xzf - -C "${WORK_DIR}/bundle"
-MANIFEST="${WORK_DIR}/bundle/manifest.json"
-[[ -f "${MANIFEST}" ]] || die "备份包缺少 manifest.json"
-python3 - "${WORK_DIR}/bundle" "${MANIFEST}" <<'PY'
-import hashlib
-import json
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-manifest = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-problems = []
-for item in manifest.get("files", []):
-    path = root / item["path"]
+openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$BUNDLE" \
+    -out "$WORK_DIR/bundle.tar.gz" -pass "file:$BACKUP_ENCRYPTION_KEY_FILE"
+python3 - "$WORK_DIR/bundle.tar.gz" "$WORK_DIR/bundle" <<'PY'
+import hashlib,json,sys,tarfile
+from pathlib import Path,PurePosixPath
+root=Path(sys.argv[2]).resolve()
+with tarfile.open(sys.argv[1],"r:gz") as tar:
+    for item in tar.getmembers():
+        path=PurePosixPath(item.name)
+        if path.is_absolute() or ".." in path.parts or not (item.isfile() or item.isdir()):
+            raise SystemExit("备份包含不安全路径/链接")
+    tar.extractall(root)
+manifest=json.loads((root/"manifest.json").read_text())
+for item in manifest.get("files",[]):
+    path=(root/item["path"]).resolve()
+    if not path.is_relative_to(root): raise SystemExit("清单路径越界")
     if not path.is_file():
-        # 旧备份包可能没有写入空的跳过库清单，属可选元数据，不阻断恢复。
-        if Path(item["path"]).name == ".skipped_dbs":
-            continue
-        problems.append(f"缺少文件 {item['path']}")
-        continue
-    if path.name.endswith(".enc"):
-        continue
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    if item.get("sha256") and digest != item["sha256"]:
-        problems.append(f"校验值不一致 {item['path']}")
-if problems:
-    print("\n".join(problems))
-    sys.exit(1)
-print(json.dumps({"verified_files": len(manifest.get("files", []))}))
+        if path.name==".skipped_dbs": continue
+        raise SystemExit("清单文件缺失: "+item["path"])
+    if path.name.endswith(".enc"): continue
+    with open(path,"rb") as f: digest=hashlib.file_digest(f,"sha256").hexdigest()
+    if item.get("sha256") and digest!=item["sha256"]:
+        raise SystemExit("清单校验失败: "+item["path"])
+actual=sorted(p.name[:-7] for p in root.glob("*.sql.gz"))
+if not actual or actual!=sorted(manifest.get("databases",[])):
+    raise SystemExit("清单 databases 与归档 SQL 文件不一致")
+print(json.dumps({"run_id":manifest.get("run_id"),"databases":actual}))
 PY
 
-CENTER_SQL="$(ls "${WORK_DIR}/bundle/${CENTER_DB_NAME}.sql.gz" 2>/dev/null || true)"
-[[ -n "${CENTER_SQL}" ]] || die "备份包缺少中心库 ${CENTER_DB_NAME}.sql.gz"
-TENANT_SQLS=()
-while IFS= read -r sql; do
-    [[ "${sql}" == *"${CENTER_DB_NAME}"* ]] && continue
-    TENANT_SQLS+=("${sql}")
-done < <(ls -1 "${WORK_DIR}"/bundle/*.sql.gz 2>/dev/null || true)
+log "2/7 检查 dump 的 schema 声明和表清单"
+CENTER_SQL="$WORK_DIR/bundle/$CENTER_DB_NAME.sql.gz"
+[[ -f "$CENTER_SQL" ]] || die "缺少中心库 dump"
+SQLS=("$CENTER_SQL")
+for sql in "$WORK_DIR"/bundle/*.sql.gz; do
+    [[ "$sql" == "$CENTER_SQL" ]] || SQLS+=("$sql")
+done
+for sql in "${SQLS[@]}"; do
+    db="$(basename "$sql" .sql.gz)"
+    python3 "$SCRIPT_DIR/check_drill_dump.py" --file "$sql" --database "$db" \
+        --output "$WORK_DIR/inventory/$db.json" --sql-output "$WORK_DIR/sql/$db.sql"
+done
 
-# ---------------------------------------------------------------- 隔离安全断言（启动前）
-log "3/7 生成 drill 专用 compose 覆盖（独立项目 + 独立卷名 + 无端口发布）"
-cat > "${OVERRIDE_FILE}" <<YAML
-# 自动生成：仅用于 drill 项目 ${PROJECT}。所有命名卷都改为 ${PROJECT}_*，
-# 并清空端口发布、禁用业务服务；不得手工复用到主项目。
-services:
-  mysql:
-    ports: !reset []
-  redis-cache:
-    ports: !reset []
-  redis-queue:
-    ports: !reset []
-  api:
-    profiles: ["never"]
-  worker:
-    profiles: ["never"]
-  scheduler:
-    profiles: ["never"]
-  nginx:
-    profiles: ["never"]
-  caddy:
-    profiles: ["never"]
-  migrate:
-    profiles: ["never"]
-  registry:
-    profiles: ["never"]
-volumes:
-  mysql_data:
-    name: ${PROJECT}_mysql_data
-  redis_queue_data:
-    name: ${PROJECT}_redis_queue_data
-  catalog_media_data:
-    name: ${PROJECT}_catalog_media_data
-  registry_data:
-    name: ${PROJECT}_registry_data
-YAML
-
-log "   解析最终 compose 配置（不启动容器）"
-if ! compose config --format json > "${CONFIG_JSON}" 2>"${WORK_DIR}/compose-config.err"; then
-    die "docker compose config 失败：$(tail -n 3 "${WORK_DIR}/compose-config.err" | tr '\n' ' ')"
-fi
-if ! python3 "${SAFETY_CHECKER}" --project "${PROJECT}" --main-project "${MAIN_PROJECT}" --config "${CONFIG_JSON}"; then
-    die "隔离安全断言失败：拒绝启动（不会影响主项目）"
-fi
-SAFETY_VERIFIED=1
-python3 - "${CONFIG_JSON}" "${PROJECT}" <<'PY'
-import json
-import sys
-config = json.load(open(sys.argv[1], encoding="utf-8"))
-print("[drill] 演练项目：", sys.argv[2])
-for key, spec in sorted((config.get("volumes") or {}).items()):
-    print(f"[drill]   卷 {key} -> {spec.get('name')}")
-mysql = (config.get("services") or {}).get("mysql") or {}
-print("[drill]   mysql ports:", mysql.get("ports") or [])
+log "3/7 生成并冻结独立 MySQL 配置"
+MAIN_CONTAINER_ID="$(docker ps -q --filter "label=com.docker.compose.project=$MAIN_PROJECT" --filter label=com.docker.compose.service=mysql)"
+[[ -n "$MAIN_CONTAINER_ID" && "$MAIN_CONTAINER_ID" != *$'\n'* ]] || die "无法唯一定位主 MySQL，拒绝演练"
+docker inspect "$MAIN_CONTAINER_ID" > "$WORK_DIR/main-container.json"
+# 只借用本机已有 MySQL 镜像；密码随机生成，不复用生产密码。
+python3 - "$WORK_DIR/main-container.json" "$CONFIG_JSON" "$PROJECT" <<'PY'
+import json,secrets,sys
+from pathlib import Path
+main=json.loads(Path(sys.argv[1]).read_text())[0]
+project=sys.argv[3]
+config={"name":project,"services":{"mysql":{
+ "image":main["Image"],"pull_policy":"never","restart":"no","mem_limit":"768m",
+ "environment":{"MYSQL_ROOT_PASSWORD":secrets.token_hex(24)},
+ "command":["--character-set-server=utf8mb4","--collation-server=utf8mb4_unicode_ci","--innodb-buffer-pool-size=128M","--max-connections=30","--performance-schema=OFF"],
+ "healthcheck":{"disable":True},"ports":[],
+ "volumes":[{"type":"volume","source":"mysql_data","target":"/var/lib/mysql"}],
+ "networks":{"default":None}}},
+ "volumes":{"mysql_data":{"name":project+"_mysql_data"}},
+ "networks":{"default":{"name":project+"_default","internal":True}}}
+Path(sys.argv[2]).write_text(json.dumps(config))
 PY
-
-if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "dry-run：安全断言通过，未启动任何容器、未导入任何数据；退出"
+chmod 600 "$CONFIG_JSON"
+python3 "$SAFETY_CHECKER" --project "$PROJECT" --main-project "$MAIN_PROJECT" --config "$CONFIG_JSON"
+compose config --quiet
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "dry-run 通过：归档/schema/独立卷配置有效，未启动容器、未导入"
     exit 0
 fi
-
-# 交互确认：必须输入 drill 项目名（--yes 可跳过，仅限自动化/已复核场景）
-if [[ "${ASSUME_YES}" -ne 1 ]]; then
-    cat <<EOF
-
-[drill] 即将启动隔离演练：
-  项目     : ${PROJECT}
-  备份包   : ${BUNDLE}
-  主项目名 : ${MAIN_PROJECT}（本脚本不会对其执行任何 up/down/rm）
-  卷名     : 全部为 ${PROJECT}_*（已通过 compose config 断言）
-确认请输入项目名（${PROJECT}），其它输入将中止：
-EOF
+if [[ "$ASSUME_YES" -ne 1 ]]; then
+    printf '确认独立演练请输入项目名 %s：' "$PROJECT"
     read -r answer
-    [[ "${answer}" == "${PROJECT}" ]] || die "未确认，已中止（未启动任何容器）"
+    [[ "$answer" == "$PROJECT" ]] || die "已取消"
+fi
+[[ -z "$(mysql_container_id)" ]] || die "drill 项目已存在，拒绝复用"
+if docker volume inspect "${PROJECT}_mysql_data" >/dev/null 2>&1; then
+    die "drill 卷已存在，拒绝复用"
+fi
+if docker network inspect "${PROJECT}_default" >/dev/null 2>&1; then
+    die "drill 网络已存在，拒绝复用"
 fi
 
-# ---------------------------------------------------------------- 启动隔离 MySQL
-log "4/7 启动隔离 MySQL（project=${PROJECT}，独立卷，不暴露端口）"
-compose up -d --no-deps mysql
-
-mysql_container_id() { compose ps -q mysql 2>/dev/null || true; }
-
-print_mysql_diagnostics() {
-    local cid="$1"
-    warn "MySQL 未就绪/导入失败，输出容器状态与日志（drill 项目 ${PROJECT}，不影响主项目）"
-    if [[ -n "${cid}" ]]; then
-        docker inspect --format 'name={{.Name}} status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${cid}" >&2 || true
-        docker logs --tail 200 "${cid}" >&2 || true
-    else
-        warn "未找到 mysql 容器：project=${PROJECT}"
-        compose ps >&2 || true
-    fi
-}
-
-mysql_ping() {
-    compose exec -T mysql sh -c '
-        set -eu
-        export MYSQL_PWD="${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 未设置}"
-        exec mysqladmin ping -uroot --silent
-    ' >/dev/null 2>&1
-}
-
-mysql_select_one() {
-    local value
-    value="$(compose exec -T mysql sh -c '
-        set -eu
-        export MYSQL_PWD="${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 未设置}"
-        exec mysql -N -B -uroot -e "SELECT 1"
-    ' 2>/dev/null | tr -d "[:space:]" || true)"
-    [[ "${value}" == "1" ]]
-}
-
-# 就绪判定：mysqladmin ping + `SELECT 1` 双探针连续 3 次成功（间隔 2s），最多 120s；
-# 避免 MySQL 容器 entrypoint 的临时初始化实例刚可 ping 就导入导致 ERROR 2002。
 wait_for_mysql_ready() {
-    local deadline=$((SECONDS + 120)) ping_ok=0 select_ok=0 consecutive=0 cid=""
-    log "   等待 MySQL 就绪（双探针：mysqladmin ping + SELECT 1；最多 120s，连续 3 次成功）"
+    local deadline=$((SECONDS+180)) consecutive=0 value pid1
+    log "等待 PID 1 正式 mysqld + TCP 3306 SELECT 1（最多 180s，连续三次）"
     while (( SECONDS < deadline )); do
-        cid="$(mysql_container_id)"
-        if [[ -z "${cid}" ]]; then
-            sleep 2
-            continue
-        fi
-        if [[ "$(docker inspect --format '{{.State.Running}}' "${cid}" 2>/dev/null || echo false)" != "true" ]]; then
-            sleep 2
-            continue
-        fi
-        if mysql_ping; then ping_ok=1; else ping_ok=0; fi
-        if mysql_select_one; then select_ok=1; else select_ok=0; fi
-        if [[ "${ping_ok}" -eq 1 && "${select_ok}" -eq 1 ]]; then
-            consecutive=$((consecutive + 1))
-            if (( consecutive >= 3 )); then
-                log "   MySQL 就绪（双探针连续 ${consecutive} 次成功，耗时约 $((120 - (deadline - SECONDS)))s）"
-                return 0
-            fi
+        [[ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER_ID")" == true ]] || return 1
+        pid1="$(docker exec "$CONTAINER_ID" cat /proc/1/comm 2>/dev/null)" || pid1=""
+        value=""
+        if [[ "$pid1" == mysqld ]] && value="$(mysql_query 'SELECT 1' 2>/dev/null)" && [[ "$value" == 1 ]]; then
+            consecutive=$((consecutive+1))
         else
             consecutive=0
         fi
+        [[ "$consecutive" -lt 3 ]] || return 0
         sleep 2
     done
-    print_mysql_diagnostics "${cid}"
     return 1
 }
-
-wait_for_mysql_ready || die "隔离 MySQL 启动超时/未就绪（双探针未连续通过；见上方容器日志；仅 drill 项目受影响）"
-
-# 启动后再次校验：容器名与挂载卷必须属于 drill 项目
-CONTAINER_ID="$(mysql_container_id)"
-[[ -n "${CONTAINER_ID}" ]] || die "未找到 drill mysql 容器"
-CONTAINER_NAME="$(docker inspect --format '{{.Name}}' "${CONTAINER_ID}")"
-[[ "${CONTAINER_NAME}" == *"${PROJECT}"* ]] || die "异常：mysql 容器名 ${CONTAINER_NAME} 不属于 ${PROJECT}，立即中止"
-MOUNTED_VOLUMES="$(docker inspect --format '{{range .Mounts}}{{println .Name}}{{end}}' "${CONTAINER_ID}" | sed '/^$/d')"
-while IFS= read -r volume; do
-    [[ -z "${volume}" ]] && continue
-    if [[ "${volume}" != ${PROJECT}_* ]]; then
-        die "异常：mysql 挂载卷 ${volume} 不属于 ${PROJECT}，立即中止（不会清理主项目）"
-    fi
-done <<< "${MOUNTED_VOLUMES}"
-log "   容器 ${CONTAINER_NAME} 挂载卷：$(echo "${MOUNTED_VOLUMES}" | tr '\n' ' ')"
-
-mysql_import() {
-    local file="$1" db="$2"
-    # dump 由 --databases 生成时通常自带 CREATE DATABASE/USE；显式指定目标库并先建库，兼容不带 USE 的 dump。
-    gunzip -c "${file}" | compose exec -T -e MYSQL_DB="${db}" mysql sh -c '
-        set -eu
-        export MYSQL_PWD="${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 未设置}"
-        mysql -uroot -e "CREATE DATABASE IF NOT EXISTS \`${MYSQL_DB}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-        exec mysql -uroot "${MYSQL_DB}"
-    '
-}
-mysql_query() {
-    compose exec -T mysql sh -c '
-        set -eu
-        export MYSQL_PWD="${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 未设置}"
-        exec mysql -N -B -uroot -e "$1"
-    ' sh "$1"
-}
-mysql_exec_sql() {
-    compose exec -T mysql sh -c '
-        set -eu
-        export MYSQL_PWD="${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 未设置}"
-        exec mysql -N -B -uroot -e "$1"
-    ' sh "$1"
-}
 db_base_table_count() {
-    local db="$1"
     local value
-    value="$(mysql_query "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${db}' AND table_type='BASE TABLE'" 2>/dev/null | tr -d '[:space:]' || true)"
-    [[ "${value}" =~ ^[0-9]+$ ]] && echo "${value}" || echo 0
+    value="$(mysql_query "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$1' AND table_type='BASE TABLE'")" || return 1
+    [[ "$value" =~ ^[0-9]+$ ]] || { warn "表数查询返回非法结果"; return 1; }
+    printf '%s\n' "$value"
 }
-dump_table_count() {
-    local file="$1"
-    local count
-    count="$(gzip -dc "${file}" | grep -c 'CREATE TABLE' || true)"
-    [[ "${count}" =~ ^[0-9]+$ ]] && echo "${count}" || echo 0
-}
-
-# 导入前校验：datadir 必须是本 drill 项目的临时卷；MySQL 可写；目标库为全新临时库。
 validate_drill_datadir() {
-    local datadir mount_name read_only probe
-    datadir="$(mysql_query 'SELECT @@datadir' | tr -d '[:space:]')"
-    [[ -n "${datadir}" ]] || die "无法读取 drill MySQL @@datadir"
-    case "${datadir}" in
-        /var/lib/mysql|/var/lib/mysql/) ;;
-        *) die "drill MySQL datadir 异常：${datadir}（预期 /var/lib/mysql，禁止导入）" ;;
-    esac
-    mount_name="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/mysql"}}{{.Name}}{{end}}{{end}}' "${CONTAINER_ID}")"
-    [[ -n "${mount_name}" ]] || die "drill MySQL 未把命名卷挂载到 /var/lib/mysql，禁止导入"
-    [[ "${mount_name}" == ${PROJECT}_* ]] || die "drill MySQL datadir 卷 ${mount_name} 不属于 ${PROJECT}，禁止导入"
-    [[ "${mount_name}" != ${MAIN_PROJECT}_* ]] || die "drill MySQL datadir 卷 ${mount_name} 属于主项目 ${MAIN_PROJECT}，禁止导入"
-    read_only="$(mysql_query 'SELECT @@read_only' | tr -d '[:space:]')"
-    [[ "${read_only}" == "0" ]] || die "drill MySQL read_only=${read_only}，禁止导入"
-    probe="$(mysql_exec_sql 'CREATE TEMPORARY TABLE __drill_probe (id INT); DROP TEMPORARY TABLE __drill_probe; SELECT "ok";' | tr -d '[:space:]')"
-    [[ "${probe}" == "ok" ]] || die "drill MySQL 写入探针失败（临时表创建/删除异常），禁止导入"
-    DRILL_DATADIR="${datadir}"
-    DRILL_DATA_VOLUME="${mount_name}"
-    export DRILL_DATADIR DRILL_DATA_VOLUME
-    log "   导入前校验通过：datadir=${datadir}，卷=${mount_name}（drill 项目），read_only=0，可写探针 OK"
+    validate_runtime || die "运行时隔离校验未通过，禁止导入"
+    local datadir
+    datadir="$(mysql_query 'SELECT @@datadir')" || die "datadir 查询失败"
+    [[ "$datadir" == /var/lib/mysql/ || "$datadir" == /var/lib/mysql ]] || die "异常 datadir"
+    [[ "$(mysql_query 'SELECT @@read_only')" == 0 ]] || die "隔离 MySQL 不可写"
+    log "运行时隔离通过：$CONTAINER_ID / ${PROJECT}_mysql_data，与主 MySQL 数据目录不同"
 }
-
-# 目标库必须全新（drill 独立卷首次启动）：center 0 张表；租户库不存在或 0 张表。
 assert_target_databases_fresh() {
-    local existing
-    existing="$(db_base_table_count "${CENTER_DB_NAME}")"
-    [[ "${existing}" -eq 0 ]] || die "drill 中心库 ${CENTER_DB_NAME} 已有 ${existing} 张表，不是全新临时库，拒绝导入"
-    for sql in "${TENANT_SQLS[@]}"; do
-        db="$(basename "${sql}" .sql.gz)"
-        existing="$(db_base_table_count "${db}")"
-        [[ "${existing}" -eq 0 ]] || die "drill 租户库 ${db} 已有 ${existing} 张表，不是全新临时库，拒绝导入"
+    local sql db count
+    for sql in "${SQLS[@]}"; do
+        db="$(basename "$sql" .sql.gz)"
+        count="$(db_base_table_count "$db")" || die "$db 表数查询失败"
+        [[ "$count" == 0 ]] || die "$db 已有 $count 表，拒绝覆盖"
     done
-    log "   目标库为全新临时库（center/tenant 表数均为 0）"
 }
-
-# 逐库导入并立即核对表数：dump 中 CREATE TABLE 数量 == information_schema BASE TABLE 数量。
-declare -A EXPECTED_TABLES=()
-declare -A IMPORTED_TABLES=()
+mysql_import() {
+    local db="$1" local_sql="$WORK_DIR/sql/$1.sql" remote_sql="/tmp/restore-$1.sql" expected_hash actual_hash
+    expected_hash="$(sha256sum "$local_sql")"; expected_hash="${expected_hash%% *}"
+    docker cp "$local_sql" "$CONTAINER_ID:$remote_sql" || return 1
+    actual_hash="$(docker exec "$CONTAINER_ID" sha256sum "$remote_sql")" || return 1
+    [[ "${actual_hash%% *}" == "$expected_hash" ]] || { warn "容器内 SQL 校验值不一致"; return 1; }
+    mysql_query "CREATE DATABASE IF NOT EXISTS $(quote_identifier "$db") CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" || return 1
+    # 文件由容器内 shell 打开，SQL 不经过 SSH/stdin/docker exec -i 管道。
+    docker exec "$CONTAINER_ID" sh -c '
+        MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql --protocol=TCP -h127.0.0.1 -P3306 \
+          --connect-timeout=5 --skip-reconnect --binary-mode -uroot --batch --database="$1" < "$2"
+    ' sh "$db" "$remote_sql" || return 1
+    docker exec "$CONTAINER_ID" rm -f -- "$remote_sql"
+}
 import_and_verify() {
-    local sql="$1" db expected actual
-    db="$(basename "${sql}" .sql.gz)"
-    expected="${EXPECTED_TABLES[${db}]:-0}"
-    log "   导入 ${db}（预期表数 ${expected}）"
-    if ! mysql_import "${sql}" "${db}"; then
-        print_mysql_diagnostics "${CONTAINER_ID}"
-        die "导入 ${db} 失败（ERROR 2002/连接中断等；drill 项目隔离，主项目不受影响）"
-    fi
-    actual="$(db_base_table_count "${db}")"
-    IMPORTED_TABLES[${db}]="${actual}"
-    if [[ "${actual}" -ne "${expected}" ]]; then
-        print_mysql_diagnostics "${CONTAINER_ID}"
-        die "导入表数不一致：${db} 预期 ${expected}，实际 ${actual}（禁止继续；drill 项目隔离）"
-    fi
-    log "   ${db} 表数校验通过：${actual}"
+    local db="$1" before actual
+    before="$(db_base_table_count "$db")" || die "$db 导入前查询失败"
+    [[ "$before" == 0 ]] || die "$db 导入前非空"
+    log "导入 schema=$db，导入前表数=$before"
+    mysql_import "$db" || die "$db 文件导入失败（以 MySQL 实际错误为准）"
+    actual="$(db_base_table_count "$db")" || die "$db 导入后查询失败"
+    mysql_query "SELECT table_name FROM information_schema.tables WHERE table_schema='$db' AND table_type='BASE TABLE' ORDER BY table_name" > "$WORK_DIR/$db.actual-tables" || die "$db 表名查询失败"
+    python3 - "$WORK_DIR" "$db" "$before" "$actual" <<'PY'
+import json,sys
+from pathlib import Path
+root=Path(sys.argv[1]); db=sys.argv[2]
+inventory=json.loads((root/"inventory"/(db+".json")).read_text())
+actual_names=(root/(db+".actual-tables")).read_text().splitlines()
+item={"database":db,"before":int(sys.argv[3]),"after":int(sys.argv[4]),"expected":inventory["table_count"],
+ "table_names_match":sorted(actual_names)==sorted(inventory["table_names"]),
+ "schema_declarations":inventory["schema_declarations"],"sql_sha256":inventory["sql_sha256"]}
+with (root/"imports.jsonl").open("a") as out: out.write(json.dumps(item)+"\n")
+print(json.dumps(item,ensure_ascii=False))
+if item["before"]!=0 or item["expected"]<=0 or item["after"]!=item["expected"] or not item["table_names_match"]:
+    raise SystemExit("导入硬校验失败：表数/表名必须与 dump 完全一致")
+PY
 }
-
+log "4/7 启动隔离 MySQL（仅本次新卷，无端口发布）"
+START_ATTEMPTED=1
+compose up -d --no-deps mysql
+CONTAINER_ID="$(mysql_container_id)"
+validate_runtime || die "启动后隔离断言失败"
+wait_for_mysql_ready || { docker logs --tail 40 "$CONTAINER_ID" >&2; die "正式 MySQL TCP 认证未就绪"; }
 validate_drill_datadir
 assert_target_databases_fresh
-
-log "5/7 恢复中心库与租户库到 drill 临时卷（${#TENANT_SQLS[@]} 个租户库）"
-CENTER_EXPECTED="$(dump_table_count "${CENTER_SQL}")"
-EXPECTED_TABLES["${CENTER_DB_NAME}"]="${CENTER_EXPECTED}"
-[[ "${CENTER_EXPECTED}" -gt 0 ]] || die "中心库备份 ${CENTER_SQL} 未包含 CREATE TABLE，拒绝导入"
-for sql in "${TENANT_SQLS[@]}"; do
-    db="$(basename "${sql}" .sql.gz)"
-    EXPECTED_TABLES[${db}]="$(dump_table_count "${sql}")"
+log "5/7 文件导入与逐库硬校验"
+for sql in "${SQLS[@]}"; do
+    import_and_verify "$(basename "$sql" .sql.gz)"
 done
-import_and_verify "${CENTER_SQL}"
-for sql in "${TENANT_SQLS[@]}"; do
-    import_and_verify "${sql}"
-done
-log "   导入完成，表数汇总：center=${IMPORTED_TABLES[${CENTER_DB_NAME}]}，租户库=${#TENANT_SQLS[@]} 个，全部与备份包 CREATE TABLE 数一致"
+log "6/7 校验账号/权限/商品关联、配置解密和备份范围"
+if python3 "$SCRIPT_DIR/validate_drill_data.py" --container "$CONTAINER_ID" --center "$CENTER_DB_NAME" \
+    --manifest "$MANIFEST" --env-file "$WORK_DIR/bundle/config/.env" --output "$WORK_DIR/validation.json"; then
+    VALIDATION_RC=0
+else
+    VALIDATION_RC=1
+fi
+write_report "$VALIDATION_RC"
+[[ "$VALIDATION_RC" -eq 0 ]] || die "数据验证存在失败项，详见 $REPORT（不得标记 verified）"
 
-# ---------------------------------------------------------------- 关键数据校验
-log "6/7 校验账号、权限、商品、配置"
-echo '[]' > "${CONFIG_JSON}.checks.json"
-declare -a CHECK_NAMES=() CHECK_RESULTS=() CHECK_DETAILS=()
-add_check() { CHECK_NAMES+=("$1"); CHECK_RESULTS+=("$2"); CHECK_DETAILS+=("$3"); }
-
-q_int() {
-    local sql="$1"
-    local value
-    value="$(mysql_query "${sql}" 2>/dev/null | tr -d '[:space:]' || true)"
-    [[ "${value}" =~ ^[0-9]+$ ]] && echo "${value}" || echo 0
-}
-
-CENTER_USERS="$(q_int "SELECT COUNT(*) FROM ${CENTER_DB_NAME}.users")"
-CENTER_USERS_WITH_PASSWORD="$(q_int "SELECT COUNT(*) FROM ${CENTER_DB_NAME}.users WHERE password_hash IS NOT NULL AND password_hash <> ''")"
-CENTER_PLATFORM_ADMINS="$(q_int "SELECT COUNT(*) FROM ${CENTER_DB_NAME}.platform_user_roles")"
-CENTER_TENANTS="$(q_int "SELECT COUNT(*) FROM ${CENTER_DB_NAME}.tenants")"
-CENTER_MEMBERSHIPS="$(q_int "SELECT COUNT(*) FROM ${CENTER_DB_NAME}.tenant_memberships")"
-add_check "center_users" "$([[ "${CENTER_USERS}" -gt 0 ]] && echo true || echo false)" "users=${CENTER_USERS}"
-add_check "password_hashes" "$([[ "${CENTER_USERS_WITH_PASSWORD}" -gt 0 ]] && echo true || echo false)" "users_with_password=${CENTER_USERS_WITH_PASSWORD}"
-add_check "platform_admins" "$([[ "${CENTER_PLATFORM_ADMINS}" -gt 0 ]] && echo true || echo false)" "platform_user_roles=${CENTER_PLATFORM_ADMINS}"
-add_check "tenants" "$([[ "${CENTER_TENANTS}" -gt 0 ]] && echo true || echo false)" "tenants=${CENTER_TENANTS}"
-add_check "memberships" "$([[ "${CENTER_MEMBERSHIPS}" -gt 0 ]] && echo true || echo false)" "memberships=${CENTER_MEMBERSHIPS}"
-
-for sql in "${TENANT_SQLS[@]}"; do
-    db="$(basename "${sql}" .sql.gz)"
-    roles="$(q_int "SELECT COUNT(*) FROM \`${db}\`.roles")"
-    permissions="$(q_int "SELECT COUNT(*) FROM \`${db}\`.role_permissions")"
-    settings="$(q_int "SELECT COUNT(*) FROM \`${db}\`.tenant_settings")"
-    products="$(q_int "SELECT COUNT(*) FROM \`${db}\`.products")"
-    skus="$(q_int "SELECT COUNT(*) FROM \`${db}\`.product_skus")"
-    add_check "tenant_roles:${db}" "$([[ "${roles}" -gt 0 ]] && echo true || echo false)" "roles=${roles}"
-    add_check "tenant_permissions:${db}" "$([[ "${permissions}" -gt 0 ]] && echo true || echo false)" "role_permissions=${permissions}"
-    add_check "tenant_settings:${db}" "$([[ "${settings}" -gt 0 ]] && echo true || echo false)" "tenant_settings=${settings}"
-    add_check "tenant_products:${db}" "true" "products=${products}, skus=${skus}"
-done
-
-CONFIG_ENV="${WORK_DIR}/bundle/config/.env"
-CONFIG_OK=false
-if [[ -f "${CONFIG_ENV}" ]]; then
-    if grep -q '^MYSQL_ROOT_PASSWORD=' "${CONFIG_ENV}" && grep -q '^APP_IMAGE_TAG=' "${CONFIG_ENV}"; then
-        CONFIG_OK=true
+# 显式请求回写时，ID、run_id、加密包校验值必须同时匹配。
+if [[ -n "$RECORD_ID" || "$RECORD_LATEST" -eq 1 ]]; then
+    [[ "$BACKUP_RECORD" == 1 ]] || die "BACKUP_RECORD 禁止回写"
+    run_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$MANIFEST")"
+    [[ "$run_id" =~ ^[A-Za-z0-9_-]+$ ]] || die "run_id 不合法"
+    digest="$(sha256sum "$BUNDLE")"; digest="${digest%% *}"
+    record_filter="JSON_UNQUOTE(JSON_EXTRACT(manifest_json,'$.run_id'))='$run_id' AND checksum='sha256:$digest'"
+    if [[ -n "$RECORD_ID" ]]; then
+        [[ "$RECORD_ID" =~ ^[1-9][0-9]*$ ]] || die "record-id 不合法"
+        record_filter="$record_filter AND id=$RECORD_ID"
     fi
+    record_target="$(mysql_query_at "$MAIN_CONTAINER_ID" "SELECT id FROM $(quote_identifier "$CENTER_DB_NAME").backup_records WHERE $record_filter")"
+    [[ "$record_target" =~ ^[1-9][0-9]*$ ]] || die "未找到唯一匹配本次 run_id/校验值的备份记录；未回写"
+    api_id="$(docker ps -q --filter "label=com.docker.compose.project=$MAIN_PROJECT" --filter label=com.docker.compose.service=api)"
+    [[ -n "$api_id" && "$api_id" != *$'\n'* ]] || die "无法唯一定位用于回写的主 API"
+    restore_json="$(python3 -c 'import json,sys; print(json.dumps({"backup_id":int(sys.argv[1]),"status":"verified","notes":"隔离恢复硬校验及数据关联/配置解密全部通过；报告 "+sys.argv[2]}))' "$record_target" "$REPORT")"
+    docker exec -e BACKUP_RESTORE_JSON="$restore_json" "$api_id" python -m app.modules.ops.backup_cli restore-check > "$WORK_DIR/record-result.json" || die "回写失败，恢复报告保留"
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("ok") is True and d.get("backup",{}).get("restore_status")=="verified" else 1)' "$WORK_DIR/record-result.json" || die "回写未返回 verified"
+    RECORD_WRITTEN=true
 fi
-add_check "config_usable" "${CONFIG_OK}" "config/.env 关键项"
-
-IMPORT_SUMMARY="center=${IMPORTED_TABLES[${CENTER_DB_NAME}]}"
-for sql in "${TENANT_SQLS[@]}"; do
-    db="$(basename "${sql}" .sql.gz)"
-    IMPORT_SUMMARY="${IMPORT_SUMMARY}, ${db}=${IMPORTED_TABLES[${db}]}"
-done
-add_check "import_table_counts" "true" "${IMPORT_SUMMARY}（与备份包 CREATE TABLE 数一致）"
-
-FAILED=0
-for i in "${!CHECK_NAMES[@]}"; do
-    if [[ "${CHECK_RESULTS[$i]}" != "true" ]]; then
-        FAILED=$((FAILED + 1))
-    fi
-done
-
-python3 - "${REPORT}" "${WORK_DIR}/bundle/manifest.json" "${CHECK_NAMES[@]}" -- "${CHECK_RESULTS[@]}" -- "${CHECK_DETAILS[@]}" <<'PY'
-import json
-import os
-import sys
-from datetime import datetime, timezone
-
-args = sys.argv[1:]
-report_path, manifest_path = args[0], args[1]
-rest = args[2:]
-sep1 = rest.index("--")
-names = rest[:sep1]
-rest = rest[sep1 + 1:]
-sep2 = rest.index("--")
-results = rest[:sep2]
-details = rest[sep2 + 1:]
-manifest = {}
-try:
-    manifest = json.loads(open(manifest_path, encoding="utf-8").read())
-except OSError:
-    pass
-checks = [
-    {"name": names[i], "ok": results[i] == "true", "detail": details[i]}
-    for i in range(len(names))
-]
-payload = {
-    "drill_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    "run_id": manifest.get("run_id", ""),
-    "trigger": manifest.get("trigger", ""),
-    "target": {
-        "project": os.environ.get("DRILL_PROJECT", ""),
-        "datadir": os.environ.get("DRILL_DATADIR", ""),
-        "data_volume": os.environ.get("DRILL_DATA_VOLUME", ""),
-        "main_project": os.environ.get("MAIN_PROJECT", ""),
-        "readiness": "mysqladmin ping + SELECT 1 连续 3 次成功（<=120s）",
-    },
-    "checks": checks,
-    "failed": sum(1 for item in checks if not item["ok"]),
-    # 只有全部检查（含导入表数与备份包一致）通过，才允许 passed=true
-    "passed": all(item["ok"] for item in checks),
-}
-open(report_path, "w", encoding="utf-8").write(json.dumps(payload, ensure_ascii=False, indent=2))
-print(json.dumps({"checks": len(checks), "failed": payload["failed"], "passed": payload["passed"]}))
-PY
-
-log "7/7 演练报告：${REPORT}"
-cat "${REPORT}"
-
-# ---------------------------------------------------------------- 回写中心库
-RECORD_TARGET="${RECORD_ID}"
-if [[ -z "${RECORD_TARGET}" && "${RECORD_LATEST}" -eq 1 ]]; then
-    LATEST_OUTPUT="$(compose exec -T -e BACKUP_INSTANCE_ID="${BACKUP_INSTANCE_ID}" \
-        api python -m app.modules.ops.backup_cli latest 2>/dev/null || true)"
-    RECORD_TARGET="$(printf '%s' "${LATEST_OUTPUT}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("backup",{}).get("id",""))' 2>/dev/null || true)"
-fi
-RESULT_STATUS="$(python3 -c 'import json,sys; print("verified" if json.load(open(sys.argv[1])).get("passed") else "failed")' "${REPORT}")"
-if [[ -n "${RECORD_TARGET}" && "${RECORD}" -eq 1 ]]; then
-    log "回写中心库 backup_records id=${RECORD_TARGET} status=${RESULT_STATUS}"
-    RESTORE_JSON="$(python3 - "${RECORD_TARGET}" "${RESULT_STATUS}" "${REPORT}" <<'PY'
-import json
-import sys
-backup_id, status, report_path = sys.argv[1], sys.argv[2], sys.argv[3]
-report = json.load(open(report_path, encoding="utf-8"))
-failed = [item["name"] for item in report.get("checks", []) if not item["ok"]]
-notes = f"隔离演练（drill 临时卷）{status}，检查 {len(report.get('checks', []))} 项"
-if failed:
-    notes += "；失败项：" + "、".join(failed[:5])
-print(json.dumps({"backup_id": int(backup_id), "status": status, "notes": notes}, ensure_ascii=False))
-PY
-)"
-    compose exec -T -e BACKUP_RESTORE_JSON="${RESTORE_JSON}" \
-        api python -m app.modules.ops.backup_cli restore-check || warn "回写中心库失败（演练结果仍在本地报告）"
-fi
-
-if [[ "${RESULT_STATUS}" == "verified" ]]; then
-    log "隔离恢复演练通过：账号/权限/商品/配置检查全部通过（drill 项目 ${PROJECT}）"
-    exit 0
-fi
-warn "隔离恢复演练存在失败项，请检查 ${REPORT}"
-exit 1
+log "7/7 隔离恢复验证通过；报告将保留在 $REPORT"

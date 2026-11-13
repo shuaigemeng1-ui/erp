@@ -3,7 +3,7 @@
 - 日期：2026-11-13
 - 环境：租户服务器 `8.163.80.17`，Compose 项目 `ventasync`
 - 严重级别：高（主租户中心库表被清空、主业务容器停止）
-- 状态：主租户运营已恢复；批次3「恢复演练」验收暂时不通过，待修复后在隔离临时卷上安全重跑
+- 当前状态（2026-11-13 17:30 CST）：隔离导入已修复，修正配置的恢复候选包通过 28 项检查。两个原始包仍不能标记 verified；生产仅中心库存在，详见第 8 节。
 - 关联：批次3 task-31（备份加密异地与恢复演练），脚本 `deploy/scripts/restore_drill.sh`
 
 ## 1. 事件经过
@@ -141,7 +141,7 @@ sudo -u erp-agent-exec bash deploy/scripts/restore_drill.sh --latest --dry-run
 sudo -u erp-agent-exec bash deploy/scripts/restore_drill.sh --latest --yes
 
 # 2) 证据
-cat /var/lib/ventasync-backups/drill-*/drill-report.json | tail -n 40
+cat /var/lib/ventasync-backups/drill-reports/*/drill-report.json | tail -n 40
 docker volume ls | grep ventasync-drill      # 演练结束后应已被清理（--keep 时保留）
 docker ps -a | grep ventasync-drill          # 应为空
 ```
@@ -161,3 +161,61 @@ docker ps -a | grep ventasync-drill          # 应为空
 - [ ] 8.163.80.17 临时卷 actual 演练通过：`drill-report.json` passed=true、`import_table_counts` 一致，
       主卷 CreatedAt/Mountpoint 不变、主容器/center 30 表不变、无 drill 残留
 - [ ] Lead 批准后中心库 `backup_records.restore_status=verified` 写入
+
+## 8. 文件导入修复及实际演练结果（2026-11-13 17:30 CST）
+
+第 5–7 节是此前修复过程记录；当前实现与证据以本节为准。
+
+### 根因与修复
+
+- 中心库 dump 第 22 行含 CREATE DATABASE ventasync_center，第 24 行含 USE ventasync_center，会覆盖前置 USE drilltest。
+- actual20.log / actual21.log 第 36 行真实错误为 Unknown command '\`'，由拼接 USE 时多余的反斜杠导致。末尾 ERROR 2002 是旧脚本固定提示，不能作为这两次执行的真实错误。
+- 保留 dump 原 schema；仅在独立 MySQL 中导入。docker cp SQL 后验证 SHA-256，由容器内 shell 文件重定向导入，不再通过 docker exec -i 管道。
+- 就绪要求 PID 1 mysqld 和 TCP 127.0.0.1:3306 认证 SELECT 1 连续三次成功。查询失败直接失败，表数和表名都必须与备份匹配。
+
+### 实际结果
+
+| 备份/候选包 | 实际 schema | 导入前 → 后 | 整体结果 |
+| --- | --- | --- | --- |
+| releases/20261113T075459Z | ventasync_center | 0 → 30 | failed：缺少活跃租户业务库 |
+| releases/20261113T075322Z | ventasync_center / vs_tenant_kangkang_shop | 0 → 30 / 0 → 34 | failed：归档 TENANT_ID=1，数据 tenant_id=3 |
+| recovery-candidates/20261113T075322Z-tenant3 | 同上 | 0 → 30 / 0 → 34 | passed=true，28 项通过，退出码 0 |
+
+候选包由 075322 原完整包派生：仅将归档 config/.env 的 TENANT_ID 从 1 改为 3，并重算清单与加密包校验值；manifest 记录 recovery_source_run_id、recovery_adjustments 和独立 run_id。原始包未修改，原始备份记录未标记 verified。
+
+已验证：负责人访问权限 1 条、设置 1 条、SPU 1 条、SKU 1 条、标识/别名 1 条；角色/权限范围、SKU/SPU、标识/SKU 无孤儿关联；3 项加密凭据可用归档密钥解密。范围是数据关联、配置结构与解密，未启动业务服务、未做交互登录或对象存储连通测试。
+
+服务器持久报告：
+
+- 原指定包：`/var/lib/ventasync-backups/drill-reports/ventasync-drill-20261113092433-2202/drill-report.json`
+- 原完整包最终复验：`/var/lib/ventasync-backups/drill-reports/ventasync-drill-20261113092746-32686/drill-report.json`
+- 修正配置候选包：`/var/lib/ventasync-backups/drill-reports/ventasync-drill-20261113092953-30453/drill-report.json`
+
+### 复现
+
+在 8.163.80.17 执行下列命令，只创建新的隔离 MySQL，结束后清理该次容器、卷、网络，报告保留。可先把 --yes 替换为 --dry-run。
+
+```bash
+bash /opt/ventasync/deploy/scripts/restore_drill.sh \
+  --bundle /var/lib/ventasync-backups/recovery-candidates/20261113T075322Z-tenant3/bundle.tar.gz.enc \
+  --yes
+```
+
+预期：center before=0/after=30，tenant before=0/after=34，passed=true、failed=0、cleanup_status=removed，退出码 0。
+
+若改用最初的 releases/20261113T075459Z 包，中心库恢复 0→30，但整体必须 passed=false、退出码 1，因为缺少 vs_tenant_kangkang_shop。
+
+### 隔离与生产现状
+
+演练仅使用独立 ventasync-drill-* 项目、随机密码、内部网络、无端口发布及单一新卷。启动和清理使用同一份冻结 Compose JSON，核对容器/卷标签、local driver、无 driver_opts、实际 Source 与生产不同。不会挂载或删除生产 ventasync_mysql_data。
+
+演练前后生产 MySQL 容器 768236ec8d44、启动时间 2026-11-13T07:54:07.132670906Z、卷 ventasync_mysql_data、目录 /var/lib/docker/volumes/ventasync_mysql_data/_data、中心库 30 表、账号 1 条、成员 1 条一致。本轮未重启生产服务或导入生产数据。演练资源均已清理，租户首页及 healthz 返回 HTTP 200。
+
+生产当前仅有 ventasync_center，但路由仍指向 mysql:3306/vs_tenant_kangkang_shop；API 实际 TENANT_ID=1，中心库租户 ID=3。这些在本轮开始时已存在，HTTP 200 不能证明商品业务正常。后续需单独恢复生产业务库并修正绑定，再完善备份覆盖检查。本轮只修正隔离候选配置，未触碰主 MySQL 卷。
+
+### 验证与部署
+
+- Linux 服务器 --self-test、原始包及候选包 --dry-run 通过。
+- 21 项针对性回归通过：dump/schema、卷隔离、查询失败、孤儿关联、合法空商品、密钥算法、绑定冲突。
+- npm run build 通过，构建输出到仓库外临时目录；未启动本地前后端。
+- 仅部署恢复脚本及 helper；未发布其它 agent 的 gateway/onboarding 应用变更，未执行生产 Compose up/down。

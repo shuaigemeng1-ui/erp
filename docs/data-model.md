@@ -136,7 +136,7 @@
 | 中心库 | `alembic/center/versions/0013_center_ops_cert.py` | center_0013 | 公网探测记录增加 HTTPS 证书剩余天数字段；无外键。 |
 | 中心库 | `alembic/center/versions/0014_center_ops_metrics_agg.py` | center_0014 | 节点指标 5 分钟/小时聚合表（bucket_start、样本数与 CPU/内存/负载/磁盘统计）；无外键。 |
 | 中心库 | `alembic/center/versions/0015_center_server_ssh.py` | center_0015 | 服务器节点 SSH 主机/端口及用户名、密码密文字段；无外键。 |
-| 中心库 | `alembic/center/versions/0016_center_release_upgrade.py` | center_0016 | 批次 1：发布版本清单与升级校验字段（完整 commit、构建配置摘要、最低 Agent 协议、center/tenant DB 目标版本、回退兼容、构建状态），实例/节点实际版本与升级状态，任务执行批次/租约/心跳/事件水位/升级检查结果；全部新增列可空或带默认值，无外键。center_0016 随批次 1 发布生效。 |
+| 中心库 | `alembic/center/versions/0016_center_release_upgrade.py` | center_0016 | 批次 1：发布版本清单与升级校验字段（完整 commit、构建配置摘要、最低 Agent 协议、center/tenant DB 目标版本、回退兼容、构建状态），实例/节点实际版本与升级状态，任务执行批次/租约/心跳/事件水位/升级检查结果；全部新增列可空或带默认值，无外键。 |
 | 租户库 | `alembic/tenant/versions/0001_tenant_identity.py` | tenant_0001 | 租户库基线：角色、权限、绑定范围、租户设置、功能开关、审计与支撑表（tenant_0001）。 |
 | 租户库 | `alembic/tenant/versions/0002_tenant_catalog.py` | tenant_0002 | 租户库：商品、SKU、图片、库存地点、库存余额、库存流水。 |
 | 租户库 | `alembic/tenant/versions/0003_tenant_channels.py` | tenant_0003 | 租户库迁移：店铺、店铺凭据、平台商品与 SKU 映射。 |
@@ -152,7 +152,7 @@
 | 租户库 | `alembic/tenant/versions/0013_tenant_supplier_contacts.py` | tenant_0013 | 供应商增加选填联系人、联系方式和备注，保留原供应商及商品关联，无外键。 |
 | 租户库 | `alembic/tenant/versions/0014_tenant_local_users.py` | tenant_0014 | 租户本机账号表（独立实例模式本地登录）：来源中心用户ID、邮箱、密码哈希、成员编号、负责人标记与同步时间；唯一(tenant_id,email)、(tenant_id,source_user_id)，无外键。 |
 
-模型业务表：中心库 29 张、租户库 33 张（均不计 Alembic 版本表），完整版本图共 30 个迁移文件（center 16 + tenant 14）。当前末端为中心库 `center_0016`（批次 1 发布后生效）、租户库 `tenant_0014`。
+模型业务表：中心库 29 张、租户库 33 张（均不计 Alembic 版本表），完整版本图共 30 个迁移文件（center 16 + tenant 14）。当前末端为中心库 `center_0016`、租户库 `tenant_0014`。
 
 追加型表例外：`node_metric_samples`、`node_checks`、`operation_job_steps`、`backup_records`、`node_metric_aggregates` 按文首“约定”不要求完整三时间列，以 `sampled_at`/`checked_at`/`started_at`/`bucket_start` 等业务时间字段作为追加时间；其余业务表仍必须包含 `id`、`created_at`、`updated_at`。
 

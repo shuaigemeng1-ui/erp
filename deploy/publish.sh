@@ -18,10 +18,7 @@ docker compose -f docker-compose.yml -f docker-compose.server.yml --env-file .en
 # 兼容 compose 构建时未带前缀的镜像标签
 docker tag "ventasync-backend:${VERSION}" "${IMAGE_PREFIX}ventasync-backend:${VERSION}" 2>/dev/null || true
 docker tag "ventasync-frontend:${VERSION}" "${IMAGE_PREFIX}ventasync-frontend:${VERSION}" 2>/dev/null || true
-# 生成租户可下载的离线镜像包；Agent 下载后 docker load。
-mkdir -p releases
-docker save "${IMAGE_PREFIX}ventasync-backend:${VERSION}" "${IMAGE_PREFIX}ventasync-frontend:${VERSION}" | gzip > "releases/${VERSION}.tar.gz"
-echo "==> 离线镜像包：deploy/releases/${VERSION}.tar.gz ($(du -h "releases/${VERSION}.tar.gz" | cut -f1))"
+# 租户升级由 Agent 在租户服务器 git pull + docker compose build，无需分发镜像包。
 
 # 持久化中心版本与镜像仓库前缀
 python3 - "$VERSION" "$IMAGE_PREFIX" <<'PY'

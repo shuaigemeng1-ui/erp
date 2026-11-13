@@ -39,7 +39,8 @@ def redact(text: str) -> str:
     value = text or ""
     for pattern in SECRET_PATTERNS:
         value = pattern.sub(lambda m: f"{m.group(1)}=***", value)
-    return value[-4000:]
+    # 保留完整 JSON 输出供 readiness 解析；日志落库时另行截断。
+    return value[-50000:]
 
 
 class CommandRunner(Protocol):
@@ -287,28 +288,62 @@ class Executor:
             return {"ok": False, "exit_code": code, "output": output, "error": "build_failed"}
 
         report(4, "构建镜像", "succeeded", "")
-        report(5, "启动服务", "running", f"版本={target_version}")
+        report(5, "执行数据库迁移", "running", "迁移必须在启动新应用前完成")
+        migrate_code, migrate_output = self._run(
+            [*compose, "--profile", "release", "run", "--rm", "migrate"],
+            version_dir,
+            phase="upgrade:migrate",
+            recorder=record,
+            timeout=1800,
+            env=env,
+        )
+        if migrate_code != 0:
+            report(5, "执行数据库迁移", "failed", migrate_output)
+            return {
+                "ok": False,
+                "exit_code": migrate_code,
+                "output": (output + "\n" + migrate_output)[-6000:],
+                "error": "migration_failed",
+            }
+        report(5, "执行数据库迁移", "succeeded", "")
+        report(6, "启动服务", "running", f"版本={target_version}")
         code, output2 = self._run(
             [*compose, "up", "-d", "--remove-orphans"], version_dir,
             phase="upgrade:up", recorder=record, timeout=1800, env=env,
         )
         combined = (output + "\n" + output2)[-6000:]
         if code != 0:
-            report(5, "启动服务", "failed", output2)
+            report(6, "启动服务", "failed", output2)
             return {"ok": False, "exit_code": code, "output": combined, "error": "up_failed"}
+        report(6, "启动服务", "succeeded", "")
 
-        report(6, "服务就绪校验", "running", "等待 api/nginx 进入 running")
+        report(7, "服务就绪校验", "running", "等待 api/nginx 进入 running")
         ready, ps_output = versions.wait_services_ready(
             self.runner, compose, timeout_seconds=180, sleep=sleep, clock=clock
         )
         if not ready:
-            report(6, "服务就绪校验", "failed", ps_output[-1000:])
+            report(7, "服务就绪校验", "failed", ps_output[-1000:])
             return {
                 "ok": False,
                 "output": (combined + "\n" + ps_output)[-6000:],
                 "error": "readiness_failed",
             }
-        report(6, "服务就绪校验", "succeeded", "")
+        report(7, "服务就绪校验", "succeeded", "")
+
+        runtime_ok, runtime_output = self._check_runtime(compose, version_dir, record)
+        if not runtime_ok:
+            report(8, "业务只读检查", "failed", runtime_output[-1000:])
+            return {
+                "ok": False,
+                "output": (combined + "\n" + runtime_output)[-6000:],
+                "error": "business_readonly_failed",
+                "checks": {
+                    "db_version": {"ok": True, "value": str(payload.get("tenant_db_version") or "")},
+                    "readiness": {"ok": True, "value": "api/nginx"},
+                    "business_readonly": {"ok": False, "value": runtime_output[-200:]},
+                },
+            }
+        report(8, "业务只读检查", "succeeded", "")
 
         env_file = Path(str(config.get("deploy_dir") or "/opt/ventasync/deploy")) / str(
             config.get("env_file") or ".env"
@@ -318,7 +353,7 @@ class Executor:
         except OSError:
             pass
         previous = versions.switch_current(config, version_dir, commit)
-        report(7, "切换当前版本", "succeeded", f"{previous or '(无)'} → {commit}")
+        report(9, "切换当前版本", "succeeded", f"{previous or '(无)'} → {commit}")
         return {
             "ok": True,
             "exit_code": 0,
@@ -327,13 +362,48 @@ class Executor:
             "target_version": target_version,
             "version_dir": str(version_dir),
             "previous_commit": previous,
-            "db_version": str(payload.get("db_version") or ""),
+            "db_version": str(payload.get("tenant_db_version") or payload.get("db_version") or ""),
             "checks": {
+                "db_version": {
+                    "ok": True,
+                    "value": str(payload.get("tenant_db_version") or ""),
+                },
+                "readiness": {"ok": True, "value": "api/nginx"},
+                "business_readonly": {"ok": True, "value": "/api/v1/runtime"},
                 "commit_verified": True,
                 "build": "succeeded",
                 "services_ready": "succeeded",
             },
         }
+
+    def _check_runtime(
+        self, compose: list[str], cwd: str | Path, record
+    ) -> tuple[bool, str]:
+        """在 api 容器内执行只读探针：readyz + 业务 runtime。"""
+        script = (
+            "import json,urllib.request;"
+            "r=json.load(urllib.request.urlopen('http://127.0.0.1:8000/readyz',timeout=5));"
+            "a=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/v1/runtime',timeout=5));"
+            "print(json.dumps({'ready':r,'app':a}))"
+        )
+        code, output = self._run(
+            [*compose, "exec", "-T", "api", "python", "-c", script],
+            cwd,
+            phase="upgrade:runtime_check",
+            recorder=record,
+            timeout=60,
+        )
+        if code != 0:
+            return False, output
+        try:
+            line = [item for item in output.splitlines() if item.strip().startswith("{")][-1]
+            payload = __import__("json").loads(line)
+            ready = payload.get("ready") or {}
+            app = payload.get("app") or {}
+            return bool(ready.get("status") == "ready" and app.get("ok")), output
+        except Exception:
+            return False, output
+
 
 
 _DEFAULT = Executor()

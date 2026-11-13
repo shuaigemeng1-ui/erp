@@ -106,7 +106,9 @@ fi
 chown root:"$SHARED_GROUP" "$CONFIG"
 chmod 640 "$CONFIG"
 chown -R "$COLLECTOR_USER":"$SHARED_GROUP" "$STATE_DIR"
+install -d -m 700 -o "$EXECUTOR_USER" -g "$SHARED_GROUP" "$STATE_DIR/.docker"
 chmod 2770 "$STATE_DIR"
+chmod 660 "$STATE_DIR"/*.db "$STATE_DIR"/*.db-* 2>/dev/null || true
 
 # ------------------------------------------------------------------ systemd
 # 旧版单 unit 安装先停掉，避免两个采集进程同时上报。
@@ -144,6 +146,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=HOME=/var/lib/erp-agent
+Environment=DOCKER_CONFIG=/var/lib/erp-agent/.docker
 ExecStart=/usr/bin/python3 /opt/erp-agent/current/erp_agent.py executor --config /etc/erp-agent/config.json
 Restart=always
 RestartSec=5

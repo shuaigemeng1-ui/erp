@@ -1385,11 +1385,17 @@ def create_operation(center, instance_id: int, payload, *, actor_user_id: int) -
     if running is not None:
         raise ConflictError("该实例已有未完成运维任务，请等待完成")
     now = _now()
+    job_payload = dict(payload.payload or {})
+    if is_upgrade and release is not None:
+        # Agent 2 只接受完整 commit；创建任务时由中心从发布清单注入，避免客户端伪造。
+        job_payload["commit"] = release.commit_sha
+        job_payload["target_version"] = target_version
+        job_payload["tenant_db_version"] = release.tenant_db_version
     row = OperationJob(
         instance_id=instance.id, node_id=node.id, job_type=payload.job_type,
         status="pending", idempotency_key=key, target_version=target_version,
         upgrade_status="pending" if is_upgrade else "",
-        payload_json=payload.payload, requested_by=actor_user_id,
+        payload_json=job_payload, requested_by=actor_user_id,
         created_at=now, updated_at=now,
     )
     if is_upgrade:

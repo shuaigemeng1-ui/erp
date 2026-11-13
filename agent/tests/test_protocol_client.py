@@ -378,6 +378,8 @@ def test_executor_upgrade_uses_version_dir_not_reset(tmp_path: Path) -> None:
                 return 0, ""
             if command[:2] == ["docker", "compose"] and "ps" in command:
                 return 0, json.dumps([{"Service": "api", "State": "running"}, {"Service": "nginx", "State": "running"}])
+            if "readyz" in joined:
+                return 0, '{"ready":{"status":"ready"},"app":{"ok":true}}'
             return 0, ""
 
     result = executor.execute(
@@ -395,3 +397,18 @@ def test_executor_upgrade_uses_version_dir_not_reset(tmp_path: Path) -> None:
     assert not any("reset --hard" in item for item in joined)
     assert result.get("ok") is True
     assert result.get("commit") == commit
+
+
+def test_readiness_parser_accepts_long_ndjson() -> None:
+    """docker compose ps 输出超过 4KB 时不能被截断，否则 readiness 误判。"""
+    from agentlib.versions import _parse_ps, _service_ready
+
+    rows = []
+    for name in ("api", "nginx"):
+        rows.append(
+            '{"Service":"%s","Name":"ventasync-%s-1","State":"running","Health":"healthy","Labels":"%s"}'
+            % (name, name, "x" * 1200)
+        )
+    statuses = _parse_ps("\n".join(rows))
+    assert set(statuses) == {"api", "nginx"}
+    assert all(_service_ready(statuses[name]) for name in ("api", "nginx"))

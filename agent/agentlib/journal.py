@@ -19,6 +19,7 @@ SQLite 使用 WAL + busy_timeout，采集进程（结果上报线程）与执行
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -167,7 +168,13 @@ class Journal:
         self._now = now
         self.lease_seconds = int(lease_seconds)
         self._lock = threading.RLock()
+        # 采集/执行两个系统用户共享 SQLite；组可写，避免执行进程只读库。
+        os.umask(0o007)
         self._conn = sqlite3.connect(str(self.path), timeout=10.0, check_same_thread=False)
+        try:
+            os.chmod(self.path, 0o660)
+        except OSError:
+            pass
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")

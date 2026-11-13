@@ -1,25 +1,27 @@
-# 当前仓库契约状态（批次 1 验收，2026-11-13，HEAD 6828c2d）
+# 当前仓库契约与试点状态（批次 1，2026-11-13，离线 6828c2d / 试点 2e34e6b）
 
-> 本节对应当前仓库 HEAD 的离线验收结论；下方历史章节保留各次发布时点的记录，其迁移数/表数/测试数**不代表当前仓库**。
+> 本节对应当前仓库与第一台试点实测；下方历史章节保留各次发布时点的记录，其迁移数/表数/测试数**不代表当前仓库**。
 > 批次 1 详细证据见 `docs/batch1-acceptance.md`，基线对照见 `docs/batch1-baseline.md`。
 
 | 检查 | 当前结果 |
 | --- | --- |
-| 后端测试 | `cd backend; python -m pytest -q` → **448 passed**，exit 0（1 条上游 Starlette 弃用提示） |
-| Agent 测试 | `cd agent; python -m pytest -q` → **21 passed**，exit 0 |
+| 后端测试 | `cd backend; python -m pytest -q` → **449 passed**，exit 0（1 条上游 Starlette 弃用提示） |
+| Agent 测试 | `cd agent; python -m pytest -q` → **22 passed**，exit 0 |
 | 前端构建 | `npm run build` exit 0（验收用临时 `--outDir`，未修改受版本管理的 `frontend/dist`；是否更新 dist 由 Lead 决定） |
 | 迁移图 | 30 个迁移文件：中心库 `center_0016 (head)`（16 个）、租户库 `tenant_0014 (head)`（14 个）；离线 SQL 可生成、0 外键、中文注释完整 |
 | 业务表 | 中心库 **29** 张、租户库 **33** 张（均不计 `alembic_version`）；已与 `docs/data-model.md` 同步 |
-| 完整契约检查 | **38/38 通过**，0 失败 0 警告：零外键、表清单/迁移图/中文注释/权限码/94 条文档路由全部通过；批次 1 的文档同步、ops 字段注释、追加型表例外规则均已落地 |
-| 场景模拟 | 重复事件幂等、租约续租、unknown 不重试、升级检查失败停止变更、旧 Agent 不领取变更任务：均有自动化用例并通过（详见 `docs/batch1-acceptance.md` 第 2 节） |
-| 试点 | 8.163.80.17 试点前只读检查清单已写入 `docs/batch1-acceptance.md` 第 3 节；本轮未连接生产、未做任何生产变更 |
+| 完整契约检查 | **38/38 通过**，0 失败 0 警告：零外键、表清单/迁移图/中文注释/权限码/94 条文档路由全部通过 |
+| 场景模拟 | 重复事件幂等、租约续租、unknown 不重试、升级检查失败停止变更、旧 Agent 不领取变更任务：均有自动化用例并通过（详见 `docs/batch1-acceptance.md` 第 3 节） |
+| 第一台试点（8.163.80.17） | **通过**：中心 `2e34e6b` + `center_0016`；发布自动登记 `verified/2/center_0016/tenant_0014`；Agent2 双 unit active、protocol=2、2.0.0；升级 job 41 `checks_status=passed`，实例 `actual_version=2e34e6b`、`db_version=tenant_0014`、`upgrade_status=succeeded`，节点心跳回写 `2e34e6b` |
+| 失败演练 | job 35 SQLite 只读、36 invalid_commit 拒绝、37/38 build/readiness 失败并修复、39 partial、40/41 passed（详见 `docs/batch1-acceptance.md` 第 2.4 节） |
+| 剩余项 | 备份前置与恢复演练、维护状态、第二租户试点（第二批）；SSH 指纹/审计、监控、独立网关（第三批）；详见 `docs/batch1-acceptance.md` 第 5 节 |
 
 补充说明：
 
 - **追加型表例外（Lead 决策）**：`node_metric_samples`、`node_checks`、`operation_job_steps`、`backup_records` 不要求
   `created_at/updated_at`，`node_metric_aggregates` 不要求 `updated_at`；以 `sampled_at`/`checked_at`/`started_at`/`finished_at`/`bucket_start`
   等业务时间字段作为追加时间。其余表仍要求 `id`、`created_at`、`updated_at`。
-- 本轮离线验收不启动容器、不连接 MySQL/Redis、不访问生产；真实环境（MySQL 行锁/Redis/Celery/真实平台店铺/恢复演练）仍需试点验收。
+- 第一台试点已覆盖 ERP 发布/升级链路；真实平台订单库存闭环、第二租户、备份恢复等未完成，不宣称批次 1 全量完成。
 - 历史章节中“38/38 通过、22 个迁移、中心 18 张/租户 32 张”等数字是各自发布时点的记录，不是当前 HEAD 结论。
 
 ---

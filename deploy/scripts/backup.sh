@@ -387,7 +387,7 @@ PY
 # ---------------------------------------------------------------- 打包加密
 log "打包并加密（AES-256-CBC / PBKDF2）"
 ENC_FILE="${RUN_DIR}/bundle.tar.gz.enc"
-PLAIN_TMP="${RUN_DIR}/.bundle.tar.gz"
+PLAIN_TMP="${RUN_DIR%/}/../.bundle-${STAMP}.tar.gz"
 tar -C "${RUN_DIR}" -czf "${PLAIN_TMP}" --exclude='bundle.tar.gz.enc*' .
 openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
     -in "${PLAIN_TMP}" -out "${ENC_FILE}" -pass "file:${KEY_FILE}"

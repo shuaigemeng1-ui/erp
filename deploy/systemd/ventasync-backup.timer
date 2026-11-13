@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily VentAsync ERP backup at 03:30 (tenant server local timezone)
+Documentation=file:/opt/ventasync/deploy/README.md
+
+[Timer]
+# 默认租户时区 03:30 执行；服务器时区即租户业务时区（deploy/README.md「时区」）。
+OnCalendar=*-*-* 03:30:00
+# 重启/停机错过后补跑一次（只补最近一次，避免堆积）
+Persistent=true
+# 随机延迟 0-5 分钟，避免多实例同时打满对象存储/数据库
+RandomizedDelaySec=300
+AccuracySec=1min
+Unit=ventasync-backup.service
+
+[Install]
+WantedBy=timers.target

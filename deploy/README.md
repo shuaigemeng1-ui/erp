@@ -450,3 +450,29 @@ bash deploy/scripts/git_update.sh --skip-migrate
 `backup.sh --all-tenants` 在 API 已挂载图片卷时同时生成 `catalog_media_*.tar.gz` 和 SHA-256；API 容器停止时仍可通过 Docker 复制卷内容。首次升级前没有图片卷时明确跳过。中心库仍须另行单库备份。图片归档须配合同一批数据库恢复到图片卷，并校正 UID/GID 10001。备份脚本改动仅完成语法检查，本轮未在生产执行恢复演练。
 
 商品中心新增 `tenant_0011`，应先备份、停止应用写入、运行在线迁移，再更新应用；不能直接启动新代码访问旧库。详情和本轮验收边界见 `docs/acceptance.md`。
+
+## 备份、加密异地与恢复演练（批次3）
+
+备份默认写入 **/var/lib/ventasync-backups**（Git 工作目录之外，目录 700 / 文件 600），
+每日 **03:30（租户服务器本地时区）**由 systemd timer 触发，保留 **30 天**：
+
+```bash
+sudo install -m 644 deploy/systemd/ventasync-backup.service /etc/systemd/system/
+sudo install -m 644 deploy/systemd/ventasync-backup.timer  /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ventasync-backup.timer
+```
+
+- 备份内容：中心库（身份/权限/配置元数据）+ 全部租户业务库 + `deploy/.env` 与编排/网关配置 + 商品图片卷；
+- 每个备份目录含 `manifest.json`（文件/SHA-256/校验结果）与加密包 `bundle.tar.gz.enc`
+  （AES-256-CBC/PBKDF2，密钥 `/etc/ventasync/backup.key`，0600，请异地保管）；
+- 异地存储独立私有：`BACKUP_OFFSITE_MODE=none|local|s3`，S3 使用独立 `BACKUP_S3_BUCKET`，
+  **不得复用商品图片公开目录**；
+- 状态记录在中心库 `backup_records`（`local_status/local_path/checksum_status/checksum/
+  offsite_status/offsite_key/restore_status/restore_verified_at/failure_reason/stages`），
+  平台接口：`GET /api/v1/platform/backups`、`POST /api/v1/platform/backups/{id}/restore-check`；
+- 升级前额外备份：Agent 升级步骤已执行 `deploy/backup.sh`，后端登记 `trigger=pre_upgrade`；
+- 隔离恢复演练：`bash deploy/scripts/restore_drill.sh --latest --record-latest`
+  （自测：`--self-test`），自动校验账号/权限/商品/配置并生成 `drill-report.json`。
+
+完整说明、演练清单与故障处理见 [`docs/backup-restore.md`](../docs/backup-restore.md)。
+

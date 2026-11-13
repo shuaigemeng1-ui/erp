@@ -6,3 +6,10 @@ backups/
 *.sql.gz
 *.sql.gz.sha256
 *.part
+# 备份产物（批次3：默认写 /var/lib/ventasync-backups；历史路径 deploy/backups 也忽略）
+backups/
+*.sql.gz
+*.enc
+*.enc.sha256
+catalog_media_*.tar.gz
+bundle.tar.gz*

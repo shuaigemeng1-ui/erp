@@ -1,0 +1,24 @@
+[Unit]
+Description=VentAsync ERP backup (encrypted + offsite, tenant instance)
+Documentation=file:/opt/ventasync/deploy/README.md
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 备份必须 root 运行（读写 /var/lib/ventasync-backups 与 /etc/ventasync/backup.key，调用 docker）
+User=root
+WorkingDirectory=/opt/ventasync/deploy
+Environment=BACKUP_TRIGGER=scheduled
+# 低优先级执行，避免与业务高峰（本机时区凌晨）争抢 IO
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/bin/env bash /opt/ventasync/deploy/backup.sh --trigger scheduled
+# 保留最后 30 次执行日志（systemd journal 亦可查）
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=7200
+
+[Install]
+WantedBy=multi-user.target

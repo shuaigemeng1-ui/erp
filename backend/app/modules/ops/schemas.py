@@ -283,3 +283,11 @@ class NodeSshFingerprintResetIn(BaseModel):
 class NodeSshExecIn(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     command: str = Field(min_length=1, max_length=2000)
+
+class BackupRestoreCheckIn(BaseModel):
+    """记录隔离环境恢复演练结果（批次3：恢复验证状态）。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    status: Literal["verified", "failed"] = Field(description="恢复验证结果：verified=通过，failed=失败")
+    notes: str = Field(default="", max_length=500, description="演练结论/证据摘要（脱敏，不含凭据）")

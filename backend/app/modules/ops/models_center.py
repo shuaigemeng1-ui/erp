@@ -416,6 +416,7 @@ class BackupRecord(IdMixin, CenterBase):
     __tablename__ = "backup_records"
     __table_args__ = (
         Index("ix_backup_records_instance_started", "instance_id", "started_at"),
+        Index("ix_backup_records_trigger_status", "trigger", "status"),
         table_options("备份记录表"),
     )
 
@@ -423,12 +424,81 @@ class BackupRecord(IdMixin, CenterBase):
     node_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="节点ID")
     job_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, comment="运维任务ID")
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="running", server_default="running", comment="备份状态：running=执行中，succeeded=成功，failed=失败")
-    storage_key: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="", comment="备份存储键")
+    storage_key: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="", comment="备份存储键（本地备份目录或对象存储键）")
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0", comment="备份大小字节")
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, comment="开始UTC")
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="完成UTC")
     retention_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="保留到期UTC")
     error: Mapped[str] = mapped_column(String(500), nullable=False, default="", server_default="", comment="失败原因")
+    # ---------------------------------------------------------------- 批次3：备份加密/异地/恢复演练
+    trigger: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="scheduled",
+        server_default="scheduled",
+        comment="触发来源：manual=手工，scheduled=每日定时，pre_upgrade=升级前额外备份",
+    )
+    local_status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+        comment="本地生成状态：pending=待生成，generated=已生成，verified=已校验，failed=失败",
+    )
+    local_path: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="", server_default="", comment="本地备份目录（Git 工作目录之外）"
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, comment="本地完整性校验通过时间（UTC）"
+    )
+    checksum_status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+        comment="校验状态：pending=待校验，verified=校验通过，failed=校验失败",
+    )
+    checksum: Mapped[str] = mapped_column(
+        String(128), nullable=False, default="", server_default="", comment="加密包/归档校验值（sha256:<hex>）"
+    )
+    offsite_status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+        comment="异地上传状态：pending=待上传，uploaded=已上传，failed=失败，skipped=未配置异地",
+    )
+    offsite_key: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="", server_default="", comment="异地私有存储对象键"
+    )
+    offsite_bucket: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default="", comment="异地私有存储桶（不复用商品图片公开目录）"
+    )
+    encryption: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="", server_default="", comment="异地包加密算法（如 aes-256-cbc/pbkdf2）"
+    )
+    restore_status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="not_tested",
+        server_default="not_tested",
+        comment="恢复验证状态：not_tested=未演练，verified=隔离恢复验证通过，failed=验证失败",
+    )
+    restore_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, comment="隔离环境恢复验证通过时间（UTC）"
+    )
+    restore_notes: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="", server_default="", comment="恢复演练结论/证据摘要"
+    )
+    failure_reason: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="", server_default="", comment="失败原因（本地/校验/异地/恢复任一阶段）"
+    )
+    stages: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSON, nullable=True, comment="阶段状态流水（生成/校验/上传/恢复，JSON 数组）"
+    )
+    manifest_json: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True, comment="备份清单（数据库/配置/本地文件/校验结果 JSON）"
+    )
 
 
 class MaintenanceWindow(IdMixin, TimestampMixin, CenterBase):

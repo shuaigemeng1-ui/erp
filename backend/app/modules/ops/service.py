@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import re
 import secrets
 import time
@@ -33,6 +34,8 @@ from app.modules.ops.schemas import (
     NodeEnrollIn,
     TelemetryPayload,
 )
+
+logger = logging.getLogger("ventasync.ops")
 
 ENROLL_TOKEN_TTL_MINUTES = 30
 OFFLINE_AFTER_SECONDS = 90
@@ -953,26 +956,35 @@ def list_alerts(
         .offset((page - 1) * page_size)
         .limit(page_size)
     ).all()
+    # 批次3：附加维护窗口 / 重复抑制 / 恢复邮件状态（只读计算，不改告警状态）
+    from app.modules.ops import alerting
+
+    suppression = alerting.enrich_alerts(center, [row for row, _ in rows])
+    items: list[dict[str, Any]] = []
+    for index, (row, hostname) in enumerate(rows):
+        item = {
+            "id": str(row.id),
+            "node_id": str(row.node_id),
+            "hostname": hostname or "",
+            "instance_id": str(row.instance_id),
+            "alert_type": row.alert_type,
+            "severity": row.severity,
+            "status": row.status,
+            "message": row.message,
+            "metric_value": row.metric_value,
+            "threshold": row.threshold,
+            "first_seen_at": _iso(row.first_seen_at),
+            "last_seen_at": _iso(row.last_seen_at),
+            "acknowledged_at": _iso(row.acknowledged_at),
+            "resolved_at": _iso(row.resolved_at),
+            "notify_count": int(row.notify_count or 0),
+            "last_notified_at": _iso(row.last_notified_at),
+        }
+        if index < len(suppression):
+            item.update(suppression[index])
+        items.append(item)
     return {
-        "items": [
-            {
-                "id": str(row.id),
-                "node_id": str(row.node_id),
-                "hostname": hostname or "",
-                "instance_id": str(row.instance_id),
-                "alert_type": row.alert_type,
-                "severity": row.severity,
-                "status": row.status,
-                "message": row.message,
-                "metric_value": row.metric_value,
-                "threshold": row.threshold,
-                "first_seen_at": _iso(row.first_seen_at),
-                "last_seen_at": _iso(row.last_seen_at),
-                "acknowledged_at": _iso(row.acknowledged_at),
-                "resolved_at": _iso(row.resolved_at),
-            }
-            for row, hostname in rows
-        ],
+        "items": items,
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -1079,7 +1091,7 @@ def _in_maintenance(center, instance_id: int, now: datetime | None = None) -> bo
     ).first() is not None
 
 
-def notify_open_alerts(center) -> int:
+def _legacy_notify_open_alerts(center) -> int:
     """对未通知或超过 30 分钟的未恢复告警发送邮件（尽力而为）。"""
     global _last_alert_email_at
     now = _now()
@@ -1133,7 +1145,7 @@ def notify_open_alerts(center) -> int:
     return sent
 
 
-def cleanup_old_monitoring_data(center) -> dict[str, int]:
+def _legacy_cleanup_old_monitoring_data(center) -> dict[str, int]:
     """原始指标保留 7 天、探测保留 7 天；每天最多执行一次。"""
     global _last_cleanup_at
     now = _now()
@@ -1560,9 +1572,321 @@ def list_backups(center, *, instance_id: int | None = None, page: int = 1, page_
         stmt = stmt.where(BackupRecord.instance_id == instance_id)
     total = int(center.execute(select(func.count()).select_from(stmt.subquery())).scalar_one())
     rows = center.execute(stmt.order_by(BackupRecord.id.desc()).offset((page-1)*page_size).limit(page_size)).scalars().all()
-    return {"items": [{"id": str(r.id), "instance_id": str(r.instance_id), "status": r.status, "storage_key": r.storage_key,
-                       "size_bytes": int(r.size_bytes or 0), "started_at": _iso(r.started_at), "finished_at": _iso(r.finished_at),
-                       "error": r.error} for r in rows], "total": total, "page": page, "page_size": page_size}
+    return {"items": [_backup_payload(r) for r in rows], "total": total, "page": page, "page_size": page_size}
+
+
+# --------------------------------------------------------------------------- 备份记录（批次3）
+BACKUP_TRIGGERS = ("manual", "scheduled", "pre_upgrade")
+BACKUP_LOCAL_STATUSES = ("pending", "generated", "verified", "failed")
+BACKUP_OFFSITE_STATUSES = ("pending", "uploaded", "failed", "skipped")
+BACKUP_RESTORE_STATUSES = ("not_tested", "verified", "failed")
+BACKUP_DEFAULT_RETENTION_DAYS = 30
+BACKUP_KEY_RE = re.compile(r"BACKUP_KEY=(\S+)")
+BACKUP_SIZE_RE = re.compile(r"BACKUP_SIZE=(\d+)")
+BACKUP_DIR_RE = re.compile(r"BACKUP_DIR=(\S+)")
+
+
+def _backup_stage(name: str, status: str, *, message: str = "", at: datetime | None = None) -> dict[str, Any]:
+    """构造一条阶段流水记录（生成/校验/上传/恢复），用于页面与验收追踪。"""
+    return {
+        "name": str(name)[:32],
+        "status": str(status)[:16],
+        "message": str(message or "")[:300],
+        "at": _iso(at or _now()),
+    }
+
+
+def _merge_stages(existing: Any, *new_stages: dict[str, Any]) -> list[dict[str, Any]]:
+    """合并阶段流水：同名阶段只保留最后一条，其余按时间顺序追加。"""
+    stages: list[dict[str, Any]] = []
+    if isinstance(existing, list):
+        stages = [dict(item) for item in existing if isinstance(item, dict)]
+    for stage in new_stages:
+        name = stage.get("name")
+        stages = [item for item in stages if item.get("name") != name]
+        stages.append(dict(stage))
+    return stages
+
+
+def _backup_payload(row: Any) -> dict[str, Any]:
+    """备份记录输出：本地生成 / 校验 / 异地 / 恢复验证四类状态（批次3契约字段）。"""
+    return {
+        "id": str(row.id),
+        "instance_id": str(row.instance_id),
+        "node_id": str(row.node_id) if row.node_id else None,
+        "job_id": str(row.job_id) if row.job_id else None,
+        "status": row.status,
+        "trigger": row.trigger,
+        "storage_key": row.storage_key,
+        "local_path": row.local_path,
+        "size_bytes": int(row.size_bytes or 0),
+        "started_at": _iso(row.started_at),
+        "finished_at": _iso(row.finished_at),
+        "retention_until": _iso(row.retention_until),
+        "local_status": row.local_status,
+        "verified_at": _iso(row.verified_at),
+        "checksum_status": row.checksum_status,
+        "checksum": row.checksum,
+        "offsite_status": row.offsite_status,
+        "offsite_key": row.offsite_key,
+        "offsite_bucket": row.offsite_bucket,
+        "encryption": row.encryption,
+        "restore_status": row.restore_status,
+        "restore_verified_at": _iso(row.restore_verified_at),
+        "restore_notes": row.restore_notes,
+        "failure_reason": row.failure_reason or row.error,
+        "stages": row.stages or [],
+        "manifest": row.manifest_json or {},
+        "error": row.error,
+    }
+
+
+def get_backup(center, backup_id: int) -> dict[str, Any]:
+    from app.modules.ops.models_center import BackupRecord
+
+    row = center.get(BackupRecord, int(backup_id))
+    if row is None:
+        raise AppError(ErrorCode.NOT_FOUND, "备份记录不存在")
+    return _backup_payload(row)
+
+
+def _upsert_backup_record(
+    center,
+    *,
+    instance_id: int,
+    trigger: str,
+    storage_key: str,
+    node_id: int | None = None,
+    job_id: int | None = None,
+):
+    """按本地备份目录去重：同一目录（或同一存储键）只保留一条记录（幂等）。"""
+    from app.modules.ops.models_center import BackupRecord
+
+    row = None
+    if storage_key:
+        row = center.execute(
+            select(BackupRecord).where(BackupRecord.storage_key == storage_key)
+        ).scalars().first()
+    if row is None and job_id:
+        row = center.execute(
+            select(BackupRecord).where(
+                BackupRecord.job_id == int(job_id), BackupRecord.trigger == "pre_upgrade"
+            )
+        ).scalars().first()
+    if row is None:
+        row = BackupRecord(instance_id=int(instance_id), node_id=node_id, job_id=job_id)
+        center.add(row)
+    if row.instance_id != int(instance_id):
+        row.instance_id = int(instance_id)
+    if node_id:
+        row.node_id = node_id
+    if job_id:
+        row.job_id = job_id
+    if trigger in BACKUP_TRIGGERS:
+        row.trigger = trigger
+    if storage_key:
+        row.storage_key = storage_key[:500]
+    return row
+
+
+def apply_backup_manifest(
+    center,
+    manifest: dict[str, Any],
+    *,
+    instance_id: int | None = None,
+    node_id: int | None = None,
+    job_id: int | None = None,
+) -> dict[str, Any]:
+    """由部署脚本 / backup_cli 调用：把一次备份的清单与状态落库。
+
+    manifest 结构（deploy/scripts/backup.sh 生成）::
+
+        {"run_id","created_at","trigger","local":{...},"offsite":{...},
+         "encryption":{...},"checks":{...},"databases":[...],"config":[...],
+         "files":[{"path","size","sha256"}],"instance_id":...}
+
+    幂等：同一存储目录（``local.dir``）重复上报时更新同一条记录，不重复插入。
+    """
+    if not isinstance(manifest, dict):
+        raise AppError(ErrorCode.VALIDATION_ERROR, "备份清单必须是 JSON 对象")
+    local = manifest.get("local") or {}
+    offsite = manifest.get("offsite") or {}
+    checks = manifest.get("checks") or {}
+    encryption = manifest.get("encryption") or {}
+    target_instance = instance_id or manifest.get("instance_id")
+    if not target_instance:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "备份清单缺少 instance_id")
+    trigger = str(manifest.get("trigger") or "scheduled")
+    if trigger not in BACKUP_TRIGGERS:
+        trigger = "scheduled"
+    local_status = str(local.get("status") or ("verified" if checks.get("sha256_ok") else "generated"))
+    if local_status not in BACKUP_LOCAL_STATUSES:
+        local_status = "generated"
+    offsite_status = str(offsite.get("status") or "pending")
+    if offsite_status not in BACKUP_OFFSITE_STATUSES:
+        offsite_status = "pending"
+    now = _now()
+    row = _upsert_backup_record(
+        center,
+        instance_id=int(target_instance),
+        trigger=trigger,
+        storage_key=str(local.get("dir") or manifest.get("run_id") or "")[:500],
+        node_id=node_id,
+        job_id=job_id,
+    )
+    offline_checksum = str(
+        offsite.get("checksum") or offsite.get("checksum_sha256") or local.get("checksum") or ""
+    )[:128]
+    checksum_ok = bool(checks.get("sha256_ok", local_status == "verified"))
+    checksum_status = "verified" if checksum_ok and offline_checksum else (
+        "failed" if local_status == "failed" or checks.get("sha256_ok") is False else "pending"
+    )
+    local_path = str(local.get("dir") or local.get("path") or "")[:500]
+    row.local_status = local_status
+    row.local_path = local_path
+    row.verified_at = now if local_status == "verified" else None
+    row.checksum_status = checksum_status
+    row.checksum = offline_checksum
+    row.offsite_status = offsite_status
+    row.offsite_key = str(offsite.get("key") or "")[:500]
+    row.offsite_bucket = str(offsite.get("bucket") or "")[:255]
+    row.encryption = str(encryption.get("algorithm") or "")[:32]
+    row.size_bytes = int(local.get("size_bytes") or 0)
+    row.started_at = row.started_at or now
+    row.finished_at = now
+    row.retention_until = now + timedelta(
+        days=int(manifest.get("retention_days") or BACKUP_DEFAULT_RETENTION_DAYS)
+    )
+    row.manifest_json = manifest
+    row.status = "running"
+    row.error = ""
+    row.failure_reason = ""
+    stages = [
+        _backup_stage("local", "succeeded" if local_status in ("generated", "verified") else "failed",
+                      message=local_path or str(local.get("error") or ""), at=now),
+        _backup_stage("checksum", checksum_status,
+                      message=offline_checksum[:120], at=now),
+        _backup_stage("offsite", offsite_status,
+                      message=str(offsite.get("key") or offsite.get("error") or "")[:120], at=now),
+    ]
+    row.stages = _merge_stages(row.stages, *stages)
+    if local_status == "failed":
+        row.status = "failed"
+        row.failure_reason = str(local.get("error") or "本地备份生成/校验失败")[:500]
+    elif checksum_status == "failed":
+        row.status = "failed"
+        row.failure_reason = "备份完整性校验失败"
+    elif offsite_status == "failed":
+        row.status = "failed"
+        row.failure_reason = str(offsite.get("error") or "异地加密上传失败")[:500]
+    elif local_status in ("generated", "verified"):
+        # 异地未配置（skipped）也算成功：本地已校验即可用于恢复演练
+        row.status = "succeeded"
+    row.error = row.failure_reason
+    center.flush()
+    return _backup_payload(row)
+
+
+def record_restore_check(
+    center,
+    backup_id: int,
+    *,
+    status: str,
+    notes: str = "",
+    actor_user_id: int | None = None,
+) -> dict[str, Any]:
+    """记录隔离环境恢复演练结果（verified/failed），用于验收追踪。"""
+    from app.modules.ops.models_center import BackupRecord
+
+    if status not in ("verified", "failed"):
+        raise AppError(ErrorCode.VALIDATION_ERROR, "恢复验证状态必须是 verified 或 failed")
+    row = center.get(BackupRecord, int(backup_id))
+    if row is None:
+        raise AppError(ErrorCode.NOT_FOUND, "备份记录不存在")
+    now = _now()
+    row.restore_status = status
+    row.restore_verified_at = now if status == "verified" else None
+    row.restore_notes = str(notes or "")[:500]
+    row.stages = _merge_stages(
+        row.stages, _backup_stage("restore", status, message=str(notes or ""), at=now)
+    )
+    if status == "failed" and not row.failure_reason:
+        row.failure_reason = str(notes or "隔离环境恢复验证失败")[:500]
+    if status == "verified" and row.local_status != "verified":
+        row.local_status = "verified"
+        row.verified_at = row.verified_at or now
+    center.flush()
+    logger.info(
+        "备份恢复演练记录：backup=%s status=%s actor=%s notes=%s",
+        row.id,
+        status,
+        actor_user_id,
+        str(notes or "")[:120],
+    )
+    return _backup_payload(row)
+
+
+def _record_pre_upgrade_backup(center, job: Any, now: datetime) -> None:
+    """升级前额外备份的后端记录（Agent 已执行备份步骤，这里只登记结果）。
+
+    Agent 升级流程在迁移前执行 ``deploy/backup.sh`` 并上报「升级前备份」步骤；
+    从步骤消息中解析 BACKUP_KEY / BACKUP_SIZE；若备份脚本已通过 backup_cli 落库，
+    则按存储键复用同一条记录并标记为 ``pre_upgrade``，避免重复。
+    """
+    from app.modules.ops.models_center import BackupRecord, OperationJobStep
+
+    steps = center.execute(
+        select(OperationJobStep).where(OperationJobStep.job_id == job.id)
+    ).scalars().all()
+    backup_steps = [
+        step for step in steps if "备份" in str(step.name or "") and step.status == "succeeded"
+    ]
+    if not backup_steps:
+        return
+    message = "\n".join(str(step.message or "") for step in backup_steps)
+    key_match = BACKUP_KEY_RE.search(message)
+    size_match = BACKUP_SIZE_RE.search(message)
+    dir_match = BACKUP_DIR_RE.search(message)
+    storage_key = (dir_match.group(1) if dir_match else "") or (
+        key_match.group(1) if key_match else ""
+    )
+    row = None
+    if storage_key:
+        row = center.execute(
+            select(BackupRecord).where(BackupRecord.storage_key == storage_key)
+        ).scalars().first()
+    if row is None and job.instance_id:
+        row = center.execute(
+            select(BackupRecord).where(
+                BackupRecord.job_id == job.id, BackupRecord.trigger == "pre_upgrade"
+            )
+        ).scalars().first()
+    if row is None:
+        row = BackupRecord(
+            instance_id=int(job.instance_id),
+            node_id=job.node_id,
+            job_id=job.id,
+            status="succeeded",
+        )
+        center.add(row)
+    row.trigger = "pre_upgrade"
+    row.job_id = job.id
+    if storage_key:
+        row.storage_key = storage_key[:500]
+        row.local_path = row.local_path or storage_key[:500]
+    if size_match:
+        row.size_bytes = int(size_match.group(1))
+    row.stages = _merge_stages(
+        row.stages, _backup_stage("local", "generated", message="升级前额外备份", at=now)
+    )
+    row.status = "succeeded" if row.local_status in ("", "pending", "generated", "verified") else row.status
+    row.local_status = row.local_status if row.local_status in ("verified",) else "generated"
+    row.started_at = row.started_at or job.started_at or now
+    row.finished_at = now
+    row.retention_until = row.retention_until or now + timedelta(days=BACKUP_DEFAULT_RETENTION_DAYS)
+    if not row.offsite_status or row.offsite_status == "pending":
+        row.offsite_status = "pending"
+    center.flush()
 
 
 TERMINAL_JOB_STATUSES = ("succeeded", "failed", "unknown")
@@ -1600,7 +1924,7 @@ def _sync_instance_after_job(center, row, now: datetime) -> None:
 
 def _apply_job_event(center, row, payload, now: datetime) -> None:
     """把一条 Agent 事件应用到任务（不提交事务）。"""
-    from app.modules.ops.models_center import BackupRecord, OperationJobStep
+    from app.modules.ops.models_center import OperationJobStep
 
     if payload.agent_protocol_version:
         row.agent_protocol_version = _safe_int(payload.agent_protocol_version)
@@ -1670,17 +1994,58 @@ def _apply_job_event(center, row, payload, now: datetime) -> None:
             )
             if payload.status == "succeeded" and not row.actual_version:
                 row.actual_version = row.target_version
+            if payload.status == "succeeded":
+                # 升级前额外备份：Agent 已执行「升级前备份」步骤，这里登记后端记录
+                try:
+                    _record_pre_upgrade_backup(center, row, now)
+                except Exception:  # noqa: BLE001 - 记录失败不影响升级结果
+                    logger.warning("记录升级前备份失败 job=%s", row.id, exc_info=True)
         if row.job_type == "backup":
-            center.add(
-                BackupRecord(
-                    instance_id=row.instance_id, node_id=row.node_id, job_id=row.id,
-                    status="succeeded" if payload.status == "succeeded" else "failed",
+            job_payload = row.payload_json or {}
+            trigger = str(job_payload.get("trigger") or "scheduled")
+            row_trigger = trigger if trigger in BACKUP_TRIGGERS else "scheduled"
+            try:
+                backup_row = _upsert_backup_record(
+                    center,
+                    instance_id=int(row.instance_id),
+                    trigger=row_trigger,
                     storage_key=str(result.get("storage_key", "")),
-                    size_bytes=int(result.get("size_bytes", 0) or 0),
-                    started_at=row.started_at or now, finished_at=now,
-                    retention_until=now + timedelta(days=30), error=(payload.error or "")[:500],
+                    node_id=row.node_id,
+                    job_id=row.id,
                 )
-            )
+                backup_row.status = "succeeded" if payload.status == "succeeded" else "failed"
+                backup_row.size_bytes = int(result.get("size_bytes", 0) or 0)
+                backup_row.local_status = (
+                    "generated" if payload.status == "succeeded" else "failed"
+                )
+                backup_row.offsite_status = str(
+                    result.get("offsite_status") or "pending"
+                )[:16]
+                backup_row.local_path = str(result.get("storage_key") or "")[:500]
+                backup_row.offsite_key = str(result.get("offsite_key") or "")[:500]
+                backup_row.checksum = str(
+                    result.get("checksum") or result.get("checksum_sha256") or ""
+                )[:128]
+                backup_row.checksum_status = "verified" if backup_row.checksum else "pending"
+                backup_row.encryption = str(result.get("encryption") or "")[:32]
+                backup_row.stages = _merge_stages(
+                    backup_row.stages,
+                    _backup_stage(
+                        "local",
+                        "generated" if payload.status == "succeeded" else "failed",
+                        message="Agent 备份任务",
+                        at=now,
+                    ),
+                )
+                backup_row.started_at = row.started_at or now
+                backup_row.finished_at = now
+                backup_row.retention_until = now + timedelta(
+                    days=int(job_payload.get("retention_days") or BACKUP_DEFAULT_RETENTION_DAYS)
+                )
+                backup_row.error = (payload.error or "")[:500]
+                center.flush()
+            except Exception:  # noqa: BLE001 - 记录失败不影响任务结果
+                logger.warning("记录备份任务结果失败 job=%s", row.id, exc_info=True)
         row.updated_at = now
         _sync_instance_after_job(center, row, now)
         return
@@ -2093,7 +2458,7 @@ def check_backup_alerts(center) -> int:
 _agg_last_at: datetime | None = None
 
 
-def aggregate_metrics(center, *, force: bool = False) -> int:
+def _legacy_aggregate_metrics(center, *, force: bool = False) -> int:
     """把近 2 小时原始指标聚合为 5 分钟桶，再由 5 分钟桶聚合小时桶。"""
     from app.modules.ops.models_center import NodeMetricAggregate
 
@@ -3004,3 +3369,29 @@ def ssh_session_recheck(session_id: str, user_id: int) -> tuple[bool, str]:
     if not user.is_platform_admin:
         return False, "permission_revoked"
     return True, ""
+
+
+# --------------------------------------------------------------------------- 监控聚合与通知（批次3修复接线）
+# 以下函数保持原公开签名，内部委托独立模块实现，避免与采集判定逻辑（task-29）耦合：
+# * aggregate_metrics：历史补报补算 + 小时桶加权平均（ops.metrics_aggregation）
+# * cleanup_old_monitoring_data：按 sampled_at/checked_at + 聚合桶保留期清理
+# * notify_open_alerts：维护窗口 / 重复抑制 / 恢复邮件（ops.alerting）
+def aggregate_metrics(center, *, force: bool = False) -> int:
+    """把原始样本聚合为 5m / 1h 桶（含历史补报补算与加权平均）。"""
+    from app.modules.ops import metrics_aggregation
+
+    return metrics_aggregation.aggregate_metrics(center, force=force)
+
+
+def cleanup_old_monitoring_data(center) -> dict[str, int]:
+    """清理过期原始指标、探测记录与聚合桶。"""
+    from app.modules.ops import metrics_aggregation
+
+    return metrics_aggregation.cleanup_monitoring_data(center)
+
+
+def notify_open_alerts(center) -> int:
+    """发送告警 / 恢复邮件：维护窗口抑制、重复提醒抑制；失败仅记录日志。"""
+    from app.modules.ops import alerting
+
+    return alerting.notify_open_alerts(center)

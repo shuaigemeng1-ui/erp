@@ -21,6 +21,7 @@ from app.modules.ops.schemas import (
     NodeSshExecIn,
     NodeSshFingerprintResetIn,
     OperationCreate,
+    BackupRestoreCheckIn,
     ReleaseCreate,
     ReleaseUpdate,
 )
@@ -198,6 +199,38 @@ def node_checks(
     return success(service.list_checks(center, node_id, limit=limit))
 
 
+@router.get("/nodes/{node_id}/probe-latency", summary="节点公网探测耗时历史（按 target）")
+def node_probe_latency(
+    center: CenterDb,
+    _: PlatformAdmin,
+    node_id: int,
+    hours: int = Query(default=24, ge=1, le=720, description="回看小时数"),
+) -> dict:
+    """公网探测耗时（root/healthz/api 分开统计）与业务请求耗时分离展示。"""
+    from app.modules.ops import performance
+
+    return success(performance.probe_latency_overview(center, node_id, hours=hours))
+
+
+@router.get("/metrics/http", summary="管理 API 请求性能（请求量 / 5xx / P95 / P99）")
+def http_metrics(
+    _: PlatformAdmin,
+    window_seconds: int = Query(
+        default=900, ge=60, le=86400, description="统计窗口（秒），默认 15 分钟"
+    ),
+    route: str = Query(default="", max_length=200, description="按路由模板过滤"),
+    method: str = Query(default="", max_length=16, description="按 HTTP 方法过滤"),
+) -> dict:
+    """业务请求性能指标（P95/P99 由固定直方图桶计算，Redis 不可用时 degraded）。"""
+    from app.modules.ops import performance
+
+    return success(
+        performance.http_metrics(
+            window_seconds=window_seconds, route=route or None, method=method or None
+        )
+    )
+
+
 @router.get("/releases", summary="发布版本列表")
 def releases(center: CenterDb, _: PlatformAdmin) -> dict:
     return success(service.list_releases(center))
@@ -242,6 +275,26 @@ def retry_operation(center: CenterDb, admin: PlatformAdmin, job_id: int) -> dict
 def backups(center: CenterDb, _: PlatformAdmin, pagination: PageParams = Depends(), instance_id: str = Query(default="", max_length=32)) -> dict:
     data = service.list_backups(center, instance_id=int(instance_id) if instance_id.isdigit() else None, page=pagination.page, page_size=pagination.page_size)
     return paged(data["items"], data["total"], data["page"], data["page_size"])
+
+
+@router.get("/backups/{backup_id}", summary="备份详情")
+def backup_detail(center: CenterDb, _: PlatformAdmin, backup_id: int) -> dict:
+    return success(service.get_backup(center, backup_id))
+
+
+@router.post("/backups/{backup_id}/restore-check", summary="记录隔离环境恢复验证结果")
+def backup_restore_check(
+    center: CenterDb, admin: PlatformAdmin, backup_id: int, payload: BackupRestoreCheckIn
+) -> dict:
+    return success(
+        service.record_restore_check(
+            center,
+            backup_id,
+            status=payload.status,
+            notes=payload.notes,
+            actor_user_id=admin.user_id,
+        )
+    )
 
 
 @router.get("/instances/{instance_id}/maintenance-windows", summary="实例维护窗口")

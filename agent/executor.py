@@ -34,7 +34,7 @@ def redact(text: str) -> str:
     return value[-4000:]
 
 
-def _run(command: list[str], cwd: str, timeout: int = 300) -> tuple[int, str]:
+def _run(command: list[str], cwd: str, timeout: int = 300, extra_env: dict[str, str] | None = None) -> tuple[int, str]:
     try:
         result = subprocess.run(
             command,
@@ -43,7 +43,7 @@ def _run(command: list[str], cwd: str, timeout: int = 300) -> tuple[int, str]:
             text=True,
             timeout=timeout,
             check=False,
-            env={**os.environ, "COMPOSE_INTERACTIVE_NO_CLI": "1"},
+            env={**os.environ, "COMPOSE_INTERACTIVE_NO_CLI": "1", **(extra_env or {})},
         )
         output = redact((result.stdout or "") + "\n" + (result.stderr or ""))
         return result.returncode, output
@@ -114,14 +114,19 @@ def execute(job: dict[str, Any], config: dict[str, Any], report) -> dict[str, An
             size = int(size_match.group(1))
         report(2, "执行备份", "succeeded" if code == 0 else "failed", output)
         return {"ok": code == 0, "exit_code": code, "output": output, "storage_key": key, "size_bytes": size}
-    # deploy / upgrade
-    report(2, "拉取镜像", "running", "")
-    code, output = _run([*compose, "pull"], deploy_dir, timeout=1800)
+    # deploy / upgrade：目标版本作为 APP_IMAGE_TAG 传入，不修改 .env；固定版本镜像可本地存在。
+    target = str(job.get("target_version") or payload.get("target_version") or "").strip()
+    if target and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", target):
+        report(2, "校验版本", "failed", "版本号格式不正确")
+        return {"ok": False, "error": "invalid_version"}
+    env_extra = {"APP_IMAGE_TAG": target} if target else {}
+    report(2, f"拉取镜像 {target or '当前版本'}", "running", "")
+    code, output = _run([*compose, "pull", "--ignore-pull-failures"], deploy_dir, timeout=1800, extra_env=env_extra)
     report(2, "拉取镜像", "succeeded" if code == 0 else "failed", output)
     if code != 0:
         return {"ok": False, "exit_code": code, "output": output}
-    report(3, "更新服务", "running", "")
-    code2, output2 = _run([*compose, "up", "-d", "--remove-orphans"], deploy_dir, timeout=1800)
+    report(3, f"更新服务 {target or '当前版本'}", "running", "")
+    code2, output2 = _run([*compose, "up", "-d", "--remove-orphans"], deploy_dir, timeout=1800, extra_env=env_extra)
     report(3, "更新服务", "succeeded" if code2 == 0 else "failed", output2)
     time.sleep(3)
-    return {"ok": code2 == 0, "exit_code": code2, "output": output2}
+    return {"ok": code2 == 0, "exit_code": code2, "output": output2, "target_version": target}

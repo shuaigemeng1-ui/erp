@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -132,6 +133,12 @@ def execute(job: dict[str, Any], config: dict[str, Any], report) -> dict[str, An
         report(3, f"更新服务 {target or '当前版本'}", "running", "")
         code2, output2 = _run([*compose, "up", "-d", "--remove-orphans"], deploy_dir, timeout=1800)
         report(3, "更新服务", "succeeded" if code2 == 0 else "failed", output2)
+        if code2 == 0 and target:
+            try:
+                # 升级成功后持久化版本标签，避免下一次普通 compose 启动回退到旧镜像。
+                shutil.copyfile(temp_env, env_source)
+            except OSError:
+                pass
         time.sleep(3)
         return {"ok": code2 == 0, "exit_code": code2, "output": output2, "target_version": target}
     finally:

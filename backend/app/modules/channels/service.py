@@ -1032,7 +1032,20 @@ def disconnect_store(
         credential.status = CREDENTIAL_STATUS_REVOKED
         credential.last_error = None
         credential.updated_at = now
+    store.webhook_enabled = False
+    db.execute(
+        update(TiktokWebhookSubscription)
+        .where(
+            TiktokWebhookSubscription.tenant_id == tenant_id,
+            TiktokWebhookSubscription.store_id == store_id,
+        )
+        .values(status="disabled", last_error="store disconnected")
+    )
     release_store_registry(center, channel=store.channel, tenant_id=tenant_id, store_id=store_id)
+    try:
+        unregister_gateway_webhook_shop(store)
+    except Exception:  # noqa: BLE001 - gateway cleanup must not block disconnect
+        logger.warning("Gateway Webhook 店铺解绑失败：tenant=%s store=%s", tenant_id, store_id)
     record_audit(
         db,
         tenant_id=tenant_id,

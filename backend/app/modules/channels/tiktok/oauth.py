@@ -103,7 +103,7 @@ def create_authorization_session(
         "tenant_id": tenant_id_int,
         "member_id": int(member_id),
         "environment": env,
-        "redirect_path": safe_redirect_path(redirect_path, f"/tenants/{tenant_id_int}/stores"),
+        "redirect_path": safe_redirect_path(redirect_path, "/stores"),
         "store_id": int(store_id) if store_id else None,
         "store_code": (store_code or "").strip(),
         "service_id": (service_id or "").strip(),
@@ -163,7 +163,7 @@ def validate_authorization_session(
         "member_id": member_id,
         "environment": environment,
         "redirect_path": safe_redirect_path(
-            str(payload.get("redirect_path") or ""), f"/tenants/{tenant_id}/stores"
+            str(payload.get("redirect_path") or ""), "/stores"
         ),
         "store_id": store_id,
         "store_code": str(payload.get("store_code") or ""),
@@ -245,7 +245,7 @@ def start_authorization(
         tenant_id=tenant_id,
         member_id=member_id,
         environment=env,
-        redirect_path=safe_redirect_path(redirect_path, f"/tenants/{tenant_id}/stores"),
+        redirect_path=safe_redirect_path(redirect_path, "/stores"),
         service_id=config.app_id,
         market=market,
         store_id=store.id if store is not None else None,
@@ -398,7 +398,7 @@ def complete_authorization(
         "external_store_id": external_id,
         "store_code": str(session.get("store_code") or ""),
         "redirect_path": str(
-            session.get("redirect_path") or f"/tenants/{tenant_id}/stores"
+            session.get("redirect_path") or "/stores"
         ),
     }
 

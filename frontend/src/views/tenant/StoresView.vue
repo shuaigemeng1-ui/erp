@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRoute, useRouter } from 'vue-router'
 import { Refresh } from '@element-plus/icons-vue'
 import { channelsApi } from '@/api/channels'
 import { useTenantStore } from '@/stores/tenant'
@@ -10,6 +11,8 @@ import { formatDateTime, textOrDash } from '@/utils/format'
 import type { AuthorizeResult, Store } from '@/types'
 
 const tenant = useTenantStore()
+const route = useRoute()
+const router = useRouter()
 const tid = (): string => tenant.requireTenantId()
 
 const loading = ref(false)
@@ -29,6 +32,8 @@ const createForm = reactive<{ channel: 'tiktok' | 'shopee'; name: string }>({
 const authVisible = ref(false)
 const authStore = ref<Store | null>(null)
 const authResult = ref<AuthorizeResult | null>(null)
+const oauthMessage = ref('')
+const oauthError = ref(false)
 
 async function load(): Promise<void> {
   loading.value = true
@@ -183,11 +188,43 @@ function platformStoreId(store: Store): string {
   return store.status === 'pending_authorization' ? '' : store.external_store_id
 }
 
-onMounted(load)
+async function handleOAuthResult(): Promise<void> {
+  const status = String(route.query.tiktok ?? '')
+  if (status === 'connected') {
+    oauthMessage.value = 'TikTok 授权成功，店铺已连接'
+    oauthError.value = false
+    ElMessage.success(oauthMessage.value)
+    await load()
+  } else if (status === 'error') {
+    const reason = String(route.query.reason ?? '授权失败')
+    oauthMessage.value = `TikTok 授权失败：${reason}`
+    oauthError.value = true
+    ElMessage.error(oauthMessage.value)
+  }
+  if (status || route.query.reason) {
+    const query = { ...route.query }
+    delete query.tiktok
+    delete query.reason
+    await router.replace({ query })
+  }
+}
+
+onMounted(async () => {
+  await load()
+  await handleOAuthResult()
+})
 </script>
 
 <template>
   <el-card shadow="never" class="page-card">
+    <el-alert
+      v-if="oauthMessage"
+      :type="oauthError ? 'error' : 'success'"
+      :title="oauthMessage"
+      :closable="true"
+      show-icon
+      class="oauth-result-alert"
+    />
     <div class="table-toolbar">
       <div class="toolbar-actions">
         <el-button :icon="Refresh" @click="load">刷新</el-button>

@@ -782,7 +782,7 @@ def start_shopee_authorization(
         tenant_id=tenant_id,
         member_id=member_id,
         environment=env,
-        redirect_path=safe_redirect_path(redirect_path, f"/tenants/{tenant_id}/stores"),
+        redirect_path=safe_redirect_path(redirect_path, "/stores"),
         auth_base=resolve_base_url(env),
         partner_id=int(config.partner_id or 0),
         partner_key=config.partner_key,

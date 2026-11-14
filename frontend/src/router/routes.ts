@@ -85,7 +85,7 @@ export const routes: RouteRecordRaw[] = [
         path: 'listings',
         name: 'listings',
         component: () => import('@/views/tenant/ListingsView.vue'),
-        meta: { tenant: true, permission: 'channel.listing.read', title: '平台商品映射' },
+        meta: { tenant: true, permission: 'channel.listing.read', title: '在线商品' },
       },
       {
         path: 'orders',

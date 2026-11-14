@@ -8,9 +8,8 @@ import { useTableQuery } from '@/composables/useTableQuery'
 import { useTenantTask } from '@/composables/useTenantTask'
 import { useTenantStore } from '@/stores/tenant'
 import PaginationBar from '@/components/PaginationBar.vue'
-import StatusTag from '@/components/StatusTag.vue'
-import IdCopy from '@/components/IdCopy.vue'
 import { formatDateTime, formatMoney, stringOrUndefined, textOrDash } from '@/utils/format'
+import { ORDER_STATUS_OPTIONS, orderStatusLabel, orderStatusType } from '@/utils/orderStatus'
 import type { Order, Store } from '@/types'
 
 const tenant = useTenantStore()
@@ -20,7 +19,7 @@ const { submitAndPoll } = useTenantTask()
 
 const canSync = computed(() => tenant.has('order.sync'))
 
-const statusOptions = ['pending', 'paid', 'ready_to_ship', 'shipped', 'completed', 'cancelled', 'abnormal']
+const statusOptions = ORDER_STATUS_OPTIONS
 
 const query = reactive({
   status: '',
@@ -96,7 +95,7 @@ onMounted(loadStores)
   <el-card shadow="never" class="page-card">
     <div class="filter-bar">
       <el-select v-model="query.status" placeholder="订单状态" clearable filterable allow-create style="width: 170px" @change="search()">
-        <el-option v-for="status in statusOptions" :key="status" :label="status" :value="status" />
+        <el-option v-for="status in statusOptions" :key="status.value" :label="status.label" :value="status.value" />
       </el-select>
       <el-select v-model="query.store_id" placeholder="店铺" clearable style="width: 180px" @change="search()">
         <el-option v-for="store in stores" :key="store.id" :label="store.name" :value="store.id" />
@@ -119,19 +118,21 @@ onMounted(loadStores)
     </div>
 
     <el-table v-loading="loading" :data="rows" border size="small" row-key="id">
-      <el-table-column label="平台订单号" min-width="190">
-        <template #default="{ row }"><span class="mono">{{ row.external_order_no }}</span></template>
-      </el-table-column>
       <el-table-column label="店铺" width="150" show-overflow-tooltip>
         <template #default="{ row }">{{ textOrDash(row.store_name) }}</template>
       </el-table-column>
-      <el-table-column label="状态" width="140">
+      <el-table-column label="平台订单号" min-width="190">
+        <template #default="{ row }"><span class="mono">{{ row.external_order_no }}</span></template>
+      </el-table-column>
+      <el-table-column label="状态" width="130">
         <template #default="{ row }">
-          <StatusTag :status="row.status" />
+          <el-tag :type="orderStatusType(row.status)" size="small">
+            {{ orderStatusLabel(row.status) }}
+          </el-tag>
           <el-tag v-if="row.abnormal_reason" size="small" type="danger" style="margin-left: 4px">异常</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="平台状态" width="130">
+      <el-table-column label="平台状态" width="150">
         <template #default="{ row }">{{ textOrDash(row.platform_status) }}</template>
       </el-table-column>
       <el-table-column label="金额" width="130" align="right">
@@ -145,9 +146,6 @@ onMounted(loadStores)
       </el-table-column>
       <el-table-column label="异常原因" min-width="160" show-overflow-tooltip>
         <template #default="{ row }">{{ textOrDash(row.abnormal_reason) }}</template>
-      </el-table-column>
-      <el-table-column label="订单 ID" width="110">
-        <template #default="{ row }"><IdCopy :id="row.id" /></template>
       </el-table-column>
       <el-table-column label="操作" width="90" fixed="right">
         <template #default="{ row }">

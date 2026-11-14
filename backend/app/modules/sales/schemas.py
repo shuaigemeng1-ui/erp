@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
 
@@ -104,6 +104,7 @@ class OrderOut(BaseModel):
 
     id: IdStr
     store_id: IdStr
+    store_name: str = Field(default="", description="store display name")
     channel: str
     external_order_no: str
     status: str = Field(description="归一化订单状态")
@@ -117,10 +118,11 @@ class OrderOut(BaseModel):
     updated_at: datetime | None = None
 
     @classmethod
-    def from_model(cls, order: Order) -> "OrderOut":
+    def from_model(cls, order: Order, store_name: str = "") -> "OrderOut":
         return cls(
             id=int(order.id),
             store_id=int(order.store_id),
+            store_name=store_name,
             channel=order.channel or "",
             external_order_no=order.external_order_no or "",
             status=order.status or "unknown",
@@ -138,6 +140,7 @@ class OrderOut(BaseModel):
 class OrderDetailOut(OrderOut):
     """订单详情：明细、状态历史、库存影响。"""
 
+    raw: dict[str, Any] = Field(default_factory=dict, description="platform raw payload")
     items: list[OrderItemOut] = Field(default_factory=list)
     history: list[OrderStatusHistoryOut] = Field(default_factory=list)
     stock_effects: list[OrderStockEffectOut] = Field(default_factory=list)

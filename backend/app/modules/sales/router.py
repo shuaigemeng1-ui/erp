@@ -19,6 +19,8 @@ from app.api.deps import AccessSnapshotDep, TenantCtx, TenantDb, require_permiss
 from app.core.http import PageParams, accepted, paged, success
 from app.core.permissions import Permission
 from app.modules.sales import service as sales_service
+from app.modules.channels.models_tenant import Store
+from app.modules.sales.models_tenant import PlatformOrderRaw
 from app.modules.sales.schemas import (
     OrderDetailOut,
     OrderOut,
@@ -59,8 +61,14 @@ def list_orders(
         date_from=date_from,
         date_to=date_to,
     )
+    store_ids = {int(order.store_id) for order in items}
+    store_names = {
+        int(store.id): store.name
+        for store in (db.get(Store, store_id) for store_id in store_ids)
+        if store is not None
+    }
     return paged(
-        [OrderOut.from_model(order) for order in items],
+        [OrderOut.from_model(order, store_name=store_names.get(int(order.store_id), "")) for order in items],
         total,
         pagination.page,
         pagination.page_size,
@@ -81,11 +89,14 @@ def get_order(
         effective=snapshot.effective,
         order_id=order_id,
     )
+    store = db.get(Store, int(detail.order.store_id))
+    raw_row = db.get(PlatformOrderRaw, int(detail.order.raw_id)) if detail.order.raw_id else None
     payload = OrderDetailOut(
-        **OrderOut.from_model(detail.order).model_dump(),
+        **OrderOut.from_model(detail.order, store_name=store.name if store else "").model_dump(),
         items=[OrderItemOut.from_model(item) for item in detail.items],
         history=[OrderStatusHistoryOut.from_model(row) for row in detail.history],
         stock_effects=[OrderStockEffectOut.from_model(row) for row in detail.effects],
+        raw=dict(raw_row.payload or {}) if raw_row is not None and isinstance(raw_row.payload, dict) else {},
     )
     return success(payload)
 

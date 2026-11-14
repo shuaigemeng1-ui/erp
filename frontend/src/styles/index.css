@@ -234,3 +234,5 @@ body {
 .clickable-row {
   cursor: pointer;
 }
+
+.detail-subcard { margin-top: 16px; }

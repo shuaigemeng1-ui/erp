@@ -28,7 +28,7 @@ export const tenantMenuItems: MenuItem[] = [
   { path: '/products', title: '商品', icon: Goods, permission: 'catalog.product.read' },
   { path: '/inventory', title: '库存', icon: Box, permission: 'inventory.read' },
   { path: '/stores', title: '店铺连接', icon: Shop, permission: 'store.read' },
-  { path: '/listings', title: '平台商品映射', icon: Link, permission: 'channel.listing.read' },
+  { path: '/listings', title: '在线商品', icon: Link, permission: 'channel.listing.read' },
   { path: '/orders', title: '订单', icon: Tickets, permission: 'order.read' },
   { path: '/sync-runs', title: '任务记录', icon: Timer, permission: 'task.read' },
   { path: '/settings/products', title: '基础设置', icon: SetUp, permission: 'catalog.product.read' },

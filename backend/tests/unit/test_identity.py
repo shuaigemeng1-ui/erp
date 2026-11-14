@@ -732,6 +732,7 @@ def _build_sqlite_sessions():
     import app.modules.audit.models_tenant  # noqa: F401
     import app.modules.identity.models_center  # noqa: F401
     import app.modules.identity.models_tenant  # noqa: F401
+    import app.modules.ops.models_center  # noqa: F401
     import app.modules.platform.models_center  # noqa: F401
 
     center_tables = (
@@ -747,6 +748,7 @@ def _build_sqlite_sessions():
         "plan_features",
         "subscriptions",
         "platform_audit_logs",
+        "tenant_instances",
     )
     tenant_tables = (
         "roles",

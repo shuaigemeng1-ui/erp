@@ -101,10 +101,27 @@ def login(payload: LoginRequest, request: Request, center: CenterDb) -> JSONResp
     if payload.scope == "platform" and not is_platform_admin:
         raise AppError(ErrorCode.PLATFORM_PERMISSION_REQUIRED, "该账号不是平台管理员")
     if settings.deployment_mode == "center" and payload.scope != "platform":
-        raise AppError(
-            ErrorCode.SCOPE_DENIED,
-            "管理中心只允许平台管理员登录，请使用租户独立域名登录",
-        )
+        # 独立租户必须回到自己的域名；中心只保留 shared 租户的旧入口兼容。
+        from sqlalchemy import select as sa_select
+        from app.modules.ops.models_center import TenantInstance as OpsTenantInstance
+
+        tenant_ids = [
+            int(item["id"])
+            for item in service.list_user_tenants(center, int(user.id))
+            if item.get("id") is not None
+        ]
+        if tenant_ids:
+            independent = center.execute(
+                sa_select(OpsTenantInstance.id).where(
+                    OpsTenantInstance.tenant_id.in_(tenant_ids),
+                    OpsTenantInstance.deployment_mode == "independent",
+                )
+            ).first()
+            if independent is not None:
+                raise AppError(
+                    ErrorCode.SCOPE_DENIED,
+                    "该租户为独立部署，请使用租户独立域名登录",
+                )
     service.record_login(center, user)
     # 轮换会话：旧会话（若存在）立即失效
     old_session_id = getattr(request.state, "session_id", "")

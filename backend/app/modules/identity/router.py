@@ -45,6 +45,7 @@ from app.core.auth import (
     set_csrf_cookie,
     set_session_cookies,
 )
+from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.http import PageParams, paged, success
 from app.core.permissions import Permission
@@ -99,6 +100,11 @@ def login(payload: LoginRequest, request: Request, center: CenterDb) -> JSONResp
     is_platform_admin = service.is_platform_admin(center, int(user.id))
     if payload.scope == "platform" and not is_platform_admin:
         raise AppError(ErrorCode.PLATFORM_PERMISSION_REQUIRED, "该账号不是平台管理员")
+    if settings.deployment_mode == "center" and payload.scope != "platform":
+        raise AppError(
+            ErrorCode.SCOPE_DENIED,
+            "管理中心只允许平台管理员登录，请使用租户独立域名登录",
+        )
     service.record_login(center, user)
     # 轮换会话：旧会话（若存在）立即失效
     old_session_id = getattr(request.state, "session_id", "")

@@ -43,6 +43,7 @@ celery_app.conf.update(
     task_routes={
         "app.modules.tasks.outbox.*": {"queue": "outbox"},
         "app.modules.tasks.scheduler.*": {"queue": "scheduler"},
+        "app.modules.channels.tasks.process_tiktok_webhook_events": {"queue": "tiktok_refresh"},
         "app.modules.channels.tasks.*": {"queue": "channel"},
         "app.modules.sales.tasks.*": {"queue": "sales"},
         "app.modules.tasks.tasks.*": {"queue": "default"},

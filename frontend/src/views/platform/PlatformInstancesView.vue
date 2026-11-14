@@ -944,8 +944,16 @@ function preferredRelease(instance: OpsInstance): OpsRelease | null {
 }
 
 /** 空串表示可升级；否则用于禁用按钮 tooltip。 */
+/** 独立部署实例允许显式升级，但仍禁止迁移中/回滚/写阻断。 */
+function upgradeCenterBlockedReason(instance: OpsInstance): string {
+  if (instance.migration_status === 'migrating') return '实例迁移中，升级操作已暂停'
+  if (instance.migration_status === 'rollback') return '实例处于迁移回滚状态，升级操作已暂停'
+  if (instance.write_blocked) return '实例当前禁止写操作，请通过迁移流程处理'
+  return ''
+}
+
 function upgradeBlockedReason(instance: OpsInstance): string {
-  const centerBlocked = centerOperationsBlockedReason(instance)
+  const centerBlocked = upgradeCenterBlockedReason(instance)
   if (centerBlocked) return centerBlocked
   if (releasesLoading.value) return '正在加载发布清单'
   const release = preferredRelease(instance)

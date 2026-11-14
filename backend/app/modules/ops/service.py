@@ -1282,8 +1282,14 @@ def create_operation(center, instance_id: int, payload, *, actor_user_id: int) -
     from app.modules.platform.service import record_platform_audit
 
     instance = get_instance(center, instance_id)
-    # 迁移中 / 已迁出 / 独立部署的实例不再参与旧中心运维任务调度
-    if instance_write_blocked(instance):
+    # 迁移中/回滚/独立部署不参与旧中心业务调度；但升级是显式 Agent 任务，
+    # 独立部署实例仍可由管理员发起，不能因此恢复旧中心写入。
+    upgrade_allowed = (
+        payload.job_type in UPGRADE_JOB_TYPES
+        and normalize_deployment_mode(instance.deployment_mode) == "independent"
+        and normalize_migration_status(instance.migration_status) in {"registered", "migrated"}
+    )
+    if instance_write_blocked(instance) and not upgrade_allowed:
         raise ConflictError(MIGRATION_WRITE_BLOCKED_MESSAGE)
     node = center.execute(
         select(ServerNode).where(ServerNode.instance_id == instance.id).order_by(ServerNode.id.asc())

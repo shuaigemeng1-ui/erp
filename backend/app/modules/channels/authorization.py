@@ -22,6 +22,53 @@ logger = logging.getLogger("ventasync.channels.authorization")
 TTL = 600
 
 
+def _direct_auth_url(center, row: AuthorizationLink, config) -> str:
+    """生成可直接打开的渠道授权地址，避免用户先访问租户域名。
+
+    指纹浏览器通常只放行平台域名；复制出去的链接应直接指向 TikTok/Shopee。
+    仍需先创建网关一次性 state（或本地签名 state），保证回调可校验。
+    """
+    from app.modules.channels import gateway_relay
+    from app.modules.gateway.client import GatewayCallError
+    from app.modules.channels.shopee.signature import append_query_params, build_authorize_url
+    from app.modules.channels.tiktok.oauth import build_authorization_url
+
+    gateway_state: str | None = None
+    if gateway_relay.relay_enabled():
+        try:
+            gateway_info = gateway_relay.create_oauth_state(row)
+            gateway_state = str(gateway_info.get("state") or "")
+            if not gateway_state:
+                raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "网关未返回授权 state")
+        except (GatewayCallError, AppError) as exc:
+            if not gateway_relay.oauth_legacy_fallback_enabled():
+                raise
+            logger.warning("创建网关 OAuth state 失败，回退本地 state：%s", exc)
+            gateway_state = None
+    state = gateway_state or create_oauth_state(row)
+    if row.channel == "tiktok":
+        return build_authorization_url(
+            service_id=config.app_id,
+            state=state,
+            market=config.region or "ROW",
+        )
+    from app.modules.channels.shopee.client import resolve_base_url
+
+    callback_base = (
+        gateway_relay.gateway_callback_url(row.channel)
+        if gateway_state
+        else config.redirect_url
+    )
+    if not callback_base:
+        raise AppError(ErrorCode.CHANNEL_APP_NOT_CONFIGURED, "平台未配置可用的 OAuth 回调地址")
+    return build_authorize_url(
+        auth_base=resolve_base_url(row.context["environment"]),
+        partner_id=int(config.partner_id),
+        partner_key=config.partner_key,
+        redirect_url=append_query_params(callback_base, {"state": state}),
+    )
+
+
 def issue_link(center, *, channel: str, payload: dict) -> dict:
     # 串行化同租户链接轮换；旧链接（以及由它签发的 state）立即失效。
     from app.modules.identity.models_center import Tenant
@@ -45,7 +92,7 @@ def issue_link(center, *, channel: str, payload: dict) -> dict:
         status="active", context=dict(payload))
     center.add(row)
     center.commit()
-    url = f"{settings.app_origin.rstrip('/')}{settings.api_prefix}/integrations/authorization/{token}"
+    url = _direct_auth_url(center, row, config)
     return {"auth_url": url, "expires_at": None, "environment": payload["environment"],
             "store_id": payload.get("store_id"), "store_code": payload.get("store_code", "")}
 

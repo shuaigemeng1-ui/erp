@@ -74,7 +74,14 @@ class Store(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
         nullable=False,
         default="",
         server_default=text("''"),
-        comment="店铺名称",
+        comment="ERP 显示名称（新建店铺时填写）",
+    )
+    external_name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        default="",
+        server_default=text("''"),
+        comment="平台店铺真实名称（只读，展示用）",
     )
     store_code: Mapped[str] = mapped_column(
         String(32),
@@ -211,6 +218,13 @@ class ChannelListing(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
         default="",
         server_default=text("''"),
         comment="平台商品标题",
+    )
+    image_url: Mapped[str] = mapped_column(
+        String(1000),
+        nullable=False,
+        default="",
+        server_default=text("''"),
+        comment="平台商品主图 URL",
     )
     price: Mapped[Decimal | None] = mapped_column(
         Numeric(18, 4), nullable=True, comment="平台售价"

@@ -347,6 +347,7 @@ def complete_authorization(
             environment=environment,
             external_store_id=external_id,
             store_name=name or f"TikTok Shop 店铺 {external_id}",
+            external_name=name,
             region=region,
             access_token=str(token.get("access_token") or ""),
             refresh_token=str(token.get("refresh_token") or ""),

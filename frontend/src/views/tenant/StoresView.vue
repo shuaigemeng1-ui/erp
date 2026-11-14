@@ -236,7 +236,13 @@ onMounted(async () => {
       <el-table-column label="ID" width="100">
         <template #default="{ row }"><IdCopy :id="row.id" /></template>
       </el-table-column>
-      <el-table-column prop="name" label="店铺名称" min-width="180" />
+      <el-table-column prop="name" label="显示名称" min-width="160" />
+      <el-table-column label="平台店铺名称" min-width="180">
+        <template #default="{ row }">{{ textOrDash(row.external_name) }}</template>
+      </el-table-column>
+      <el-table-column label="区域" width="90">
+        <template #default="{ row }">{{ textOrDash(row.region) }}</template>
+      </el-table-column>
       <el-table-column label="店铺编码" width="130">
         <template #default="{ row }"><span class="mono">{{ textOrDash(row.store_code) }}</span></template>
       </el-table-column>

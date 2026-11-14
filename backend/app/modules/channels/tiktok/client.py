@@ -244,8 +244,8 @@ class TikTokClient:
         return self.request("POST", path, params=params, body=body or {}, **kwargs)
 
     def get_shops(self) -> list[dict[str, Any]]:
-        """读取授权店铺（需要 access_token；不含 shop_cipher）。"""
-        payload = self.get("/authorization/202309/shops")
+        """读取授权店铺（需要 access_token；不能携带 shop_cipher）。"""
+        payload = self.get("/authorization/202309/shops", shop_cipher="")
         data = payload.get("data") if isinstance(payload, Mapping) else None
         shops = data.get("shops") if isinstance(data, Mapping) else None
         if not isinstance(shops, list):
@@ -270,6 +270,12 @@ class TikTokClient:
         if page_token:
             params["page_token"] = page_token
         return self.post("/product/202309/products/search", params=params, body={})
+
+    def get_product(self, product_id: str) -> dict[str, Any]:
+        product_id = str(product_id or "").strip()
+        if not product_id:
+            raise TikTokApiError("商品 ID 为空")
+        return self.get(f"/product/202309/products/{product_id}")
 
     def search_orders(
         self,

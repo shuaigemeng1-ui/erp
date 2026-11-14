@@ -18,6 +18,7 @@ export interface Store {
   channel: string
   store_code: string
   name: string
+  external_name?: string
   external_store_id: string
   region?: string | null
   timezone?: string | null
@@ -39,6 +40,7 @@ export interface Listing {
   external_item_id: string
   external_sku_id?: string | null
   title: string
+  image_url?: string | null
   price?: Decimal | null
   currency?: string | null
   remote_stock?: Decimal | null

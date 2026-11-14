@@ -114,7 +114,8 @@ class StoreOut(BaseModel):
     id: str = Field(description="店铺ID")
     channel: str = Field(description="渠道编码")
     store_code: str = Field(description="ERP 内部店铺编码")
-    name: str = Field(description="店铺名称")
+    name: str = Field(description="ERP 显示名称")
+    external_name: str = Field(default="", description="平台店铺真实名称")
     external_store_id: str = Field(description="平台店铺ID")
     region: str | None = Field(default=None, description="站点区域")
     timezone: str = Field(description="店铺时区")
@@ -160,6 +161,7 @@ class ListingOut(BaseModel):
     external_item_id: str = Field(description="平台商品ID")
     external_sku_id: str = Field(description="平台规格ID / SKU 编码；无规格为空串")
     title: str = Field(description="平台商品标题")
+    image_url: str = Field(default="", description="平台商品主图")
     price: str | None = Field(default=None, description="平台售价（字符串）")
     currency: str = Field(description="币种")
     remote_stock: int | None = Field(default=None, description="平台可售库存快照")
@@ -189,6 +191,7 @@ def store_payload(summary: Any) -> dict[str, Any]:
         "channel": summary.channel,
         "store_code": summary.store_code,
         "name": summary.name,
+        "external_name": summary.external_name,
         "external_store_id": summary.external_store_id,
         "region": summary.region,
         "timezone": summary.timezone,
@@ -212,6 +215,7 @@ def listing_payload(item: dict[str, Any]) -> dict[str, Any]:
         "external_item_id": item.get("external_item_id") or "",
         "external_sku_id": item.get("external_sku_id") or "",
         "title": item.get("title") or "",
+        "image_url": item.get("image_url") or "",
         "price": decimal_string(item.get("price")),
         "currency": item.get("currency") or "",
         "remote_stock": item.get("remote_stock"),

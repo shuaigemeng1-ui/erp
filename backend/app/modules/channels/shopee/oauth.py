@@ -336,6 +336,7 @@ def complete_authorization(
             environment=environment,
             external_store_id=str(shop_id),
             store_name=build_store_display_name(shop_id, profile),
+            external_name=build_store_display_name(shop_id, profile),
             region=build_store_region(profile),
             access_token=token["access_token"],
             refresh_token=token["refresh_token"],

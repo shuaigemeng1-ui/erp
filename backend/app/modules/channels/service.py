@@ -161,6 +161,7 @@ class StoreSummary:
     channel: str
     store_code: str
     name: str
+    external_name: str
     external_store_id: str
     region: str | None
     timezone: str
@@ -209,6 +210,7 @@ class RemoteListing:
     status: str
     specs: Mapping[str, str]
     raw: Mapping[str, Any]
+    image_url: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -710,6 +712,7 @@ def list_store_summaries(
             channel=store.channel,
             store_code=store.store_code,
             name=store.name,
+            external_name=store.external_name,
             external_store_id=store.external_store_id,
             region=store.region,
             timezone=store.timezone,
@@ -831,6 +834,7 @@ def upsert_store_from_authorization(
     environment: str,
     external_store_id: str,
     store_name: str,
+    external_name: str,
     region: str | None,
     access_token: str,
     refresh_token: str,
@@ -862,6 +866,7 @@ def upsert_store_from_authorization(
             raise AppError(ErrorCode.CONFLICT, "已连接店铺不能更换平台身份，请新建店铺")
         store.store_code = store.store_code or _generate_store_code(db, tenant_id, channel)
         store.external_store_id = external_id
+        store.external_name = external_name or store.external_name
         store.environment = environment
         store.region = region or store.region
         store.status = STORE_STATUS_CONNECTED
@@ -880,6 +885,7 @@ def upsert_store_from_authorization(
                 environment=environment,
                 store_code=_generate_store_code(db, tenant_id, channel),
                 name=store_name or f"{_channel_label(channel)} 店铺 {external_id}",
+                external_name=external_name or store_name,
                 external_store_id=external_id,
                 region=region,
                 timezone="UTC",
@@ -894,6 +900,7 @@ def upsert_store_from_authorization(
             store.store_code = store.store_code or _generate_store_code(db, tenant_id, channel)
             store.environment = environment
             store.name = store_name or store.name
+            store.external_name = external_name or store.external_name
             store.region = region or store.region
             store.status = STORE_STATUS_CONNECTED
             store.authorized_at = now
@@ -1378,6 +1385,41 @@ def _tiktok_price(sku: Mapping[str, Any], product: Mapping[str, Any]) -> Decimal
     return _decimal_price(sku.get("price") or product.get("price"))
 
 
+def _tiktok_currency(sku: Mapping[str, Any], product: Mapping[str, Any]) -> str:
+    price = sku.get("price")
+    if isinstance(price, Mapping):
+        value = str(price.get("currency") or "").strip()
+        if value:
+            return value[:8]
+    for source in (sku, product):
+        value = str(source.get("currency") or "").strip()
+        if value:
+            return value[:8]
+    return ""
+
+
+def _tiktok_image_url(product: Mapping[str, Any]) -> str:
+    """TikTok 详情接口的 main_images[].urls/thumb_urls；搜索接口不返回图片。"""
+    for key in ("main_images", "images"):
+        images = product.get(key)
+        if not isinstance(images, Sequence):
+            continue
+        for image in images:
+            if isinstance(image, Mapping):
+                for url_key in ("urls", "thumb_urls"):
+                    urls = image.get(url_key)
+                    if isinstance(urls, Sequence):
+                        value = next((str(item) for item in urls if item), "")
+                        if value:
+                            return value[:1000]
+                value = image.get("url") or image.get("thumb_url")
+                if value:
+                    return str(value)[:1000]
+            elif image:
+                return str(image)[:1000]
+    return ""
+
+
 def _tiktok_stock(sku: Mapping[str, Any]) -> int | None:
     inventory = sku.get("inventory")
     if isinstance(inventory, Sequence):
@@ -1425,7 +1467,7 @@ def parse_tiktok_listings(products: Sequence[Mapping[str, Any]]) -> list[RemoteL
             continue
         title = str(product.get("title") or product.get("product_name") or "")[:255]
         status = _tiktok_listing_status(product)
-        raw_currency = product.get("currency")
+        image_url = _tiktok_image_url(product)
         skus = product.get("skus") or product.get("skus_info") or []
         if not isinstance(skus, Sequence) or not skus:
             skus = [{}]
@@ -1443,10 +1485,11 @@ def parse_tiktok_listings(products: Sequence[Mapping[str, Any]]) -> list[RemoteL
                     external_sku_id=sku_id,
                     title=title,
                     price=_tiktok_price(sku, product),
-                    currency=str(raw_currency or "")[:8],
+                    currency=_tiktok_currency(sku, product),
                     remote_stock=_tiktok_stock(sku),
                     status=status,
                     specs=specs,
+                    image_url=image_url,
                     raw={
                         "channel": CHANNEL_TIKTOK,
                         "product": dict(product),
@@ -1471,7 +1514,29 @@ def _fetch_tiktok_listings(
             products = data.get("products") if isinstance(data, Mapping) else None
             if not isinstance(products, Sequence):
                 products = []
-            rows.extend(parse_tiktok_listings(products))
+            detailed: list[Mapping[str, Any]] = []
+            for product in products:
+                if not isinstance(product, Mapping):
+                    continue
+                product_id = normalize_external_id(product.get("id") or product.get("product_id"))
+                detail_product = product
+                if product_id:
+                    try:
+                        detail = client.get_product(product_id)
+                        detail_data = detail.get("data") if isinstance(detail, Mapping) else None
+                        candidate = (
+                            detail_data.get("product")
+                            if isinstance(detail_data, Mapping) and isinstance(detail_data.get("product"), Mapping)
+                            else detail_data
+                        )
+                        if isinstance(candidate, Mapping):
+                            # 搜索接口含价格/库存，详情接口含主图；合并时保留搜索 SKU 的价格。
+                            detail_product = {**product, **candidate}
+                            detail_product["skus"] = product.get("skus") or candidate.get("skus")
+                    except TikTokApiError as exc:
+                        logger.warning("TikTok 商品详情读取失败 product=%s：%s", product_id, exc)
+                detailed.append(detail_product)
+            rows.extend(parse_tiktok_listings(detailed))
             page_token = str((data or {}).get("next_page_token") or "") if isinstance(data, Mapping) else ""
             if not page_token:
                 break
@@ -1923,6 +1988,7 @@ def _upsert_listing_row(
             title=remote.title,
             price=remote.price,
             currency=remote.currency,
+            image_url=remote.image_url,
             remote_stock=remote.remote_stock,
             status=remote.status,
             raw=dict(remote.raw),
@@ -1937,6 +2003,7 @@ def _upsert_listing_row(
         listing.title = remote.title or listing.title
         listing.price = remote.price if remote.price is not None else listing.price
         listing.currency = remote.currency or listing.currency
+        listing.image_url = remote.image_url or listing.image_url
         listing.remote_stock = remote.remote_stock
         listing.status = remote.status
         listing.raw = dict(remote.raw)
@@ -2266,6 +2333,7 @@ def list_listing_summaries(
                 "external_item_id": listing.external_item_id,
                 "external_sku_id": listing.external_sku_id,
                 "title": listing.title,
+                "image_url": listing.image_url,
                 "price": listing.price,
                 "currency": listing.currency,
                 "remote_stock": listing.remote_stock,

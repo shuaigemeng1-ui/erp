@@ -198,6 +198,19 @@ onMounted(loadStores)
       <el-table-column label="平台 SKU" width="150">
         <template #default="{ row }"><span class="mono">{{ textOrDash(row.external_sku_id) }}</span></template>
       </el-table-column>
+      <el-table-column label="图片" width="76" align="center">
+        <template #default="{ row }">
+          <el-image
+            v-if="row.image_url"
+            :src="row.image_url"
+            fit="cover"
+            style="width: 48px; height: 48px; border-radius: 4px"
+            :preview-src-list="[row.image_url]"
+            preview-teleported
+          />
+          <span v-else>-</span>
+        </template>
+      </el-table-column>
       <el-table-column prop="title" label="标题" min-width="220" show-overflow-tooltip />
       <el-table-column label="价格" width="130" align="right">
         <template #default="{ row }">{{ formatDecimal(row.price) }} {{ row.currency ?? '' }}</template>

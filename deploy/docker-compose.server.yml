@@ -9,8 +9,11 @@
 # 1. 前端改用 frontend/Dockerfile.runtime（使用本地构建好的 dist，服务器不跑 Node 构建）。
 # 2. nginx 只绑定 127.0.0.1:${HTTP_PORT}，由宿主机 Caddy 反代到公网 80/443。
 # 3. MySQL 降低 buffer pool、关闭 performance_schema，限制各容器内存上限，
-#    适配 2GB 内存 + 2GB swap 的机器。
-# 4. Celery 并发由 .env 的 CELERY_CONCURRENCY 控制（建议 1）。
+#    适配 2GB 内存 + 2GB swap 的机器（新增 tiktok-refresh-worker 后重新分配上限）。
+# 4. Celery 并发由 .env 的 CELERY_CONCURRENCY 控制（2C2G 必须为 1）；
+#    tiktok_refresh 专用 Worker 由 profile=tiktok-refresh 启用，concurrency=1。
+# 5. 队列 Redis maxmemory=96MiB、容器上限 160m：剩余 ~64MiB 留给 Redis
+#    进程开销与 AOF rewrite；保持 noeviction + appendfsync everysec。
 # =============================================================================
 services:
   mysql:
@@ -19,25 +22,30 @@ services:
       - --collation-server=utf8mb4_0900_ai_ci
       - --default-time-zone=+00:00
       - --innodb-buffer-pool-size=${MYSQL_INNODB_BUFFER_POOL_SIZE:-128M}
-      - --max-connections=${MYSQL_MAX_CONNECTIONS:-100}
+      - --max-connections=${MYSQL_MAX_CONNECTIONS:-150}
       - --performance-schema=OFF
       - --skip-name-resolve
-    mem_limit: ${MYSQL_MEM_LIMIT:-700m}
+    mem_limit: ${MYSQL_MEM_LIMIT:-600m}
 
   redis-cache:
     mem_limit: ${CACHE_REDIS_MEM_LIMIT:-96m}
 
   redis-queue:
+    # maxmemory 96MiB 由基础 compose 的 QUEUE_REDIS_MAXMEMORY 控制；
+    # 容器上限 160m 留出进程/AOF rewrite 余量，禁止把 maxmemory 调到接近 mem_limit。
     mem_limit: ${QUEUE_REDIS_MEM_LIMIT:-160m}
 
   api:
-    mem_limit: ${API_MEM_LIMIT:-420m}
+    mem_limit: ${API_MEM_LIMIT:-360m}
 
   worker:
-    mem_limit: ${WORKER_MEM_LIMIT:-420m}
+    mem_limit: ${WORKER_MEM_LIMIT:-320m}
+
+  tiktok-refresh-worker:
+    mem_limit: ${TIKTOK_REFRESH_WORKER_MEM_LIMIT:-200m}
 
   scheduler:
-    mem_limit: ${SCHEDULER_MEM_LIMIT:-160m}
+    mem_limit: ${SCHEDULER_MEM_LIMIT:-120m}
 
   nginx:
     build:

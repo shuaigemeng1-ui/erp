@@ -26,9 +26,10 @@ API、Celery Worker、独立调度进程、独立迁移发布任务、Nginx 反�
 | --- | --- | --- | --- | --- |
 | `mysql` | `mysql:8.4` | 默认 | backend（internal） | InnoDB、utf8mb4、UTC；无宿主端口 |
 | `redis-cache` | `redis:7` | `volatile-lru` | backend | 会话/缓存，允许淘汰 |
-| `redis-queue` | `redis:7` | `noeviction` + AOF | backend | Celery broker/结果，禁止淘汰 |
+| `redis-queue` | `redis:7` | `noeviction` + AOF everysec | backend | Celery broker/结果，禁止淘汰；2C2G `maxmemory=96MiB`、容器上限 160m |
 | `api` | backend/Dockerfile | `uvicorn app.main:app` | edge + backend | 不迁移、不对外暴露端口 |
-| `worker` | backend/Dockerfile | `celery -A app.workers.celery_app worker -Q default,outbox,scheduler,channel,sales` | edge + backend | 需要访问 Shopee，故接 edge |
+| `worker` | backend/Dockerfile | `celery -A app.workers.celery_app worker -Q default,outbox,scheduler,channel,sales --concurrency=${CELERY_CONCURRENCY:-1}` | edge + backend | 普通业务 Worker；2C2G 保持 1 个执行位，需访问 Shopee |
+| `tiktok-refresh-worker` | backend/Dockerfile | `celery ... worker -Q tiktok_refresh --concurrency=${TIKTOK_REFRESH_CONCURRENCY:-1}` | edge + backend | 专用 TikTok 刷新 Worker；`profile=tiktok-refresh`，默认不启动，依赖 task-40 队列路由 |
 | `scheduler` | backend/Dockerfile | `python -m app.workers.scheduler` | edge + backend | 独立调度进程，不放进 API 副本 |
 | `migrate` | backend/Dockerfile | `python scripts/migrate_all.py` | backend | `profile=release`，仅发布时运行 |
 | `nginx` | frontend/Dockerfile | `nginx -g 'daemon off;'` | edge | 唯一对外入口：`HTTP_PORT` → 容器 80 |
@@ -259,8 +260,10 @@ API 以单容器单进程运行，扩容用 `docker compose up -d --scale api=3`
 | `CENTER_DB_*` | 中心库库名与运行账号 |
 | `TENANT_DB_PREFIX` / `TENANT_DB_USER_PREFIX` | 租户库与账号命名前缀 |
 | `TENANT_POOL_SIZE` / `TENANT_MAX_OVERFLOW` | 每租户连接池，注意与 `MYSQL_MAX_CONNECTIONS` 匹配 |
-| `CACHE_REDIS_MAXMEMORY` / `QUEUE_REDIS_MAXMEMORY` | 两个 Redis 实例内存上限 |
-| `CELERY_CONCURRENCY` | Worker 并发度（IO 密集任务可适当提高） |
+| `CACHE_REDIS_MAXMEMORY` / `QUEUE_REDIS_MAXMEMORY` | 两个 Redis 实例内存上限；2C2G 队列用 `96mb`，必须低于容器 mem_limit（160m）并留 AOF rewrite 余量 |
+| `CELERY_CONCURRENCY` | 普通业务 Worker 并发度；2C2G 保持 `1` |
+| `TIKTOK_REFRESH_QUEUE` / `TIKTOK_REFRESH_CONCURRENCY` | 专用 TikTok 刷新 Worker 队列名/并发（默认 `tiktok_refresh` / `1`，profile 开启后生效） |
+| `TIKTOK_REFRESH_WORKER_MEM_LIMIT` | 专用 Worker 容器内存上限（低配默认 `200m`） |
 | `SHOPEE_AUTH_REDIRECT_URL` | 必须与 Shopee 应用后台登记的回调地址一致 |
 | `BOOTSTRAP_PLATFORM_ADMIN_*` | 首次管理员，初始化后建议清空 |
 
@@ -293,6 +296,8 @@ API 以单容器单进程运行，扩容用 `docker compose up -d --scale api=3`
 ```bash
 docker compose -f deploy/docker-compose.yml config -q                        # 使用 Compose 默认值
 docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example config -q
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.server.yml \
+  --env-file deploy/.env.example --profile tiktok-refresh config -q           # 含专用 Worker
 docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example config --profiles
 ```
 
@@ -321,12 +326,18 @@ curl -fsS http://127.0.0.1:8080/api/v1/auth/csrf
    # HTTP_BIND=127.0.0.1  HTTP_PORT=8081
    # APP_ORIGIN=http://<公网IP>  CORS_ALLOW_ORIGINS=http://<公网IP>
    # PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/  PIP_TRUSTED_HOST=mirrors.aliyun.com
-   # CELERY_CONCURRENCY=1  MYSQL_INNODB_BUFFER_POOL_SIZE=128M  MYSQL_MAX_CONNECTIONS=100
+   # CELERY_CONCURRENCY=1  MYSQL_INNODB_BUFFER_POOL_SIZE=128M  MYSQL_MAX_CONNECTIONS=150
+   # QUEUE_REDIS_MAXMEMORY=96mb  CACHE_REDIS_MAXMEMORY=64mb  MYSQL_MEM_LIMIT=600m  API_MEM_LIMIT=360m
    cd deploy
    docker compose -f docker-compose.yml -f docker-compose.server.yml --env-file .env up -d --build
    docker compose -f docker-compose.yml -f docker-compose.server.yml --env-file .env --profile release run --rm migrate
    docker compose -f docker-compose.yml -f docker-compose.server.yml --env-file .env exec -T api python -m app.cli platform-init
    ```
+
+   > 2026-11 起队列 Redis 目标为 `maxmemory=96MiB` + 容器 `160m`，普通 Worker
+   > `concurrency=1`；新增 `tiktok-refresh-worker`（profile=`tiktok-refresh`，只消费
+   > `tiktok_refresh`，concurrency=1，依赖 task-40 队列路由）。完整内存/CPU/MySQL
+   > 连接预算与上线窗口步骤见 [`docs/deploy44-redis-worker.md`](../docs/deploy44-redis-worker.md)。
 
 3. 宿主机 Caddy 反代 + 自动 HTTPS（保留已有站点，仅追加域名与 IP 跳转站点；
    完整示例见 `deploy/caddy/Caddyfile.example`）：
@@ -416,7 +427,7 @@ curl -fsS http://127.0.0.1:8080/api/v1/auth/csrf
 | 组件 | 持久化方式 | 实测 |
 | --- | --- | --- |
 | MySQL 8.4 | 命名卷 `ventasync_mysql_data` → `/var/lib/mysql` | 225MB；重启容器后中心库/租户库行数完全一致 |
-| Celery 队列 Redis | 命名卷 `ventasync_redis_queue_data` → `/data`，AOF `yes` + `noeviction` | 重启保留未执行任务 |
+| Celery 队列 Redis | 命名卷 `ventasync_redis_queue_data` → `/data`，AOF `yes` + `noeviction`；2C2G `maxmemory=96MiB`、容器 160m | 重启保留未执行任务；降 maxmemory 需窗口 |
 | 缓存/会话 Redis | 不持久化（可接受：会话重建即可） | — |
 | 业务备份 | `deploy/scripts/backup.sh` + 每日 03:30 cron，保留 14 天 | 中心库 + 全部租户库 `.sql.gz + .sha256` |
 

@@ -4,7 +4,8 @@
 # 进程分离（plan.txt「部署」与「迁移使用独立发布任务执行」）：
 #   mysql / redis-cache / redis-queue  数据服务（仅内部网络）
 #   api                                 FastAPI（uvicorn app.main:app），不执行迁移
-#   worker                              Celery Worker（default,outbox,scheduler,channel,sales 五队列）
+#   worker                              Celery Worker（default,outbox,scheduler,channel,sales 五队列；2C2G 建议 concurrency=1）
+#   tiktok-refresh-worker               TikTok 订单刷新专用 Worker（profile=tiktok-refresh，只消费 tiktok_refresh，默认不启动）
 #   scheduler                           独立调度进程（python -m app.workers.scheduler）
 #   migrate                             独立发布任务（profile=release），中心库 + 全部租户库 alembic upgrade head
 #   nginx                               公网入口：/api 反代 + 前端静态（frontend/Dockerfile 多阶段构建）
@@ -203,7 +204,9 @@ services:
     restart: unless-stopped
     logging: *default-logging
 
-  # 任务队列 / Celery 结果：noeviction + AOF，清缓存不能清除待执行任务
+  # 任务队列 / Celery 结果：noeviction + AOF，清缓存不能清除待执行任务。
+  # 2C2G：maxmemory=96MiB、容器上限 160m（server 覆盖），为进程/AOF rewrite 留余量；
+  # maxmemory 必须低于 mem_limit，降上限需在发布窗口执行并先检查 used_memory。
   redis-queue:
     image: redis:7
     command:
@@ -215,7 +218,7 @@ services:
       - --save
       - ""
       - --maxmemory
-      - ${QUEUE_REDIS_MAXMEMORY:-512mb}
+      - ${QUEUE_REDIS_MAXMEMORY:-96mb}
       - --maxmemory-policy
       - noeviction
     environment:
@@ -281,7 +284,47 @@ services:
       - --loglevel
       - ${CELERY_LOG_LEVEL:-INFO}
       - --concurrency
-      - ${CELERY_CONCURRENCY:-4}
+      - ${CELERY_CONCURRENCY:-1}
+    environment: *app-env
+    networks:
+      - edge
+      - backend
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app inspect ping --timeout 10 >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+  # TikTok 订单刷新专用 Worker：只消费 tiktok_refresh，避免与普通业务队列抢占执行位。
+  # 默认 profile 不启动；task-40 落地队列路由后，在发布窗口用
+  #   docker compose --profile tiktok-refresh up -d --no-deps tiktok-refresh-worker
+  # 启用。启用前不要向 tiktok_refresh 投递任务（否则会积压，普通 worker 不消费该队列）。
+  tiktok-refresh-worker:
+    <<: *backend
+    profiles: ["tiktok-refresh"]
+    command:
+      - celery
+      - -A
+      - app.workers.celery_app
+      - worker
+      - -Q
+      - ${TIKTOK_REFRESH_QUEUE:-tiktok_refresh}
+      - --loglevel
+      - ${CELERY_LOG_LEVEL:-INFO}
+      - --concurrency
+      - ${TIKTOK_REFRESH_CONCURRENCY:-1}
+      - --hostname
+      - tiktok-refresh@%h
     environment: *app-env
     networks:
       - edge

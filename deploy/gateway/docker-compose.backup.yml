@@ -1,0 +1,73 @@
+# 网关 SQLite 备份 sidecar（与 gateway 同一 Compose 项目）
+#
+# 用法（在 /opt/erp，需与主 compose 合并；不会重启/修改 gateway 容器）：
+#   cp deploy/gateway/backup.env.example /opt/erp-gateway/backup.env
+#   chmod 600 /opt/erp-gateway/backup.env
+#   docker compose -f deploy/gateway/docker-compose.yml \
+#     -f deploy/gateway/docker-compose.backup.yml \
+#     --env-file /opt/erp-gateway/.env --env-file /opt/erp-gateway/backup.env \
+#     --profile backup up -d gateway-backup
+#
+# 说明：
+# * 只读挂载 gateway_data:/data，备份进程无法修改生产 SQLite/WAL；
+# * 脚本通过 SQLite online backup API 生成一致性快照，不直接 cp WAL；
+# * 默认每 900 秒（15 分钟）快照一次；密钥文件只读挂载；
+# * 本文件是可选 profile，普通 `up -d` 不会启动备份容器。
+name: erp-gateway
+
+services:
+  gateway-backup:
+    image: erp-gateway:${GATEWAY_IMAGE_TAG:-latest}
+    profiles: ["backup"]
+    restart: unless-stopped
+    init: true
+    depends_on:
+      gateway:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    volumes:
+      # 只读挂载生产数据卷；backup 只读 SQLite 文件（WAL 由 online backup 读取）。
+      - gateway_data:/data:ro
+      # 挂载仓库脚本（只读）；默认从 deploy/gateway 相对仓库根目录解析。
+      - ${GATEWAY_BACKUP_SCRIPT_DIR:-../../scripts}:/opt/gateway-backup:ro
+      # 本地私有备份目录（权限 700，文件 600）。
+      - ${GATEWAY_BACKUP_ROOT:-/opt/erp-gateway/backups}:/backup
+      # 加密密钥目录（只读；密钥文件必须与备份分开保存）。
+      - ${GATEWAY_BACKUP_KEY_DIR:-/opt/erp-gateway/keys}:/keys:ro
+      # 独立私有目录/挂载盘（异机备份由该目录的远端同步或另挂 NFS 完成）。
+      - ${GATEWAY_BACKUP_OFFSITE_DIR:-/opt/erp-gateway/offsite}:/offsite
+    environment:
+      GATEWAY_BACKUP_KEY_FILE: /keys/backup.key
+      GATEWAY_BACKUP_RECENT_HOURS: ${GATEWAY_BACKUP_RECENT_HOURS:-24}
+      GATEWAY_BACKUP_DAILY_DAYS: ${GATEWAY_BACKUP_DAILY_DAYS:-30}
+      GATEWAY_RETENTION_PAYLOAD_DAYS: ${GATEWAY_RETENTION_PAYLOAD_DAYS:-7}
+      GATEWAY_RETENTION_DEDUP_DAYS: ${GATEWAY_RETENTION_DEDUP_DAYS:-30}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        set -eu;
+        while true; do
+          python /opt/gateway-backup/gateway_backup.py snapshot
+            --source /data/gateway.db
+            --backup-root /backup
+            --key-file /keys/backup.key
+            --recent-hours "${GATEWAY_BACKUP_RECENT_HOURS:-24}"
+            --daily-days "${GATEWAY_BACKUP_DAILY_DAYS:-30}"
+            --offsite local --offsite-dir /offsite
+            --json
+          || echo "gateway backup failed (see JSON/logs above)" >&2;
+          python /opt/gateway-backup/gateway_backup.py retention
+            --database /data/gateway.db --json
+          || echo "gateway retention dry-run failed (no deletion performed)" >&2;
+          sleep "${GATEWAY_BACKUP_INTERVAL_SECONDS:-900}";
+        done
+
+volumes:
+  # 覆盖基础 compose 的卷名；实际生产如 erp-gateway-v2-data 用 GATEWAY_DATA_VOLUME 指定。
+  gateway_data:
+    name: ${GATEWAY_DATA_VOLUME:-erp_gateway_data}

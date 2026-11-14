@@ -9,6 +9,7 @@
 - 2 vCPU
 - 4 GB RAM
 - 40 GB 系统盘 + 30–50 GB `/data` 持久盘
+- 独立备份盘/NFS/异机目录（建议 30–50 GB，用于加密 SQLite 快照与恢复演练；禁止与 `/data` 同盘）
 - Ubuntu 24.04 LTS
 - Docker Engine + Compose v2
 - 公网域名（示例 `gateway.example.com`）和 HTTPS 证书
@@ -21,6 +22,8 @@
 ```text
 /opt/erp-gateway/
   docker-compose.yml
+  docker-compose.backup.yml   # 可选备份 sidecar（每 15 分钟）
+  backup.env                  # 备份目录/密钥目录/频率/保留（600）
   .env
 ```
 
@@ -109,14 +112,58 @@ GATEWAY_PUBLIC_URL=https://gateway.example.com
 
 任何时候都要保留旧链路可用，直到新链验证完成。
 
-## 8. 备份
+## 8. 备份与恢复（SQLite 在线快照，禁止直接 cp/tar WAL）
+
+网关 SQLite 使用 WAL 模式，直接 `cp`/`tar` 数据卷会得到不一致副本。使用仓库脚本
+`scripts/gateway_backup.py`（SQLite 在线备份 API + 加密 + manifest + 恢复演练）：
 
 ```bash
-docker run --rm -v erp_gateway_data:/data -v "$PWD":/backup alpine \
-  tar czf /backup/gateway-data-$(date +%Y%m%d).tgz -C /data .
+# 1) 独立密钥目录（权限 700，密钥 600；必须与备份分开保存）
+install -d -m 700 /opt/erp-gateway/keys
+python3 /opt/erp/scripts/gateway_backup.py snapshot \
+  --key-file /opt/erp-gateway/keys/backup.key --init-key
+
+# 2) 手动快照（sidecar 未启用时；实际生产建议用备份 sidecar）
+python3 /opt/erp/scripts/gateway_backup.py snapshot \
+  --source /data/gateway.db \
+  --backup-root /opt/erp-gateway/backups \
+  --key-file /opt/erp-gateway/keys/backup.key \
+  --offsite local --offsite-dir /opt/erp-gateway/offsite --json
+
+# 3) 隔离恢复演练（只读备份 + 临时目录；不碰生产卷）
+python3 /opt/erp/scripts/gateway_backup.py restore-drill \
+  --backup /opt/erp-gateway/backups/gateway-*.db.enc \
+  --key-file /opt/erp-gateway/keys/backup.key \
+  --work-dir /tmp/gateway-drill --report-dir /tmp/gateway-drill-reports --json
+
+# 4) 只读状态 / 磁盘预算 / 事件清理（默认 dry-run）
+python3 /opt/erp/scripts/gateway_backup.py status \
+  --database /data/gateway.db --backup-root /opt/erp-gateway/backups --json
+python3 /opt/erp/scripts/gateway_backup.py retention \
+  --database /data/gateway.db --json
 ```
 
-同时备份 `GATEWAY_SECRET_KEY` 到独立密钥管理系统；密钥丢失将无法解密渠道凭据。
+15 分钟自动快照（可选 sidecar，只读挂载数据卷，不重启主网关）：
+
+```bash
+cp deploy/gateway/backup.env.example /opt/erp-gateway/backup.env
+chmod 600 /opt/erp-gateway/backup.env
+# 实际卷名如 erp-gateway-v2-data：在 backup.env 设置 GATEWAY_DATA_VOLUME
+docker compose -f deploy/gateway/docker-compose.yml \
+  -f deploy/gateway/docker-compose.backup.yml \
+  --env-file /opt/erp-gateway/.env --env-file /opt/erp-gateway/backup.env \
+  --profile backup config -q
+docker compose -f deploy/gateway/docker-compose.yml \
+  -f deploy/gateway/docker-compose.backup.yml \
+  --env-file /opt/erp-gateway/.env --env-file /opt/erp-gateway/backup.env \
+  --profile backup up -d --no-deps gateway-backup
+```
+
+保留策略：已完成事件原文 7 天、去重行 30 天、未完成事件保留到处理结束；
+`retention --apply` 必须在维护窗口、先备份、先 dry-run 后执行。
+快照保留：最近 24h 全部 + 30 天每日一份，磁盘预算见
+`docs/gateway-backup.md`。同时把 `GATEWAY_SECRET_KEY` 和备份加密密钥
+`backup.key` 分别保存到独立密钥管理系统；密钥丢失将无法恢复渠道凭据/备份。
 
 ## 9. 安全
 

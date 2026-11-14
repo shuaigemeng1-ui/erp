@@ -116,7 +116,9 @@ state/刷新锁等集成状态，不保存租户业务数据。
 3. **旧 8100 未删除**：旧容器 `erp-gateway` 已停但未删除，旧端口 8100 仍占位；观察期后按回滚策略清理。
 4. **旧卷保留**：`erp-gateway-data` 保留回滚，需纳入备份/密钥管理，避免泄露渠道凭据。
 5. **监控/告警**：网关健康与证书到期需纳入监控；当前仅人工健康检查。
-6. **备份恢复演练**：网关 SQLite 备份已生成，但独立恢复演练未执行；恢复需同时恢复 `GATEWAY_SECRET_KEY`。
+6. **备份恢复演练**：在线一致性快照/加密/恢复脚本与 sidecar 已交付（`docs/gateway-backup.md`，
+   task-45），本地合成数据演练通过；**生产最新备份的隔离 restore-drill 尚未执行**，且恢复需同时恢复
+   `GATEWAY_SECRET_KEY` 与备份加密密钥。
 7. **标准部署包与实际不一致**：`deploy/gateway/` 默认 8100/erp-gateway/erp_gateway_data；本次实际为
    8101/erp-gateway-v2/erp-gateway-v2-data。后续发布需统一命名或明确覆盖值，避免误操作。
 
@@ -138,8 +140,11 @@ docker volume ls | grep -E 'erp-gateway(-v2)?-data'
 # 日志（不输出密钥）
 docker logs --tail 100 erp-gateway-v2
 
-# 备份文件
+# 旧 tar 备份（仅历史回滚资产；**不可用于在线一致性恢复**）
 ls -l /opt/erp-gateway/backups/gateway-data-20261113T103136Z.tgz
+# 新方案：SQLite 在线快照 + 加密 + manifest + 恢复演练（task-45）
+python3 /opt/erp/scripts/gateway_backup.py status \
+  --database /data/gateway.db --backup-root /opt/erp-gateway/backups --json
 ```
 
 Caddy 配置变更后先 `caddy validate`/`caddy reload`（按中心机实际方式），并确认 TLS 证书状态。
@@ -161,6 +166,7 @@ Caddy 配置变更后先 `caddy validate`/`caddy reload`（按中心机实际方
 
 ## 10. 关联文档
 
+- 网关 SQLite 一致性快照/加密异机备份/恢复演练：`docs/gateway-backup.md`（task-45，含自测证据与磁盘预算）
 - 部署形态：`docs/deployment-modes.md`
 - 租户接入：`docs/batch4-tenant-onboarding.md`
 - 验收状态：`docs/acceptance.md`

@@ -17,14 +17,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import random
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Mapping
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-from urllib.request import Request as UrlRequest, urlopen
+from urllib.request import Request as UrlRequest
+from urllib.request import urlopen
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
@@ -46,10 +52,12 @@ from app.modules.gateway.webhook import (
     relay_signature,
     tenant_relay_url,
     verify_tiktok_signature,
+    webhook_idempotency_key,
 )
 
 INSTANCE_TOKEN_HEADER = "x-gateway-instance-token"
 ADMIN_TOKEN_HEADER = "x-gateway-token"
+logger = logging.getLogger("ventasync.gateway")
 
 
 # --------------------------------------------------------------------------- 错误
@@ -144,6 +152,25 @@ class WebhookShopIn(BaseModel):
     platform_shop_id: str = Field(min_length=1, max_length=64)
 
 
+class WebhookReplayIn(BaseModel):
+    """按事件/店铺/时间段重放（复用原 notification ID 与幂等键）。"""
+
+    event_ids: list[int] = Field(default_factory=list)
+    event_id: int | None = Field(default=None, gt=0)
+    notification_ids: list[str] = Field(default_factory=list)
+    notification_id: str = Field(default="", max_length=128)
+    platform_shop_id: str = Field(default="", max_length=64)
+    shop_id: str = Field(default="", max_length=64)
+    tenant_id: int | None = Field(default=None, gt=0)
+    created_from: str = Field(default="", max_length=64)
+    created_after: str = Field(default="", max_length=64)
+    created_to: str = Field(default="", max_length=64)
+    created_before: str = Field(default="", max_length=64)
+    statuses: list[str] = Field(default_factory=lambda: ["dead"])
+    operator: str = Field(min_length=1, max_length=100, description="操作人（写入审计）")
+    limit: int = Field(default=500, ge=1, le=1000)
+
+
 class MigrationSwitchIn(BaseModel):
     instance_auth_enabled: bool | None = None
     legacy_tenant_admin_enabled: bool | None = None
@@ -154,7 +181,73 @@ class MigrationSwitchIn(BaseModel):
 
 # --------------------------------------------------------------------------- 工具
 def _iso_from_epoch(epoch: int) -> str:
-    return datetime.fromtimestamp(int(epoch), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.fromtimestamp(int(epoch), tz=UTC).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_time_filter(value: str, *, end: bool = False) -> str:
+    """把日期/ISO/epoch 统一成 UTC ISO 文本；date-only 的结束时间补齐到当天末尾。"""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if raw.isdigit():
+        return _iso_from_epoch(int(raw))
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise _error(400, "gateway_time_filter_invalid", f"时间格式无效：{raw}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    if end and "T" not in raw and " " not in raw:
+        parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _retry_after_seconds(value: str | None) -> int | None:
+    """解析 Retry-After（秒或 HTTP-date）；无效返回 None。"""
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return max(0, int(raw))
+    try:
+        parsed = parsedate_to_datetime(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return max(0, int(parsed.timestamp() - time.time()))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _webhook_retry_delay(cfg: GatewayConfig, attempts: int, retry_after: int | None) -> int:
+    """Retry-After 优先；否则指数退避+抖动；始终限制在 [1, max] 秒。"""
+    if retry_after is not None:
+        return max(1, min(int(cfg.webhook_retry_max_seconds), int(retry_after)))
+    exponent = min(max(0, int(attempts) - 1), 20)
+    base = max(1, int(cfg.webhook_retry_base_seconds)) * (2**exponent)
+    jitter_percent = max(0, min(100, int(cfg.webhook_retry_jitter_percent)))
+    if jitter_percent:
+        jitter = base * jitter_percent / 100.0
+        base = int(base + random.uniform(-jitter, jitter))
+    return max(1, min(int(cfg.webhook_retry_max_seconds), int(base)))
+
+
+def _parse_webhook_receipt(body: bytes) -> dict[str, Any] | None:
+    """解析租户 relay 严格 JSON 回执；非对象/非法 JSON 返回 None。"""
+    if not body:
+        return None
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _receipt_error(receipt: Mapping[str, Any] | None) -> str:
+    if not receipt:
+        return "tenant relay response is not a JSON receipt"
+    reason = str(receipt.get("reason") or "").strip()
+    status = str(receipt.get("status") or "").strip()
+    return f"tenant relay receipt received={receipt.get('received')} duplicate={receipt.get('duplicate')} mapping_missing={receipt.get('mapping_missing')} reason={reason or status or 'unknown'}"
 
 
 def _json_response_error(status_code: int, code: str, message: str) -> JSONResponse:
@@ -316,31 +409,64 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
         raise _error(401, "gateway_token_required", "缺少实例令牌或管理令牌")
 
     # ------------------------------------------------------------------ Webhook 分发
-    def _deliver_webhook_event(event: Mapping[str, Any]) -> None:
-        """Best-effort delivery from durable Gateway inbox to the tenant relay."""
+    def _deliver_webhook_event(event: Mapping[str, Any], lease_token: str) -> None:
+        """单次投递：保留真实 HTTP 状态码/Retry-After，按租约回写结果。"""
         event_id = int(event["id"])
-        attempts = int(event.get("attempts") or 0) + 1
-        if not cfg.webhook_relay_secret:
-            store.mark_webhook_event(
+        attempts = max(1, int(event.get("attempts") or 1))
+        started = time.perf_counter()
+
+        def _elapsed_ms() -> int:
+            return max(0, int((time.perf_counter() - started) * 1000))
+
+        def _retry(status_code: int, failure_class: str, error: str, retry_after: int | None) -> None:
+            delay = _webhook_retry_delay(cfg, attempts, retry_after)
+            if failure_class in {"mapping_missing", "persist_failed"}:
+                logger.warning(
+                    "webhook delivery alert event_id=%s class=%s status=%s delay=%ss error=%s",
+                    event_id,
+                    failure_class,
+                    status_code,
+                    delay,
+                    error[:300],
+                )
+            store.complete_webhook_event(
                 event_id,
+                lease_token,
                 status="pending",
-                attempts=attempts,
-                next_attempt_at=epoch_now() + 60,
-                last_error="GATEWAY_WEBHOOK_RELAY_SECRET is not configured",
+                status_code=status_code,
+                latency_ms=_elapsed_ms(),
+                next_attempt_at=epoch_now() + delay,
+                last_error=error,
+                failure_class=failure_class,
             )
+
+        def _dead(status_code: int, failure_class: str, error: str) -> None:
+            store.complete_webhook_event(
+                event_id,
+                lease_token,
+                status="dead",
+                status_code=status_code,
+                latency_ms=_elapsed_ms(),
+                last_error=error,
+                failure_class=failure_class,
+            )
+
+        if not cfg.webhook_relay_secret:
+            _retry(0, "config", "GATEWAY_WEBHOOK_RELAY_SECRET is not configured", None)
             return
-        instance = store.get_instance(int(event["instance_id"])) if event.get("instance_id") else None
+        instance_id = event.get("instance_id")
+        instance = store.get_instance(int(instance_id)) if instance_id else None
         if instance is None:
-            store.mark_webhook_event(event_id, status="dead", attempts=attempts, last_error="instance not found")
+            _dead(0, "mapping", "instance not found")
             return
         relay_url = tenant_relay_url(str(instance.get("callback_url") or ""))
         if not relay_url:
-            store.mark_webhook_event(event_id, status="dead", attempts=attempts, last_error="tenant relay url missing")
+            _dead(0, "mapping", "tenant relay url missing")
             return
         try:
             raw_body = decrypt_secret(cfg, str(event.get("payload_cipher") or "")).encode("utf-8")
-        except Exception:
-            store.mark_webhook_event(event_id, status="dead", attempts=attempts, last_error="payload decrypt failed")
+        except Exception:  # noqa: BLE001 - 密钥/密文损坏属于永久坏报文
+            _dead(0, "payload_permanent", "payload decrypt failed")
             return
         timestamp = str(epoch_now())
         signature = relay_signature(
@@ -348,60 +474,177 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
             timestamp=timestamp,
             raw_body=raw_body,
         )
+        notification_id = str(event.get("notification_id") or event_id)
         request = UrlRequest(
             relay_url,
             data=raw_body,
             method="POST",
             headers={
                 "Content-Type": "application/json",
+                "Idempotency-Key": webhook_idempotency_key(
+                    channel=str(event.get("channel") or "tiktok"),
+                    notification_id=notification_id,
+                ),
+                "X-Gateway-Notification-Id": notification_id,
                 "X-Gateway-Instance-Id": str(instance.get("id") or ""),
                 "X-Gateway-Tenant-Id": str(instance.get("tenant_id") or ""),
-                "X-Gateway-Event-Id": str(event.get("notification_id") or event_id),
+                "X-Gateway-Event-Id": notification_id,
                 "X-Gateway-Timestamp": timestamp,
                 "X-Gateway-Signature": signature,
             },
         )
+        status_code = 0
+        failure_class = ""
+        last_error = ""
+        retry_after: int | None = None
+        response_body = b""
         try:
-            with urlopen(request, timeout=10) as response:
+            with urlopen(request, timeout=cfg.webhook_delivery_timeout_seconds) as response:
                 status_code = int(response.status)
-                response.read(2048)
-        except Exception as exc:  # network/timeout/TLS
+                response_body = response.read(65536)
+        except HTTPError as exc:  # 关键：urllib 把 4xx/5xx 抛成 HTTPError，不能归为 0
+            status_code = int(exc.code or 0)
+            headers = exc.headers
+            retry_after = _retry_after_seconds(
+                headers.get("Retry-After") if headers is not None else None
+            )
+            try:
+                response_body = exc.read(65536)
+                body_text = response_body.decode("utf-8", "replace").strip()
+            except Exception:  # noqa: BLE001
+                body_text = ""
+            last_error = f"tenant relay HTTP {status_code}" + (
+                f": {body_text[:500]}" if body_text else ""
+            )
+        except (URLError, TimeoutError, OSError) as exc:
             status_code = 0
-            last_error = str(exc)[:500]
-        else:
-            last_error = ""
-        if 200 <= status_code < 300 or status_code == 409:
-            store.mark_webhook_event(event_id, status="delivered", attempts=attempts)
-            return
-        if status_code in {400, 413, 422}:
-            store.mark_webhook_event(
-                event_id, status="dead", attempts=attempts, last_error=last_error or f"tenant returned {status_code}"
+            failure_class = "network"
+            last_error = f"tenant relay network error: {exc}"
+        except Exception as exc:  # noqa: BLE001 - 单个事件异常不能杀死 dispatcher
+            status_code = 0
+            failure_class = "network"
+            last_error = f"tenant relay error: {exc}"
+
+        # 租户 relay 严格回执：只有 received=true 或 duplicate=true 才算已交付；
+        # 200 也可能是 mapping_missing/persist_failed，不能只看 HTTP 2xx。
+        receipt = _parse_webhook_receipt(response_body)
+        if receipt is not None and (
+            receipt.get("received") is True or receipt.get("duplicate") is True
+        ):
+            store.complete_webhook_event(
+                event_id,
+                lease_token,
+                status="delivered",
+                status_code=status_code,
+                latency_ms=_elapsed_ms(),
+                delivered=True,
             )
             return
-        # 5xx、超时、连接失败、401/403/404、以及长期配置故障都不能丢消息：
-        # 保持 pending，持续退避重试；租户升级/故障恢复后自动补投。
-        store.mark_webhook_event(
-            event_id,
-            status="pending",
-            attempts=attempts,
-            next_attempt_at=epoch_now() + min(3600, 5 * (2 ** min(attempts, 8))),
-            last_error=last_error or f"tenant returned {status_code}",
-        )
+        if receipt is not None and receipt.get("mapping_missing") is True:
+            _retry(status_code, "mapping_missing", _receipt_error(receipt), retry_after)
+            return
+        if receipt is not None and str(receipt.get("reason") or "") == "persist_failed":
+            _retry(status_code, "persist_failed", _receipt_error(receipt), retry_after)
+            return
+        if 200 <= status_code < 300 or status_code == 409:
+            _retry(status_code, "invalid_receipt", _receipt_error(receipt), retry_after)
+            return
+        if not failure_class:
+            if status_code in {400, 404, 410, 413, 422}:
+                failure_class = "payload_permanent" if status_code in {400, 413, 422} else "mapping"
+            elif status_code in {401, 403}:
+                failure_class = "auth"
+            elif status_code == 429:
+                failure_class = "rate_limit"
+            elif status_code >= 500:
+                failure_class = "server"
+            else:
+                failure_class = "unknown"
+        if receipt is not None:
+            last_error = _receipt_error(receipt)
+        last_error = last_error or f"tenant relay HTTP {status_code}"
+        if failure_class in {"payload_permanent", "mapping"}:
+            _dead(status_code, failure_class, last_error)
+            return
+        _retry(status_code, failure_class, last_error, retry_after)
 
     async def _webhook_dispatcher_loop() -> None:
         interval = max(1, int(cfg.webhook_dispatch_interval_seconds or 2))
+        global_limit = max(1, int(cfg.webhook_dispatch_global_concurrency))
+        tenant_limit = max(1, int(cfg.webhook_dispatch_tenant_concurrency))
+        store_limit = max(1, int(cfg.webhook_dispatch_store_concurrency))
+        tasks: set[asyncio.Task[Any]] = set()
+        task_meta: dict[asyncio.Task[Any], tuple[int, str]] = {}
+        tenant_in_flight: dict[int, int] = {}
+        store_in_flight: dict[str, int] = {}
+
+        def _done(task: asyncio.Task[Any]) -> None:
+            tasks.discard(task)
+            meta = task_meta.pop(task, None)
+            if meta is not None:
+                tenant_id, store_key = meta
+                tenant_in_flight[tenant_id] = max(0, tenant_in_flight.get(tenant_id, 0) - 1)
+                store_in_flight[store_key] = max(0, store_in_flight.get(store_key, 0) - 1)
+            try:
+                task.exception()
+            except Exception:  # noqa: BLE001 - 已由单事件投递捕获，这里只消费异常
+                pass
+
         while True:
             try:
                 if cfg.webhook_dispatch_enabled:
-                    pending = await asyncio.to_thread(store.list_pending_webhook_events, limit=20)
-                    for event in pending:
-                        await asyncio.to_thread(_deliver_webhook_event, event)
-            except Exception:  # noqa: BLE001 - dispatcher must survive one bad row
-                pass
-            await asyncio.sleep(interval)
+                    while len(tasks) < global_limit:
+                        capacity = global_limit - len(tasks)
+                        claimed = await asyncio.to_thread(
+                            store.claim_webhook_events,
+                            limit=min(capacity, cfg.webhook_claim_batch_size),
+                            lease_seconds=cfg.webhook_lease_seconds,
+                            tenant_limit=tenant_limit,
+                            store_limit=store_limit,
+                            tenant_in_flight=dict(tenant_in_flight),
+                            store_in_flight=dict(store_in_flight),
+                        )
+                        if not claimed:
+                            break
+                        for event in claimed:
+                            tenant_id = int(event.get("tenant_id") or 0)
+                            store_key = (
+                                f"{event.get('channel') or ''}:{event.get('platform_shop_id') or ''}"
+                            )
+                            tenant_in_flight[tenant_id] = tenant_in_flight.get(tenant_id, 0) + 1
+                            store_in_flight[store_key] = store_in_flight.get(store_key, 0) + 1
+                            task = asyncio.create_task(
+                                asyncio.to_thread(
+                                    _deliver_webhook_event,
+                                    event,
+                                    str(event.get("lease_token") or ""),
+                                )
+                            )
+                            tasks.add(task)
+                            task_meta[task] = (tenant_id, store_key)
+                            task.add_done_callback(_done)
+                        if len(tasks) >= global_limit:
+                            break
+                if len(tasks) >= global_limit:
+                    await asyncio.sleep(0.05)
+                elif tasks:
+                    await asyncio.sleep(0.05 if not cfg.webhook_dispatch_enabled else min(0.2, interval))
+                else:
+                    await asyncio.sleep(interval)
+            except Exception:  # noqa: BLE001 - dispatcher 必须持续运行
+                await asyncio.sleep(interval)
 
     @application.on_event("startup")
     async def _start_webhook_dispatcher() -> None:
+        application.state.webhook_deliver_event = _deliver_webhook_event
+        application.state.webhook_dispatch_config = {
+            "enabled": cfg.webhook_dispatch_enabled,
+            "global_concurrency": cfg.webhook_dispatch_global_concurrency,
+            "tenant_concurrency": cfg.webhook_dispatch_tenant_concurrency,
+            "store_concurrency": cfg.webhook_dispatch_store_concurrency,
+            "lease_seconds": cfg.webhook_lease_seconds,
+            "retry_max_seconds": cfg.webhook_retry_max_seconds,
+        }
         if not cfg.webhook_dispatch_enabled:
             return
         task = asyncio.create_task(_webhook_dispatcher_loop())
@@ -518,6 +761,91 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
         )
         return {"deactivated": True}
 
+    @application.get("/api/v1/gateway/admin/webhook-stats")
+    def admin_webhook_stats(request: Request) -> dict[str, Any]:
+        require_admin(request)
+        return {
+            "webhook": store.webhook_stats(),
+            "dispatch": {
+                "enabled": cfg.webhook_dispatch_enabled,
+                "global_concurrency": cfg.webhook_dispatch_global_concurrency,
+                "tenant_concurrency": cfg.webhook_dispatch_tenant_concurrency,
+                "store_concurrency": cfg.webhook_dispatch_store_concurrency,
+                "lease_seconds": cfg.webhook_lease_seconds,
+                "retry_base_seconds": cfg.webhook_retry_base_seconds,
+                "retry_max_seconds": cfg.webhook_retry_max_seconds,
+                "retry_jitter_percent": cfg.webhook_retry_jitter_percent,
+                "delivery_timeout_seconds": cfg.webhook_delivery_timeout_seconds,
+            },
+        }
+
+    @application.post("/api/v1/gateway/admin/webhook-events/replay")
+    def admin_replay_webhook_events(body: WebhookReplayIn, request: Request) -> dict[str, Any]:
+        """按事件/店铺/时间段重放；复用原 notification ID 与幂等键，记录操作人。"""
+        admin = require_admin(request)
+        operator = (body.operator or "").strip()
+        if not operator:
+            raise _error(400, "gateway_replay_operator_required", "重放必须提供操作人 operator")
+        allowed_statuses = {"pending", "delivered", "dead", "unroutable"}
+        statuses = [item.strip().lower() for item in body.statuses if item.strip()]
+        if not statuses or any(item not in allowed_statuses for item in statuses):
+            raise _error(400, "gateway_replay_status_invalid", "statuses 只能是 pending/delivered/dead/unroutable")
+        created_from = _normalize_time_filter(body.created_from or body.created_after)
+        created_to = _normalize_time_filter(body.created_to or body.created_before, end=True)
+        event_ids = list(body.event_ids) + ([int(body.event_id)] if body.event_id else [])
+        notification_ids = list(body.notification_ids) + (
+            [body.notification_id] if body.notification_id else []
+        )
+        platform_shop_id = body.platform_shop_id or body.shop_id
+        if not (event_ids or notification_ids or platform_shop_id or body.tenant_id or created_from or created_to):
+            # 仅按 statuses 全量重放风险过高；必须至少给出事件/店铺/租户/时间段之一。
+            raise _error(400, "gateway_replay_filter_required", "重放至少需要 event_ids/notification_ids/店铺/租户/时间段之一")
+        replayed = store.replay_webhook_events(
+            event_ids=event_ids,
+            notification_ids=notification_ids,
+            platform_shop_id=platform_shop_id,
+            tenant_id=body.tenant_id,
+            created_from=created_from,
+            created_to=created_to,
+            statuses=statuses,
+            limit=body.limit,
+        )
+        store.audit(
+            action="webhook.replay",
+            actor=operator,
+            summary=f"重放 Webhook 事件 {len(replayed)} 条",
+            payload={
+                "operator": operator,
+                "admin": admin,
+                "filters": {
+                    "event_ids": event_ids,
+                    "notification_ids": notification_ids,
+                    "platform_shop_id": platform_shop_id,
+                    "tenant_id": body.tenant_id,
+                    "created_from": created_from,
+                    "created_to": created_to,
+                    "statuses": statuses,
+                },
+                "replayed": len(replayed),
+                "event_ids": [int(row["id"]) for row in replayed],
+            },
+        )
+        return {
+            "replayed": len(replayed),
+            "operator": operator,
+            "events": [
+                {
+                    "id": str(row["id"]),
+                    "notification_id": row["notification_id"],
+                    "tenant_id": str(row["tenant_id"]) if row["tenant_id"] is not None else None,
+                    "platform_shop_id": row["platform_shop_id"],
+                    "status": row["status"],
+                    "replay_count": int(row.get("replay_count") or 0),
+                }
+                for row in replayed
+            ],
+        }
+
     # ------------------------------------------------------------------ 健康检查
     def health_payload() -> dict[str, Any]:
         if cfg.purge_expired_on_health:
@@ -529,6 +857,15 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
             "time": utc_now(),
             "channel_apps": store.channel_app_count(),
             "instances": store.instance_counts(),
+            "webhook": store.webhook_stats(),
+            "webhook_dispatch": {
+                "enabled": cfg.webhook_dispatch_enabled,
+                "global_concurrency": cfg.webhook_dispatch_global_concurrency,
+                "tenant_concurrency": cfg.webhook_dispatch_tenant_concurrency,
+                "store_concurrency": cfg.webhook_dispatch_store_concurrency,
+                "lease_seconds": cfg.webhook_lease_seconds,
+                "retry_max_seconds": cfg.webhook_retry_max_seconds,
+            },
             "flags": {
                 "instance_auth_enabled": store.instance_auth_enabled(),
                 "legacy_tenant_admin_enabled": store.legacy_tenant_admin_enabled(),

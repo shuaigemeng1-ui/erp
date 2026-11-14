@@ -119,3 +119,8 @@ def tenant_relay_url(callback_url: str) -> str:
     if not parsed.scheme or not parsed.netloc:
         return ""
     return f"{parsed.scheme}://{parsed.netloc}{TENANT_RELAY_PATH}"
+
+
+def webhook_idempotency_key(*, channel: str, notification_id: str) -> str:
+    """租户侧幂等键：同一通知重放时保持不变（original notification ID）。"""
+    return f"{(channel or 'tiktok').strip().lower()}:{str(notification_id).strip()}"

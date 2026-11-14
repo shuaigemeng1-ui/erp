@@ -21,15 +21,17 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Any, Iterator
+from datetime import UTC, datetime
+from typing import Any
 
 from app.modules.gateway.config import GatewayConfig
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def epoch_now() -> int:
@@ -182,6 +184,14 @@ CREATE TABLE IF NOT EXISTS gateway_webhook_events (
     duplicate_count INTEGER NOT NULL DEFAULT 0,
     next_attempt_at INTEGER NOT NULL DEFAULT 0,
     last_error TEXT NOT NULL DEFAULT '',
+    lease_token TEXT NOT NULL DEFAULT '',
+    lease_expires_at INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER NOT NULL DEFAULT 0,
+    last_status_code INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    delivered_at TEXT,
+    replay_count INTEGER NOT NULL DEFAULT 0,
+    failure_class TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(channel, notification_id)
@@ -224,7 +234,10 @@ class GatewayStore:
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout = {int(self.config.sqlite_busy_timeout_ms)}")
         connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = NORMAL")
+        synchronous = str(self.config.sqlite_synchronous or "FULL").upper()
+        if synchronous not in {"NORMAL", "FULL"}:
+            synchronous = "FULL"
+        connection.execute(f"PRAGMA synchronous = {synchronous}")
         connection.execute("PRAGMA foreign_keys = OFF")
         return connection
 
@@ -274,6 +287,32 @@ class GatewayStore:
                     connection.execute(
                         "ALTER TABLE gateway_oauth_states ADD COLUMN resolved_at TEXT"
                     )
+                # 旧网关 SQLite 升级（task-41）：webhook 并发租约/真实状态码/延迟/重放字段。
+                webhook_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(gateway_webhook_events)"
+                    ).fetchall()
+                }
+                webhook_migrations = {
+                    "lease_token": "TEXT NOT NULL DEFAULT ''",
+                    "lease_expires_at": "INTEGER NOT NULL DEFAULT 0",
+                    "last_attempt_at": "INTEGER NOT NULL DEFAULT 0",
+                    "last_status_code": "INTEGER NOT NULL DEFAULT 0",
+                    "latency_ms": "INTEGER NOT NULL DEFAULT 0",
+                    "delivered_at": "TEXT",
+                    "replay_count": "INTEGER NOT NULL DEFAULT 0",
+                    "failure_class": "TEXT NOT NULL DEFAULT ''",
+                }
+                for column, definition in webhook_migrations.items():
+                    if column not in webhook_columns:
+                        connection.execute(
+                            f"ALTER TABLE gateway_webhook_events ADD COLUMN {column} {definition}"
+                        )
+                connection.execute(
+                    """CREATE INDEX IF NOT EXISTS ix_gateway_webhook_events_claim
+                       ON gateway_webhook_events(status, next_attempt_at, lease_expires_at, last_attempt_at)"""
+                )
                 for key, value in DEFAULT_SETTINGS.items():
                     row = connection.execute(
                         "SELECT value FROM gateway_settings WHERE key = ?", (key,)
@@ -657,14 +696,309 @@ class GatewayStore:
 
     def list_pending_webhook_events(self, *, limit: int = 20) -> list[dict[str, Any]]:
         self._ensure()
+        now = int(time.time())
         with self._read() as connection:
             rows = connection.execute(
                 """SELECT * FROM gateway_webhook_events
                    WHERE status = 'pending' AND next_attempt_at <= ?
-                   ORDER BY id ASC LIMIT ?""",
-                (int(time.time()), int(limit)),
+                     AND (lease_token = '' OR lease_expires_at <= ?)
+                   ORDER BY last_attempt_at ASC, id ASC LIMIT ?""",
+                (now, now, int(limit)),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def claim_webhook_events(
+        self,
+        *,
+        limit: int = 16,
+        lease_seconds: int = 60,
+        tenant_limit: int = 8,
+        store_limit: int = 1,
+        tenant_in_flight: dict[int, int] | None = None,
+        store_in_flight: dict[str, int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """短事务领取待投递事件；按店铺轮转 + 租户/全局容量，返回独占租约的行。
+
+        同一店铺默认只允许一个在途请求（store_limit=1），保证平台事件顺序；不同店铺
+        轮转领取，避免单一店铺积压饿死其他店铺。领取后 ``attempts`` 立即 +1，租约到期
+        仍未完成的行可被重新领取（进程崩溃/HTTP 超时）。
+        """
+        self._ensure()
+        now = int(time.time())
+        batch_limit = max(1, min(1000, int(limit)))
+        tenant_limits = dict(tenant_in_flight or {})
+        store_limits = dict(store_in_flight or {})
+        with self._write() as connection:
+            # 每个店铺取少量候选（窗口函数）再轮转，避免单一店铺的大积压把候选窗口占满。
+            per_store_candidates = max(1, min(50, batch_limit))
+            rows = connection.execute(
+                """SELECT * FROM (
+                       SELECT *, ROW_NUMBER() OVER (
+                           PARTITION BY channel, platform_shop_id
+                           ORDER BY last_attempt_at ASC, id ASC
+                       ) AS _store_rank
+                       FROM gateway_webhook_events
+                       WHERE status = 'pending' AND next_attempt_at <= ?
+                         AND (lease_token = '' OR lease_expires_at <= ?)
+                   ) WHERE _store_rank <= ?
+                   ORDER BY last_attempt_at ASC, id ASC
+                   LIMIT ?""",
+                (
+                    now,
+                    now,
+                    per_store_candidates,
+                    max(batch_limit * 10, batch_limit),
+                ),
+            ).fetchall()
+            groups: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                item = dict(row)
+                item.pop("_store_rank", None)
+                key = f"{item.get('channel') or ''}:{item.get('platform_shop_id') or ''}"
+                groups.setdefault(key, []).append(item)
+            for items in groups.values():
+                items.sort(key=lambda item: (int(item.get("last_attempt_at") or 0), int(item["id"])))
+            keys = list(groups.keys())
+            selected: list[dict[str, Any]] = []
+            while len(selected) < batch_limit:
+                progressed = False
+                for key in keys:
+                    if len(selected) >= batch_limit:
+                        break
+                    items = groups[key]
+                    while items:
+                        item = items[0]
+                        tenant_id = item.get("tenant_id")
+                        tenant_key = int(tenant_id) if tenant_id is not None else 0
+                        if store_limits.get(key, 0) >= store_limit:
+                            break
+                        if tenant_key and tenant_limits.get(tenant_key, 0) >= tenant_limit:
+                            break
+                        items.pop(0)
+                        selected.append(item)
+                        store_limits[key] = store_limits.get(key, 0) + 1
+                        tenant_limits[tenant_key] = tenant_limits.get(tenant_key, 0) + 1
+                        progressed = True
+                        break
+                if not progressed:
+                    break
+            if not selected:
+                return []
+            now_text = utc_now()
+            lease_until = now + max(5, int(lease_seconds))
+            claimed: list[dict[str, Any]] = []
+            for item in selected:
+                lease_token = uuid.uuid4().hex
+                updated = connection.execute(
+                    """UPDATE gateway_webhook_events
+                       SET lease_token = ?, lease_expires_at = ?, attempts = attempts + 1,
+                           last_attempt_at = ?, updated_at = ?
+                       WHERE id = ? AND status = 'pending'
+                         AND (lease_token = '' OR lease_expires_at <= ?)""",
+                    (
+                        lease_token,
+                        lease_until,
+                        now,
+                        now_text,
+                        int(item["id"]),
+                        now,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    continue
+                fresh = connection.execute(
+                    "SELECT * FROM gateway_webhook_events WHERE id = ?",
+                    (int(item["id"]),),
+                ).fetchone()
+                if fresh is not None:
+                    claimed.append(dict(fresh))
+            return claimed
+
+    def complete_webhook_event(
+        self,
+        event_id: int,
+        lease_token: str,
+        *,
+        status: str,
+        status_code: int,
+        latency_ms: int,
+        next_attempt_at: int = 0,
+        last_error: str = "",
+        failure_class: str = "",
+        delivered: bool = False,
+    ) -> bool:
+        """按租约回写结果，避免过期 worker 覆盖新租约。"""
+        self._ensure()
+        if not lease_token:
+            return False
+        now = utc_now()
+        with self._write() as connection:
+            updated = connection.execute(
+                """UPDATE gateway_webhook_events
+                   SET status = ?, last_status_code = ?, latency_ms = ?, next_attempt_at = ?,
+                       last_error = ?, failure_class = ?, lease_token = '', lease_expires_at = 0,
+                       delivered_at = ?, updated_at = ?
+                   WHERE id = ? AND lease_token = ?""",
+                (
+                    status,
+                    int(status_code),
+                    int(latency_ms),
+                    int(next_attempt_at),
+                    last_error[:1000],
+                    failure_class[:64],
+                    now if delivered else None,
+                    now,
+                    int(event_id),
+                    str(lease_token),
+                ),
+            )
+            return updated.rowcount == 1
+
+    def webhook_stats(self, *, now: int | None = None) -> dict[str, Any]:
+        """可观测积压：pending/oldest/delivered/dead/retry/lease/最近延迟。"""
+        self._ensure()
+        now_epoch = int(now if now is not None else time.time())
+        with self._read() as connection:
+            status_rows = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM gateway_webhook_events GROUP BY status"
+            ).fetchall()
+            counts = {str(row["status"]): int(row["count"]) for row in status_rows}
+            oldest = connection.execute(
+                """SELECT id, created_at FROM gateway_webhook_events
+                   WHERE status = 'pending' ORDER BY created_at ASC, id ASC LIMIT 1"""
+            ).fetchone()
+            due = connection.execute(
+                """SELECT COUNT(*) FROM gateway_webhook_events
+                   WHERE status = 'pending' AND next_attempt_at <= ?
+                     AND (lease_token = '' OR lease_expires_at <= ?)""",
+                (now_epoch, now_epoch),
+            ).fetchone()[0]
+            retry = connection.execute(
+                "SELECT COUNT(*) FROM gateway_webhook_events WHERE status = 'pending' AND attempts > 0"
+            ).fetchone()[0]
+            leased = connection.execute(
+                """SELECT COUNT(*) FROM gateway_webhook_events
+                   WHERE lease_token != '' AND lease_expires_at > ?""",
+                (now_epoch,),
+            ).fetchone()[0]
+            last_delivery = connection.execute(
+                """SELECT latency_ms, delivered_at, last_status_code
+                   FROM gateway_webhook_events
+                   WHERE delivered_at IS NOT NULL
+                   ORDER BY delivered_at DESC, id DESC LIMIT 1"""
+            ).fetchone()
+            failure_rows = connection.execute(
+                """SELECT failure_class, COUNT(*) AS count FROM gateway_webhook_events
+                   WHERE failure_class != '' AND status IN ('pending', 'dead')
+                   GROUP BY failure_class"""
+            ).fetchall()
+        oldest_age = None
+        oldest_at = None
+        if oldest is not None:
+            oldest_at = str(oldest["created_at"])
+            try:
+                parsed = datetime.fromisoformat(oldest_at.replace("Z", "+00:00"))
+                oldest_age = max(0, int(now_epoch - parsed.timestamp()))
+            except ValueError:
+                oldest_age = None
+        return {
+            "pending": int(counts.get("pending", 0)),
+            "delivered": int(counts.get("delivered", 0)),
+            "dead": int(counts.get("dead", 0)),
+            "unroutable": int(counts.get("unroutable", 0)),
+            "retry": int(retry),
+            "leased": int(leased),
+            "due": int(due),
+            "failure_classes": {
+                str(row["failure_class"]): int(row["count"]) for row in failure_rows
+            },
+            "total": int(sum(counts.values())),
+            "oldest_pending_at": oldest_at,
+            "oldest_pending_age_seconds": oldest_age,
+            "oldest_pending": oldest_age,
+            "last_delivery_latency_ms": int(last_delivery["latency_ms"] or 0)
+            if last_delivery is not None
+            else None,
+            "latency_ms": int(last_delivery["latency_ms"] or 0)
+            if last_delivery is not None
+            else None,
+            "last_latency_ms": int(last_delivery["latency_ms"] or 0)
+            if last_delivery is not None
+            else None,
+            "last_delivery_at": str(last_delivery["delivered_at"])
+            if last_delivery is not None
+            else None,
+            "last_status_code": int(last_delivery["last_status_code"] or 0)
+            if last_delivery is not None
+            else None,
+        }
+
+    def replay_webhook_events(
+        self,
+        *,
+        event_ids: list[int] | None = None,
+        notification_ids: list[str] | None = None,
+        platform_shop_id: str = "",
+        tenant_id: int | None = None,
+        created_from: str = "",
+        created_to: str = "",
+        statuses: list[str] | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """按事件/店铺/时间段重放：复用原行（notification ID/幂等键不变）。"""
+        self._ensure()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if event_ids:
+            clauses.append(f"id IN ({','.join('?' for _ in event_ids)})")
+            params.extend(int(item) for item in event_ids)
+        if notification_ids:
+            clauses.append(f"notification_id IN ({','.join('?' for _ in notification_ids)})")
+            params.extend(str(item) for item in notification_ids)
+        if platform_shop_id:
+            clauses.append("platform_shop_id = ?")
+            params.append(str(platform_shop_id))
+        if tenant_id is not None:
+            clauses.append("tenant_id = ?")
+            params.append(int(tenant_id))
+        if created_from:
+            clauses.append("created_at >= ?")
+            params.append(str(created_from))
+        if created_to:
+            clauses.append("created_at <= ?")
+            params.append(str(created_to))
+        selected_statuses = [str(item) for item in (statuses or ["dead"]) if str(item)]
+        if selected_statuses:
+            clauses.append(f"status IN ({','.join('?' for _ in selected_statuses)})")
+            params.extend(selected_statuses)
+        if not clauses:
+            raise ValueError("replay 至少需要一个筛选条件（事件/店铺/时间/状态）")
+        where = " AND ".join(clauses)
+        batch_limit = max(1, min(1000, int(limit)))
+        with self._write() as connection:
+            rows = connection.execute(
+                f"""SELECT * FROM gateway_webhook_events WHERE {where}
+                    ORDER BY id ASC LIMIT ?""",
+                (*params, batch_limit),
+            ).fetchall()
+            ids = [int(row["id"]) for row in rows]
+            if not ids:
+                return []
+            now = utc_now()
+            connection.execute(
+                f"""UPDATE gateway_webhook_events
+                    SET status = 'pending', attempts = 0, next_attempt_at = 0,
+                        lease_token = '', lease_expires_at = 0, last_error = '',
+                        last_status_code = 0, latency_ms = 0, delivered_at = NULL,
+                        failure_class = '', replay_count = replay_count + 1, updated_at = ?
+                    WHERE id IN ({','.join('?' for _ in ids)})""",
+                (now, *ids),
+            )
+            refreshed = connection.execute(
+                f"SELECT * FROM gateway_webhook_events WHERE id IN ({','.join('?' for _ in ids)}) ORDER BY id ASC",
+                tuple(ids),
+            ).fetchall()
+        return [dict(row) for row in refreshed]
 
     def mark_webhook_event(
         self,

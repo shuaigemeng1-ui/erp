@@ -13,21 +13,30 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import sqlite3
 import subprocess
 import sys
-import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.modules.gateway.app import create_app
 from app.modules.gateway.config import GatewayConfig
-from app.modules.gateway.security import decrypt_secret
+from app.modules.gateway.security import decrypt_secret, encrypt_secret
+from app.modules.gateway.store import GatewayStore
+from app.modules.gateway.webhook import (
+    relay_signature,
+    tiktok_signature,
+    verify_relay_signature,
+    verify_tiktok_signature,
+)
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 ADMIN_TOKEN = "test-admin-token"
@@ -443,7 +452,7 @@ def test_refresh_lock_mutex_and_concurrency(gateway) -> None:
 # --------------------------------------------------------------------------- 限流
 def test_rate_limit_per_instance(gateway) -> None:
     client, _app, _cfg = gateway
-    a = create_instance(
+    create_instance(
         client,
         tenant_id=1,
         name="a",
@@ -451,7 +460,7 @@ def test_rate_limit_per_instance(gateway) -> None:
         store_ids=[11],
         channels=["shopee"],
     )
-    b = create_instance(
+    create_instance(
         client,
         tenant_id=2,
         name="b",
@@ -942,3 +951,558 @@ def test_sqlite_persistence_and_secret_encryption(gateway) -> None:
     actions = [item["action"] for item in logs["items"]]
     assert "instance.create" in actions
     assert "channel_app.update" in actions
+
+
+# --------------------------------------------------------------------------- task-41 Webhook
+RELAY_SECRET = "test-relay-secret"
+
+
+def make_webhook_config(db_path: str, **overrides) -> GatewayConfig:
+    values = dict(
+        webhook_dispatch_enabled=False,
+        webhook_relay_secret=RELAY_SECRET,
+        webhook_retry_base_seconds=5,
+        webhook_retry_max_seconds=3600,
+        webhook_retry_jitter_percent=0,
+        webhook_lease_seconds=30,
+        webhook_delivery_timeout_seconds=3,
+        sqlite_synchronous="FULL",
+    )
+    values.update(overrides)
+    return make_config(db_path, **values)
+
+
+def prepare_webhook_instance(client: TestClient) -> dict:
+    put_channel_app(client, "tiktok", "production")
+    instance = create_instance(
+        client,
+        tenant_id=1,
+        name="webhook-tenant",
+        callback_url="https://tenant.example.com/oauth/cb",
+        store_ids=[11],
+        channels=["tiktok"],
+        environments=["production"],
+    )
+    response = client.post(
+        "/api/v1/gateway/instance/webhook-shops",
+        headers=instance_headers(instance),
+        json={"store_id": 11, "platform_shop_id": "shop-1"},
+    )
+    assert response.status_code == 200, response.text
+    return instance
+
+
+def create_pending_event(app, cfg: GatewayConfig, *, notification_id: str = "notif-1") -> int:
+    store = app.state.gateway_store
+    event_id, _ = store.create_webhook_event(
+        channel="tiktok",
+        notification_id=notification_id,
+        event_type_code=1,
+        event_type_name="ORDER_STATUS_CHANGE",
+        platform_shop_id="shop-1",
+        instance_id=1,
+        tenant_id=1,
+        store_id=11,
+        payload_cipher=encrypt_secret(cfg, json.dumps({"notification_id": notification_id})),
+        payload_sha256="sha256-test",
+        status="pending",
+    )
+    return int(event_id)
+
+
+def event_row(app, event_id: int) -> dict:
+    with sqlite3.connect(app.state.gateway_config.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM gateway_webhook_events WHERE id = ?", (int(event_id),)
+        ).fetchone()
+    assert row is not None
+    return dict(row)
+
+
+def test_webhook_signature_helpers() -> None:
+    body = b'{"tts_notification_id":"n1","type":1,"shop_id":"s1"}'
+    signature = tiktok_signature(app_key="app-key", app_secret="app-secret", raw_body=body)
+    assert verify_tiktok_signature(
+        app_key="app-key", app_secret="app-secret", raw_body=body, received_signature=signature
+    )
+    assert not verify_tiktok_signature(
+        app_key="app-key", app_secret="app-secret", raw_body=body, received_signature="bad"
+    )
+    relay = relay_signature(relay_secret="relay", timestamp="123", raw_body=body)
+    assert verify_relay_signature(
+        relay_secret="relay", timestamp="123", raw_body=body, received_signature=relay
+    )
+    assert not verify_relay_signature(
+        relay_secret="relay", timestamp="124", raw_body=body, received_signature=relay
+    )
+
+
+def test_sqlite_wal_and_synchronous_configurable(tmp_path) -> None:
+    for mode, expected in (("NORMAL", 1), ("FULL", 2)):
+        cfg = make_webhook_config(str(tmp_path / f"{mode}.db"), sqlite_synchronous=mode)
+        store = GatewayStore(cfg)
+        store.init()
+        connection = store._connect()
+        try:
+            assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+            assert connection.execute("PRAGMA synchronous").fetchone()[0] == expected
+        finally:
+            connection.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "expected_status", "expected_class"),
+    [
+        (429, {"Retry-After": "120"}, "pending", "rate_limit"),
+        (500, {}, "pending", "server"),
+        (401, {}, "pending", "auth"),
+        (400, {}, "dead", "payload_permanent"),
+    ],
+)
+def test_webhook_delivery_preserves_real_status_and_retry_after(
+    tmp_path, monkeypatch, status, headers, expected_status, expected_class
+) -> None:
+    import app.modules.gateway.app as gateway_app
+
+    cfg = make_webhook_config(str(tmp_path / f"gateway-{status}.db"))
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        prepare_webhook_instance(client)
+        event_id = create_pending_event(app, cfg, notification_id=f"status-{status}")
+        store = app.state.gateway_store
+        claimed = store.claim_webhook_events(limit=1, lease_seconds=30, tenant_limit=8, store_limit=1)
+        assert len(claimed) == 1 and int(claimed[0]["id"]) == event_id
+
+        def fake_urlopen(request, timeout=0):
+            raise HTTPError(request.full_url, status, "fake", headers, io.BytesIO(b"rejected body"))
+
+        monkeypatch.setattr(gateway_app, "urlopen", fake_urlopen)
+        app.state.webhook_deliver_event(claimed[0], claimed[0]["lease_token"])
+        row = event_row(app, event_id)
+        assert row["status"] == expected_status
+        assert row["last_status_code"] == status
+        assert row["failure_class"] == expected_class
+        assert row["lease_token"] == ""
+        assert int(row["attempts"]) == 1
+        if status == 429:
+            assert 110 <= int(row["next_attempt_at"]) - int(time.time()) <= 125
+        if expected_status == "pending":
+            assert int(row["next_attempt_at"]) > int(time.time())
+
+
+@pytest.mark.parametrize(
+    ("http_status", "receipt", "expected_status", "expected_class"),
+    [
+        (200, {"received": True, "duplicate": False}, "delivered", ""),
+        (200, {"received": True, "duplicate": True}, "delivered", ""),
+        (
+            200,
+            {"received": False, "duplicate": False, "mapping_missing": True, "reason": "mapping_missing"},
+            "pending",
+            "mapping_missing",
+        ),
+        (
+            200,
+            {"received": False, "duplicate": False, "reason": "persist_failed"},
+            "pending",
+            "persist_failed",
+        ),
+        (200, {"received": False, "duplicate": False}, "pending", "invalid_receipt"),
+        (
+            503,
+            {"received": False, "duplicate": False, "mapping_missing": True, "reason": "mapping_missing"},
+            "pending",
+            "mapping_missing",
+        ),
+        (
+            503,
+            {"received": False, "duplicate": False, "reason": "persist_failed"},
+            "pending",
+            "persist_failed",
+        ),
+    ],
+)
+def test_webhook_receipt_contract(
+    tmp_path, monkeypatch, http_status, receipt, expected_status, expected_class
+) -> None:
+    import app.modules.gateway.app as gateway_app
+
+    cfg = make_webhook_config(str(tmp_path / f"gateway-receipt-{http_status}-{expected_class or 'ok'}.db"))
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        prepare_webhook_instance(client)
+        event_id = create_pending_event(app, cfg, notification_id=f"receipt-{http_status}-{expected_class}")
+        claimed = app.state.gateway_store.claim_webhook_events(
+            limit=1, lease_seconds=30, tenant_limit=8, store_limit=1
+        )
+        body = json.dumps(receipt).encode()
+
+        class FakeResponse:
+            status = http_status
+            headers: dict = {}
+
+            def read(self, size=-1):
+                return body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(request, timeout=0):
+            if http_status == 200:
+                return FakeResponse()
+            raise HTTPError(request.full_url, http_status, "fake", {}, io.BytesIO(body))
+
+        monkeypatch.setattr(gateway_app, "urlopen", fake_urlopen)
+        app.state.webhook_deliver_event(claimed[0], claimed[0]["lease_token"])
+        row = event_row(app, event_id)
+        assert row["status"] == expected_status
+        assert row["last_status_code"] == http_status
+        assert row["lease_token"] == ""
+        if expected_class:
+            assert row["failure_class"] == expected_class
+            assert expected_class in app.state.gateway_store.webhook_stats()["failure_classes"]
+        else:
+            assert row["delivered_at"] is not None
+
+
+def test_webhook_delivery_network_error_retries_with_cap(tmp_path, monkeypatch) -> None:
+    import app.modules.gateway.app as gateway_app
+
+    cfg = make_webhook_config(str(tmp_path / "gateway-network.db"))
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        prepare_webhook_instance(client)
+        event_id = create_pending_event(app, cfg)
+        claimed = app.state.gateway_store.claim_webhook_events(
+            limit=1, lease_seconds=30, tenant_limit=8, store_limit=1
+        )
+
+        def fake_urlopen(request, timeout=0):
+            raise URLError("connection refused")
+
+        monkeypatch.setattr(gateway_app, "urlopen", fake_urlopen)
+        app.state.webhook_deliver_event(claimed[0], claimed[0]["lease_token"])
+        row = event_row(app, event_id)
+        assert row["status"] == "pending"
+        assert row["last_status_code"] == 0
+        assert row["failure_class"] == "network"
+        assert int(row["next_attempt_at"]) <= int(time.time()) + cfg.webhook_retry_max_seconds
+
+
+def test_webhook_claim_concurrency_lease_and_store_rotation(tmp_path) -> None:
+    cfg = make_webhook_config(str(tmp_path / "gateway-claim.db"))
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        prepare_webhook_instance(client)
+        store = app.state.gateway_store
+        for index in range(1, 9):
+            store.create_webhook_event(
+                channel="tiktok",
+                notification_id=f"claim-{index}",
+                event_type_code=1,
+                event_type_name="ORDER_STATUS_CHANGE",
+                platform_shop_id=f"shop-{index}",
+                instance_id=1,
+                tenant_id=1 if index <= 4 else 2,
+                store_id=11,
+                payload_cipher=encrypt_secret(cfg, "{}"),
+                payload_sha256="sha",
+            )
+
+        def claim():
+            return store.claim_webhook_events(
+                limit=4, lease_seconds=30, tenant_limit=2, store_limit=1
+            )
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            batches = list(executor.map(lambda _: claim(), range(4)))
+        claimed = [event for batch in batches for event in batch]
+        ids = [int(event["id"]) for event in claimed]
+        assert len(ids) == len(set(ids)) == 8
+        assert len({event["lease_token"] for event in claimed}) == 8
+        # store_limit=1：同一店铺不会在同一批/并发批次重复在途
+        assert len({event["platform_shop_id"] for event in claimed}) == 8
+        assert store.claim_webhook_events(limit=4, lease_seconds=30) == []
+
+        # 租约过期后可重新领取（模拟进程崩溃/HTTP 超时）
+        with sqlite3.connect(cfg.db_path) as connection:
+            connection.execute(
+                "UPDATE gateway_webhook_events SET lease_expires_at = 0 WHERE id = ?", (ids[0],)
+            )
+        reclaimed = store.claim_webhook_events(
+            limit=1, lease_seconds=30, tenant_limit=8, store_limit=1
+        )
+        assert [int(event["id"]) for event in reclaimed] == [ids[0]]
+        assert int(reclaimed[0]["attempts"]) == 2
+
+        # 租户并发上限：tenant_limit=1 时每个租户最多一个在途
+        with sqlite3.connect(cfg.db_path) as connection:
+            connection.execute("UPDATE gateway_webhook_events SET lease_expires_at = 0")
+        tenant_limited = store.claim_webhook_events(
+            limit=8, lease_seconds=30, tenant_limit=1, store_limit=2
+        )
+        tenant_counts: dict[int, int] = {}
+        for event in tenant_limited:
+            tenant_id = int(event["tenant_id"])
+            tenant_counts[tenant_id] = tenant_counts.get(tenant_id, 0) + 1
+        assert tenant_counts and all(count <= 1 for count in tenant_counts.values())
+
+
+def test_webhook_replay_reuses_notification_and_records_operator(tmp_path, monkeypatch) -> None:
+    import app.modules.gateway.app as gateway_app
+
+    cfg = make_webhook_config(str(tmp_path / "gateway-replay.db"))
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        prepare_webhook_instance(client)
+        event_id = create_pending_event(app, cfg, notification_id="replay-notif")
+        with sqlite3.connect(cfg.db_path) as connection:
+            connection.execute(
+                """UPDATE gateway_webhook_events
+                   SET status='dead', attempts=4, last_status_code=404, failure_class='mapping'
+                   WHERE id=?""",
+                (event_id,),
+            )
+        response = client.post(
+            "/api/v1/gateway/admin/webhook-events/replay",
+            headers=ADMIN_HEADERS,
+            json={"event_ids": [event_id], "operator": "ops-alice", "statuses": ["dead"]},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["replayed"] == 1
+        row = event_row(app, event_id)
+        assert row["notification_id"] == "replay-notif"
+        assert row["status"] == "pending" and int(row["attempts"]) == 0
+        assert int(row["replay_count"]) == 1
+        logs = client.get("/api/v1/gateway/admin/audit-logs", headers=ADMIN_HEADERS).json()["items"]
+        replay_logs = [item for item in logs if item["action"] == "webhook.replay"]
+        assert replay_logs and replay_logs[0]["actor"] == "ops-alice"
+
+        claimed = app.state.gateway_store.claim_webhook_events(
+            limit=1, lease_seconds=30, tenant_limit=8, store_limit=1
+        )
+        captured: dict = {}
+
+        class FakeResponse:
+            status = 200
+            headers: dict = {}
+
+            def read(self, size=-1):
+                return json.dumps(
+                    {"received": True, "duplicate": False, "event_id": "1"}
+                ).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(request, timeout=0):
+            captured["headers"] = dict(request.headers)
+            return FakeResponse()
+
+        monkeypatch.setattr(gateway_app, "urlopen", fake_urlopen)
+        app.state.webhook_deliver_event(claimed[0], claimed[0]["lease_token"])
+        row = event_row(app, event_id)
+        assert row["status"] == "delivered"
+        headers = {key.lower(): value for key, value in captured["headers"].items()}
+        assert headers["idempotency-key"] == "tiktok:replay-notif"
+        assert headers["x-gateway-notification-id"] == "replay-notif"
+        stats = app.state.gateway_store.webhook_stats()
+        assert stats["delivered"] >= 1
+        assert stats["last_delivery_latency_ms"] is not None
+
+
+def test_webhook_health_stats_and_dispatch_config(tmp_path) -> None:
+    cfg = make_webhook_config(str(tmp_path / "gateway-stats.db"))
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        health = client.get("/healthz").json()
+        webhook = health["webhook"]
+        for key in ("pending", "delivered", "dead", "retry", "oldest_pending_at", "last_delivery_latency_ms"):
+            assert key in webhook
+        assert health["webhook_dispatch"]["global_concurrency"] == 16
+        assert health["webhook_dispatch"]["tenant_concurrency"] == 8
+        assert client.get("/api/v1/gateway/admin/webhook-stats").status_code == 401
+        stats = client.get(
+            "/api/v1/gateway/admin/webhook-stats", headers=ADMIN_HEADERS
+        ).json()
+        assert stats["webhook"]["pending"] == 0
+        assert stats["dispatch"]["lease_seconds"] == 30
+
+
+def test_old_webhook_schema_migrates_without_losing_rows(tmp_path) -> None:
+    db_path = str(tmp_path / "gateway-old.db")
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE gateway_webhook_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel TEXT NOT NULL,
+                notification_id TEXT NOT NULL,
+                event_type_code INTEGER NOT NULL DEFAULT 0,
+                event_type_name TEXT NOT NULL DEFAULT '',
+                platform_shop_id TEXT NOT NULL DEFAULT '',
+                instance_id INTEGER,
+                tenant_id INTEGER,
+                store_id INTEGER,
+                payload_cipher TEXT NOT NULL DEFAULT '',
+                payload_sha256 TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                duplicate_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(channel, notification_id)
+            );
+            INSERT INTO gateway_webhook_events
+              (channel, notification_id, platform_shop_id, status, created_at, updated_at)
+              VALUES ('tiktok','old-1','shop-1','dead','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+            """
+        )
+    cfg = make_webhook_config(db_path)
+    store = GatewayStore(cfg)
+    store.init()
+    with sqlite3.connect(db_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(gateway_webhook_events)")
+        }
+        row = connection.execute(
+            "SELECT notification_id, status, lease_token FROM gateway_webhook_events"
+        ).fetchone()
+    assert {"lease_token", "lease_expires_at", "last_status_code", "latency_ms", "replay_count"} <= columns
+    assert row == ("old-1", "dead", "")
+
+
+def test_webhook_claim_rotates_across_stores_not_starved_by_backlog(tmp_path) -> None:
+    cfg = make_webhook_config(str(tmp_path / "gateway-rotation.db"))
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        prepare_webhook_instance(client)
+        store = app.state.gateway_store
+        for index in range(40):
+            store.create_webhook_event(
+                channel="tiktok",
+                notification_id=f"busy-{index}",
+                event_type_code=1,
+                event_type_name="ORDER_STATUS_CHANGE",
+                platform_shop_id="shop-busy",
+                instance_id=1,
+                tenant_id=1,
+                store_id=11,
+                payload_cipher=encrypt_secret(cfg, "{}"),
+                payload_sha256="sha",
+            )
+        store.create_webhook_event(
+            channel="tiktok",
+            notification_id="quiet-1",
+            event_type_code=1,
+            event_type_name="ORDER_STATUS_CHANGE",
+            platform_shop_id="shop-quiet",
+            instance_id=1,
+            tenant_id=1,
+            store_id=11,
+            payload_cipher=encrypt_secret(cfg, "{}"),
+            payload_sha256="sha",
+        )
+        claimed = store.claim_webhook_events(
+            limit=2, lease_seconds=30, tenant_limit=8, store_limit=1
+        )
+        assert {str(event["platform_shop_id"]) for event in claimed} == {"shop-busy", "shop-quiet"}
+
+
+def test_webhook_replay_time_range(tmp_path) -> None:
+    cfg = make_webhook_config(str(tmp_path / "gateway-replay-time.db"))
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        store = app.state.gateway_store
+        ids = []
+        for index, created_at in enumerate(
+            ("2026-01-01T12:00:00Z", "2026-01-03T12:00:00Z")
+        ):
+            event_id, _ = store.create_webhook_event(
+                channel="tiktok",
+                notification_id=f"time-{index}",
+                event_type_code=1,
+                event_type_name="ORDER_STATUS_CHANGE",
+                platform_shop_id="shop-1",
+                instance_id=None,
+                tenant_id=1,
+                store_id=11,
+                payload_cipher=encrypt_secret(cfg, "{}"),
+                payload_sha256="sha",
+                status="dead",
+            )
+            ids.append(int(event_id))
+            with sqlite3.connect(cfg.db_path) as connection:
+                connection.execute(
+                    "UPDATE gateway_webhook_events SET created_at=? WHERE id=?",
+                    (created_at, event_id),
+                )
+        response = client.post(
+            "/api/v1/gateway/admin/webhook-events/replay",
+            headers=ADMIN_HEADERS,
+            json={
+                "created_from": "2026-01-01",
+                "created_to": "2026-01-02",
+                "operator": "ops-time",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["replayed"] == 1
+        assert response.json()["events"][0]["id"] == str(ids[0])
+
+
+def test_webhook_ingress_signature_and_replay_filters(tmp_path) -> None:
+    cfg = make_webhook_config(str(tmp_path / "gateway-ingress.db"))
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        prepare_webhook_instance(client)
+        body = json.dumps(
+            {"tts_notification_id": "ingress-1", "type": 1, "shop_id": "shop-1"}
+        ).encode("utf-8")
+        signature = tiktok_signature(
+            app_key="tiktok-app-key", app_secret="tiktok-super-secret", raw_body=body
+        )
+        response = client.post(
+            "/api/v1/gateway/webhooks/tiktok",
+            content=body,
+            headers={"X-TikTok-Signature": signature, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 200, response.text
+        with sqlite3.connect(cfg.db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT * FROM gateway_webhook_events WHERE notification_id='ingress-1'"
+            ).fetchone()
+        assert row is not None and row["status"] == "pending"
+        event_id = int(row["id"])
+
+        # 重放按店铺过滤：只重放该店铺的 dead 行
+        with sqlite3.connect(cfg.db_path) as connection:
+            connection.execute(
+                "UPDATE gateway_webhook_events SET status='dead' WHERE id=?", (event_id,)
+            )
+            connection.execute(
+                """INSERT INTO gateway_webhook_events
+                   (channel, notification_id, event_type_code, event_type_name, platform_shop_id,
+                    instance_id, tenant_id, store_id, payload_cipher, payload_sha256, status,
+                    created_at, updated_at)
+                   VALUES ('tiktok','other-shop','1','X','shop-other',1,1,11,'', 'sha','dead',
+                           '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')"""
+            )
+        replay = client.post(
+            "/api/v1/gateway/admin/webhook-events/replay",
+            headers=ADMIN_HEADERS,
+            json={"platform_shop_id": "shop-1", "operator": "ops-shop", "statuses": ["dead"]},
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["replayed"] == 1
+        assert replay.json()["events"][0]["notification_id"] == "ingress-1"

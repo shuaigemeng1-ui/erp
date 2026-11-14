@@ -426,3 +426,128 @@ export interface OpsBackupStage {
   started_at?: string | null
   finished_at?: string | null
 }
+
+/* ------------------------------------------------------------------ *
+ * 批次4：TikTok Webhook 可观测性（task-42）
+ * ------------------------------------------------------------------ */
+
+/** Gateway Webhook 统计（来自网关只读 admin webhook-stats；缺失字段为 null） */
+export interface OpsWebhookGatewayMetrics {
+  available?: boolean
+  source?: string
+  window_seconds?: number | null
+  windowed?: boolean
+  reason?: string
+  unavailable_fields?: string[]
+  unavailable_reason?: string
+  instances?: {
+    total?: number
+    active?: number
+    verified?: number
+  } | null
+  received_total?: number | null
+  signature_failed?: number | null
+  duplicate?: number | null
+  pending?: number | null
+  oldest_pending_age_seconds?: number | null
+  oldest_pending_at?: string | null
+  delivered?: number | null
+  dead?: number | null
+  unroutable?: number | null
+  unroutable_recent?: number | null
+  unroutable_recent_source?: string
+  retry?: number | null
+  leased?: number | null
+  due?: number | null
+  success_rate?: number | null
+  p95_ms?: number | null
+  last_delivery_latency_ms?: number | null
+  last_delivery_at?: string | null
+  last_status_code?: number | null
+  checked_at?: string | null
+}
+
+/** 单店铺 Webhook 指标 */
+export interface OpsWebhookStoreMetrics {
+  store_id?: string
+  store_name?: string
+  external_store_id?: string
+  events_received?: number
+  events_pending?: number
+  events_failed?: number
+  orders_pending?: number
+  oldest_pending_age_seconds?: number | null
+  orders_written?: number
+  refresh_completed?: number
+  orders_dead?: number
+  refresh_success_rate?: number | null
+  end_to_end_p95_ms?: number | null
+  end_to_end_samples?: number
+  backfill_watermark?: string | null
+  last_event_at?: string | null
+}
+
+/** 租户 Webhook 指标（含店铺下钻） */
+export interface OpsWebhookTenantMetrics extends OpsWebhookStoreMetrics {
+  tenant_id: string
+  tenant_name?: string
+  instance_id?: string
+  instance_name?: string
+  instance_status?: string
+  outbox_failed?: number
+  error?: string | null
+  stores?: OpsWebhookStoreMetrics[]
+}
+
+/** Webhook 全局汇总 */
+export interface OpsWebhookTotals {
+  events_received?: number
+  events_pending?: number
+  events_failed?: number
+  orders_pending?: number
+  orders_written?: number
+  refresh_completed?: number
+  orders_dead?: number
+  outbox_failed?: number
+  oldest_pending_age_seconds?: number | null
+  refresh_success_rate?: number | null
+  end_to_end_p95_ms?: number | null
+  end_to_end_samples?: number
+  backfill_watermark?: string | null
+}
+
+export interface OpsWebhookRedisMemory {
+  available?: boolean
+  label?: string
+  used_memory_bytes?: number | null
+  used_memory_human?: string | null
+  maxmemory_bytes?: number | null
+  maxmemory_human?: string | null
+  connected_clients?: number | null
+  error?: string
+}
+
+export interface OpsWebhookRedisMetrics {
+  available?: boolean
+  cache?: OpsWebhookRedisMemory
+  queue?: OpsWebhookRedisMemory
+  publish_failed?: number
+  publish_failed_source?: string
+  rate_limited?: number | null
+  rate_limited_reason?: string
+}
+
+/** GET /platform/monitoring/webhooks 响应 */
+export interface OpsWebhookMetrics {
+  checked_at?: string | null
+  window_seconds?: number
+  filters?: {
+    tenant_id?: string | null
+    store_id?: string | null
+  }
+  gateway?: OpsWebhookGatewayMetrics
+  totals?: OpsWebhookTotals
+  tenants?: OpsWebhookTenantMetrics[]
+  redis?: OpsWebhookRedisMetrics
+  notes?: string[]
+}

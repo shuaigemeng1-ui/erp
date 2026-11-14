@@ -50,6 +50,11 @@ const ALERT_TYPE_LABELS: Record<string, string> = {
   api_unreachable: 'API 不可达',
   cert_expiring: '证书即将过期',
   backup_overdue: '备份超期',
+  webhook_e2e_p95_high: 'Webhook 端到端 P95 过高',
+  webhook_pending_stale: 'Webhook 待刷新积压',
+  webhook_refresh_dead: 'Webhook 刷新 dead',
+  webhook_unroutable: 'Webhook unroutable',
+  webhook_redis_publish_failed: 'Webhook Redis 发布失败',
 }
 
 type TrendRangeKey = '1h' | '24h' | '7d' | '30d'

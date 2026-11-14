@@ -13,6 +13,7 @@ from app.core.errors import AppError
 from app.core.http import PageParams, paged, success
 from app.modules.ops import service
 from app.modules.ops.monitoring_router import router as monitoring_router
+from app.modules.ops.webhook_router import router as webhook_router
 from app.modules.ops.schemas import (
     AlertAckIn,
     InstanceCreate,
@@ -32,6 +33,8 @@ logger = logging.getLogger("ventasync.ssh")
 router = APIRouter(prefix="/platform", tags=["platform-ops"])
 # 监控总览路由独立成模块（task-29），这里只做一行接线，避免多人改大文件。
 router.include_router(monitoring_router)
+# TikTok Webhook 可观测性路由（task-42），同样独立文件接线。
+router.include_router(webhook_router)
 
 
 def _client_ip(request: Request | None) -> str:

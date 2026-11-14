@@ -873,6 +873,13 @@ def run_center_maintenance(center, *, probe_interval_seconds: int = 60) -> dict[
     aggregate_metrics(center)
     mark_stale_operations(center)
     notifications = check_backup_alerts(center)
+    try:
+        from app.modules.ops import webhook_metrics
+
+        webhook_alerts = webhook_metrics.check_webhook_alerts(center, now=now)
+    except Exception:  # noqa: BLE001 - Webhook 告警失败不阻塞既有监控
+        logger.exception("TikTok Webhook 告警评估失败")
+        webhook_alerts = 0
     notified = notify_open_alerts(center)
     cleaned = cleanup_old_monitoring_data(center)
     return {
@@ -882,6 +889,7 @@ def run_center_maintenance(center, *, probe_interval_seconds: int = 60) -> dict[
         "probe_failed": 0,
         "notified": notified,
         "backup_alerts": notifications,
+        "webhook_alerts": webhook_alerts,
         "metrics_cleaned": cleaned["metrics"],
         "checks_cleaned": cleaned["checks"],
     }

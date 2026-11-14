@@ -15,6 +15,7 @@ import type {
 import { useTableQuery } from '@/composables/useTableQuery'
 import PaginationBar from '@/components/PaginationBar.vue'
 import IdCopy from '@/components/IdCopy.vue'
+import PlatformWebhookMonitorPanel from './PlatformWebhookMonitorPanel.vue'
 import { formatDateTime, parseJsonObject, stringOrUndefined, textOrDash } from '@/utils/format'
 import type {
   OpsInstance,
@@ -947,6 +948,8 @@ onMounted(() => {
         </div>
       </div>
     </el-card>
+
+    <PlatformWebhookMonitorPanel />
 
     <el-tabs v-model="activeTab" class="ops-center-tabs">
       <!-- 发布版本 -->

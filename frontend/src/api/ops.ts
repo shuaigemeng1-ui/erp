@@ -26,6 +26,7 @@ import type {
   OpsProbeResult,
   OpsServerNode,
   OpsTenantOption,
+  OpsWebhookMetrics,
 } from '@/types/ops'
 
 export interface OpsInstanceQuery extends PageParams {
@@ -539,5 +540,23 @@ export const opsApi = {
 
   deleteMaintenanceWindow(windowId: EntityId): Promise<{ deleted: boolean }> {
     return http.delete<{ deleted: boolean }>(`/platform/maintenance-windows/${segment(windowId)}`)
+  },
+
+  /* ------------------------------ TikTok Webhook 可观测性 ------------------------------ */
+
+  /** 批次4：Webhook 接收/待刷新/已写入 + Gateway/Redis 指标；只读。 */
+  webhookMetrics(
+    query: {
+      window_seconds?: number
+      tenant_id?: EntityId
+      store_id?: EntityId
+    } = {},
+    silent = false,
+  ): Promise<OpsWebhookMetrics> {
+    return http.get<OpsWebhookMetrics>(
+      '/platform/monitoring/webhooks',
+      query as QueryParams,
+      { silent },
+    )
   },
 }

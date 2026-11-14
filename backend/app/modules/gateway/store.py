@@ -18,7 +18,6 @@ SQLite 仅由网关进程访问，满足独立部署（不依赖中心本地任�
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 import time
 import uuid
@@ -28,6 +27,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.modules.gateway.config import GatewayConfig
+from app.modules.gateway.database import Connection, Row, create_backend
 
 
 def utc_now() -> str:
@@ -210,54 +210,36 @@ DEFAULT_SETTINGS: dict[str, str] = {
 
 
 class GatewayStore:
-    """SQLite 存储；每次操作独立连接，写事务 ``BEGIN IMMEDIATE`` 串行。"""
+    """Gateway store; SQLite (default) or PostgreSQL when ``GATEWAY_DATABASE_URL`` set."""
 
     def __init__(self, config: GatewayConfig) -> None:
         self.config = config
+        self.backend = create_backend(config)
         self._init_lock = threading.Lock()
         self._initialized = False
 
     # ------------------------------------------------------------------ 连接
-    def _connect(self) -> sqlite3.Connection:
-        import os
-
-        directory = os.path.dirname(self.config.db_path or "") or "."
-        try:
-            os.makedirs(directory, exist_ok=True)
-        except OSError:
-            pass
-        connection = sqlite3.connect(
-            self.config.db_path,
-            timeout=self.config.sqlite_busy_timeout_ms / 1000,
-            isolation_level=None,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout = {int(self.config.sqlite_busy_timeout_ms)}")
-        connection.execute("PRAGMA journal_mode = WAL")
-        synchronous = str(self.config.sqlite_synchronous or "FULL").upper()
-        if synchronous not in {"NORMAL", "FULL"}:
-            synchronous = "FULL"
-        connection.execute(f"PRAGMA synchronous = {synchronous}")
-        connection.execute("PRAGMA foreign_keys = OFF")
-        return connection
+    def _connect(self) -> Connection:
+        """兼容旧测试/运维探针：返回当前后端连接（调用方负责 close）。"""
+        return self.backend.connect()
 
     @contextmanager
-    def _read(self) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
+    def _read(self) -> Iterator[Connection]:
+        connection = self.backend.connect()
         try:
             yield connection
         finally:
             connection.close()
 
     @contextmanager
-    def _write(self) -> Iterator[sqlite3.Connection]:
-        connection = self._connect()
+    def _write(self) -> Iterator[Connection]:
+        connection = self.backend.connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self.backend.begin(connection)
             yield connection
-            connection.execute("COMMIT")
+            connection.commit()
         except Exception:
-            connection.execute("ROLLBACK")
+            connection.rollback()
             raise
         finally:
             connection.close()
@@ -269,16 +251,13 @@ class GatewayStore:
         with self._init_lock:
             if self._initialized:
                 return
-            with self._read() as connection:
-                connection.executescript(SCHEMA)
             with self._write() as connection:
-                # 旧网关 SQLite 升级：oauth_states 增加 context_json/resolved_at。
-                columns = {
-                    str(row[1])
-                    for row in connection.execute(
-                        "PRAGMA table_info(gateway_oauth_states)"
-                    ).fetchall()
-                }
+                if self.backend.is_postgres:
+                    # 双实例同时首次启动时串行化 schema/migration（事务级 advisory lock）。
+                    connection.execute("SELECT pg_advisory_xact_lock(?)", (94715041,))
+                self.backend.init_schema(connection, SCHEMA)
+                # 旧网关 SQLite/Postgres 升级：oauth_states 增加 context_json/resolved_at。
+                columns = self.backend.table_columns(connection, "gateway_oauth_states")
                 if "context_json" not in columns:
                     connection.execute(
                         "ALTER TABLE gateway_oauth_states ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}'"
@@ -287,17 +266,12 @@ class GatewayStore:
                     connection.execute(
                         "ALTER TABLE gateway_oauth_states ADD COLUMN resolved_at TEXT"
                     )
-                # 旧网关 SQLite 升级（task-41）：webhook 并发租约/真实状态码/延迟/重放字段。
-                webhook_columns = {
-                    str(row[1])
-                    for row in connection.execute(
-                        "PRAGMA table_info(gateway_webhook_events)"
-                    ).fetchall()
-                }
+                # 旧网关升级（task-41）：webhook 并发租约/真实状态码/延迟/重放字段。
+                webhook_columns = self.backend.table_columns(connection, "gateway_webhook_events")
                 webhook_migrations = {
                     "lease_token": "TEXT NOT NULL DEFAULT ''",
-                    "lease_expires_at": "INTEGER NOT NULL DEFAULT 0",
-                    "last_attempt_at": "INTEGER NOT NULL DEFAULT 0",
+                    "lease_expires_at": "BIGINT NOT NULL DEFAULT 0",
+                    "last_attempt_at": "BIGINT NOT NULL DEFAULT 0",
                     "last_status_code": "INTEGER NOT NULL DEFAULT 0",
                     "latency_ms": "INTEGER NOT NULL DEFAULT 0",
                     "delivered_at": "TEXT",
@@ -391,7 +365,8 @@ class GatewayStore:
                 """INSERT INTO gateway_instances
                    (instance_uuid, tenant_id, name, status, channels_json, environments_json,
                     store_ids_json, callback_url, token_hash, token_version, notes, created_at, updated_at)
-                   VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+                   VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                   RETURNING id""",
                 (
                     instance_uuid,
                     int(tenant_id),
@@ -406,7 +381,7 @@ class GatewayStore:
                     now,
                 ),
             )
-            instance_id = int(cursor.lastrowid or 0)
+            instance_id = int(cursor.fetchone()[0])
         return self.get_instance(instance_id) or {}
 
     def update_instance(self, instance_id: int, **fields: Any) -> dict[str, Any] | None:
@@ -482,7 +457,7 @@ class GatewayStore:
             ).fetchone()
         return self._instance_payload(row) if row is not None else None
 
-    def get_instance_by_token_hash(self, token_hash: str) -> tuple[dict[str, Any] | None, sqlite3.Row | None]:
+    def get_instance_by_token_hash(self, token_hash: str) -> tuple[dict[str, Any] | None, Row | None]:
         self._ensure()
         with self._read() as connection:
             row = connection.execute(
@@ -512,7 +487,7 @@ class GatewayStore:
         return {"total": int(total), "active": int(active), "verified": int(verified)}
 
     @staticmethod
-    def _instance_payload(row: sqlite3.Row) -> dict[str, Any]:
+    def _instance_payload(row: Row) -> dict[str, Any]:
         return {
             "id": str(row["id"]),
             "instance_uuid": row["instance_uuid"],
@@ -660,7 +635,8 @@ class GatewayStore:
                         platform_shop_id, instance_id, tenant_id, store_id,
                         payload_cipher, payload_sha256, status, next_attempt_at,
                         created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       RETURNING id""",
                     (
                         channel,
                         notification_id,
@@ -678,8 +654,8 @@ class GatewayStore:
                         now,
                     ),
                 )
-                return int(cursor.lastrowid), False
-        except sqlite3.IntegrityError:
+                return int(cursor.fetchone()[0]), False
+        except self.backend.integrity_errors:
             with self._write() as connection:
                 connection.execute(
                     """UPDATE gateway_webhook_events
@@ -731,25 +707,51 @@ class GatewayStore:
         with self._write() as connection:
             # 每个店铺取少量候选（窗口函数）再轮转，避免单一店铺的大积压把候选窗口占满。
             per_store_candidates = max(1, min(50, batch_limit))
-            rows = connection.execute(
-                """SELECT * FROM (
-                       SELECT *, ROW_NUMBER() OVER (
-                           PARTITION BY channel, platform_shop_id
+            if self.backend.is_postgres:
+                rows = connection.execute(
+                    """WITH candidates AS (
+                           SELECT id, last_attempt_at FROM (
+                               SELECT id, last_attempt_at, ROW_NUMBER() OVER (
+                                   PARTITION BY channel, platform_shop_id
+                                   ORDER BY last_attempt_at ASC, id ASC
+                               ) AS _store_rank
+                               FROM gateway_webhook_events
+                               WHERE status = 'pending' AND next_attempt_at <= ?
+                                 AND (lease_token = '' OR lease_expires_at <= ?)
+                           ) ranked WHERE _store_rank <= ?
                            ORDER BY last_attempt_at ASC, id ASC
-                       ) AS _store_rank
-                       FROM gateway_webhook_events
-                       WHERE status = 'pending' AND next_attempt_at <= ?
-                         AND (lease_token = '' OR lease_expires_at <= ?)
-                   ) WHERE _store_rank <= ?
-                   ORDER BY last_attempt_at ASC, id ASC
-                   LIMIT ?""",
-                (
-                    now,
-                    now,
-                    per_store_candidates,
-                    max(batch_limit * 10, batch_limit),
-                ),
-            ).fetchall()
+                           LIMIT ?
+                       )
+                       SELECT e.* FROM gateway_webhook_events e
+                       JOIN candidates c ON c.id = e.id
+                       FOR UPDATE OF e SKIP LOCKED""",
+                    (
+                        now,
+                        now,
+                        per_store_candidates,
+                        max(batch_limit * 10, batch_limit),
+                    ),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT * FROM (
+                           SELECT *, ROW_NUMBER() OVER (
+                               PARTITION BY channel, platform_shop_id
+                               ORDER BY last_attempt_at ASC, id ASC
+                           ) AS _store_rank
+                           FROM gateway_webhook_events
+                           WHERE status = 'pending' AND next_attempt_at <= ?
+                             AND (lease_token = '' OR lease_expires_at <= ?)
+                       ) WHERE _store_rank <= ?
+                       ORDER BY last_attempt_at ASC, id ASC
+                       LIMIT ?""",
+                    (
+                        now,
+                        now,
+                        per_store_candidates,
+                        max(batch_limit * 10, batch_limit),
+                    ),
+                ).fetchall()
             groups: dict[str, list[dict[str, Any]]] = {}
             for row in rows:
                 item = dict(row)
@@ -1176,26 +1178,45 @@ class GatewayStore:
         owner: str,
         ttl_seconds: int,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        """返回 ``(acquired_lock, existing_lock)``；已存在他人有效锁时返回现有锁。"""
+        """返回 ``(acquired_lock, existing_lock)``；已存在他人有效锁时返回现有锁。
+
+        使用 ``INSERT ... ON CONFLICT ... WHERE 过期或同 owner ... RETURNING`` 原子抢占；
+        PostgreSQL 额外 ``SELECT ... FOR UPDATE`` 串行化同一 lock_key 的竞争实例。
+        """
         self._ensure()
         now_epoch = epoch_now()
         now = utc_now()
+        expires = now_epoch + max(10, int(ttl_seconds))
         with self._write() as connection:
+            lock_clause = " FOR UPDATE" if self.backend.is_postgres else ""
             row = connection.execute(
-                "SELECT * FROM gateway_refresh_locks WHERE lock_key = ?", (lock_key,)
+                f"SELECT * FROM gateway_refresh_locks WHERE lock_key = ?{lock_clause}",
+                (lock_key,),
             ).fetchone()
-            if row is not None and int(row["expires_at"] or 0) > now_epoch and str(row["owner"]) != owner:
+            if (
+                row is not None
+                and int(row["expires_at"] or 0) > now_epoch
+                and str(row["owner"]) != owner
+            ):
                 return None, dict(row)
-            expires = now_epoch + max(10, int(ttl_seconds))
-            connection.execute(
-                """INSERT INTO gateway_refresh_locks(lock_key, instance_id, owner, acquired_at, expires_at, renewed_at)
+            cursor = connection.execute(
+                """INSERT INTO gateway_refresh_locks
+                   (lock_key, instance_id, owner, acquired_at, expires_at, renewed_at)
                    VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT(lock_key) DO UPDATE SET
                      instance_id=excluded.instance_id, owner=excluded.owner,
                      acquired_at=excluded.acquired_at, expires_at=excluded.expires_at,
-                     renewed_at=excluded.renewed_at""",
-                (lock_key, int(instance_id), owner, now, expires, now),
+                     renewed_at=excluded.renewed_at
+                   WHERE gateway_refresh_locks.expires_at <= ? OR gateway_refresh_locks.owner = excluded.owner
+                   RETURNING *""",
+                (lock_key, int(instance_id), owner, now, expires, now, now_epoch),
             )
+            acquired = cursor.fetchone()
+            if acquired is None:
+                existing = connection.execute(
+                    "SELECT * FROM gateway_refresh_locks WHERE lock_key = ?", (lock_key,)
+                ).fetchone()
+                return None, dict(existing) if existing is not None else None
         return (
             {
                 "lock_key": lock_key,
@@ -1279,7 +1300,9 @@ class GatewayStore:
                 """INSERT INTO gateway_deliveries
                    (instance_id, idempotency_key, request_hash, kind, target, payload_json,
                     status, attempts, max_attempts, next_attempt_at, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, 0, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, 0, ?, ?)
+                   ON CONFLICT(instance_id, idempotency_key) DO NOTHING
+                   RETURNING id""",
                 (
                     int(instance_id),
                     idempotency_key,
@@ -1292,7 +1315,19 @@ class GatewayStore:
                     now,
                 ),
             )
-            delivery_id = int(cursor.lastrowid or 0)
+            inserted = cursor.fetchone()
+            if inserted is None:
+                row = connection.execute(
+                    """SELECT * FROM gateway_deliveries
+                       WHERE instance_id = ? AND idempotency_key = ?""",
+                    (int(instance_id), idempotency_key),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("delivery insert conflict but row missing")
+                if str(row["request_hash"]) != request_hash:
+                    raise ValueError("idempotency_conflict")
+                return self._delivery_payload(row), True
+            delivery_id = int(inserted[0])
             row = connection.execute(
                 "SELECT * FROM gateway_deliveries WHERE id = ?", (delivery_id,)
             ).fetchone()
@@ -1369,7 +1404,7 @@ class GatewayStore:
         return self._delivery_payload(row) if row is not None else None
 
     @staticmethod
-    def _delivery_payload(row: sqlite3.Row) -> dict[str, Any]:
+    def _delivery_payload(row: Row) -> dict[str, Any]:
         return {
             "id": str(row["id"]),
             "instance_id": str(row["instance_id"]),
@@ -1397,24 +1432,21 @@ class GatewayStore:
         now_epoch = epoch_now()
         window_start = now_epoch - (now_epoch % window)
         with self._write() as connection:
-            row = connection.execute(
-                "SELECT * FROM gateway_rate_limits WHERE scope = ?", (scope,)
-            ).fetchone()
-            if row is None or int(row["window_start"] or 0) != window_start:
-                connection.execute(
-                    """INSERT INTO gateway_rate_limits(scope, window_start, count, updated_at)
-                       VALUES (?, ?, 1, ?)
-                       ON CONFLICT(scope) DO UPDATE SET
-                         window_start=excluded.window_start, count=1, updated_at=excluded.updated_at""",
-                    (scope, window_start, utc_now()),
-                )
-                count = 1
-            else:
-                count = int(row["count"] or 0) + 1
-                connection.execute(
-                    "UPDATE gateway_rate_limits SET count = ?, updated_at = ? WHERE scope = ?",
-                    (count, utc_now(), scope),
-                )
+            cursor = connection.execute(
+                """INSERT INTO gateway_rate_limits(scope, window_start, count, updated_at)
+                   VALUES (?, ?, 1, ?)
+                   ON CONFLICT(scope) DO UPDATE SET
+                     count = CASE
+                       WHEN gateway_rate_limits.window_start = excluded.window_start
+                       THEN gateway_rate_limits.count + 1
+                       ELSE 1
+                     END,
+                     window_start = excluded.window_start,
+                     updated_at = excluded.updated_at
+                   RETURNING count""",
+                (scope, window_start, utc_now()),
+            )
+            count = int(cursor.fetchone()[0])
         allowed = count <= limit
         reset_at = window_start + window
         return {

@@ -1,0 +1,3 @@
+# HA 镜像额外依赖；migration/本地集成测试也可在宿主机安装：
+#   pip install -r deploy/gateway/ha/requirements.txt
+psycopg[binary]>=3.2,<4

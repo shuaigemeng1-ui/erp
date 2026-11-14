@@ -57,6 +57,8 @@ class GatewayConfig:
     """网关运行配置（测试可直接构造，不读环境变量）。"""
 
     db_path: str = "/data/gateway.db"
+    # 留空=SQLite（db_path）；postgresql://...=多实例共享 PostgreSQL（HA 部署）
+    database_url: str = ""
     secret_key: str = ""
     admin_token: str = ""
     channels: tuple[str, ...] = DEFAULT_CHANNELS
@@ -100,6 +102,7 @@ class GatewayConfig:
     def from_env(cls) -> GatewayConfig:
         return cls(
             db_path=os.environ.get("GATEWAY_DB_PATH", "/data/gateway.db"),
+            database_url=os.environ.get("GATEWAY_DATABASE_URL", "").strip(),
             secret_key=os.environ.get("GATEWAY_SECRET_KEY", ""),
             admin_token=os.environ.get("GATEWAY_ADMIN_TOKEN", ""),
             channels=_env_list("GATEWAY_CHANNELS", DEFAULT_CHANNELS),
@@ -170,6 +173,10 @@ class GatewayConfig:
             raise ValueError("GATEWAY_ENVIRONMENTS 不能为空")
         if str(self.sqlite_synchronous).upper() not in {"NORMAL", "FULL"}:
             raise ValueError("GATEWAY_SQLITE_SYNCHRONOUS 只能是 NORMAL 或 FULL")
+        if self.database_url and not self.database_url.startswith(
+            ("postgresql://", "postgres://", "sqlite:")
+        ):
+            raise ValueError("GATEWAY_DATABASE_URL 只支持 postgresql:// 或 sqlite: 前缀")
         if self.webhook_dispatch_global_concurrency < 1:
             raise ValueError("webhook_dispatch_global_concurrency 必须 >= 1")
         if self.webhook_dispatch_tenant_concurrency < 1:

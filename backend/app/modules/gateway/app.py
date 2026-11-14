@@ -574,6 +574,7 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
         tenant_limit = max(1, int(cfg.webhook_dispatch_tenant_concurrency))
         store_limit = max(1, int(cfg.webhook_dispatch_store_concurrency))
         tasks: set[asyncio.Task[Any]] = set()
+        application.state.webhook_dispatch_tasks = tasks
         task_meta: dict[asyncio.Task[Any], tuple[int, str]] = {}
         tenant_in_flight: dict[int, int] = {}
         store_in_flight: dict[str, int] = {}
@@ -655,6 +656,16 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
         task = getattr(application.state, "webhook_dispatcher_task", None)
         if task is not None:
             task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown best effort
+                pass
+        # 优雅停机：取消在途协程；已领取但未完成的 DB lease 到期后由另一实例回收。
+        children = list(getattr(application.state, "webhook_dispatch_tasks", set()))
+        for child in children:
+            child.cancel()
+        if children:
+            await asyncio.wait(children, timeout=min(10, max(1, cfg.webhook_lease_seconds - 1)))
 
     @application.post(WEBHOOK_PATH)
     async def receive_tiktok_webhook(request: Request) -> Response:
@@ -766,6 +777,7 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
         require_admin(request)
         return {
             "webhook": store.webhook_stats(),
+            "storage": store.backend.describe(),
             "dispatch": {
                 "enabled": cfg.webhook_dispatch_enabled,
                 "global_concurrency": cfg.webhook_dispatch_global_concurrency,
@@ -858,6 +870,7 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
             "channel_apps": store.channel_app_count(),
             "instances": store.instance_counts(),
             "webhook": store.webhook_stats(),
+            "storage": store.backend.describe(),
             "webhook_dispatch": {
                 "enabled": cfg.webhook_dispatch_enabled,
                 "global_concurrency": cfg.webhook_dispatch_global_concurrency,

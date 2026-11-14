@@ -1,0 +1,109 @@
+# =============================================================================
+# Gateway 双实例 + PostgreSQL（本地集成/演练栈）
+#
+# 生产：将 GATEWAY_DATABASE_URL 指向托管 PostgreSQL / Patroni / CloudNativePG 的
+# 统一读写端点（自动 failover），可移除本文件的 postgres 服务，只保留 gateway-a/b + LB。
+#
+# 启动：
+#   cp .env.example .env  # 填密钥
+#   docker compose -f deploy/gateway/ha/docker-compose.yml --env-file deploy/gateway/ha/.env up -d --build
+#   curl -fsS http://127.0.0.1:8088/healthz
+#
+# 不要在这里运行 SQLite 迁移；先按 README 用 scripts/gateway_ha_migrate.py 完成数据迁移。
+# =============================================================================
+name: erp-gateway-ha
+
+x-gateway-env: &gateway-env
+  GATEWAY_DATABASE_URL: ${GATEWAY_DATABASE_URL:-postgresql://gateway:${POSTGRES_PASSWORD:-change-me}@postgres:5432/gateway}
+  GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL:-https://gateway.example.com}
+  GATEWAY_SECRET_KEY: ${GATEWAY_SECRET_KEY:?set GATEWAY_SECRET_KEY in .env}
+  GATEWAY_ADMIN_TOKEN: ${GATEWAY_ADMIN_TOKEN:?set GATEWAY_ADMIN_TOKEN in .env}
+  GATEWAY_WEBHOOK_RELAY_SECRET: ${GATEWAY_WEBHOOK_RELAY_SECRET:?set GATEWAY_WEBHOOK_RELAY_SECRET in .env}
+  GATEWAY_CHANNELS: ${GATEWAY_CHANNELS:-shopee,tiktok}
+  GATEWAY_ENVIRONMENTS: ${GATEWAY_ENVIRONMENTS:-production,test}
+  GATEWAY_INSTANCE_AUTH_ENABLED: "true"
+  GATEWAY_WEBHOOK_DISPATCH_ENABLED: "true"
+  GATEWAY_WEBHOOK_DISPATCH_GLOBAL_CONCURRENCY: ${GATEWAY_WEBHOOK_DISPATCH_GLOBAL_CONCURRENCY:-16}
+  GATEWAY_WEBHOOK_DISPATCH_TENANT_CONCURRENCY: ${GATEWAY_WEBHOOK_DISPATCH_TENANT_CONCURRENCY:-8}
+  GATEWAY_WEBHOOK_LEASE_SECONDS: ${GATEWAY_WEBHOOK_LEASE_SECONDS:-60}
+  GATEWAY_WEBHOOK_RETRY_MAX_SECONDS: ${GATEWAY_WEBHOOK_RETRY_MAX_SECONDS:-3600}
+
+x-gateway-service: &gateway-service
+  build:
+    context: ../../..
+    dockerfile: deploy/gateway/ha/Dockerfile
+  image: erp-gateway-ha:${GATEWAY_IMAGE_TAG:-latest}
+  restart: unless-stopped
+  stop_grace_period: 30s
+  networks:
+    - gateway_ha
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - gateway_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - gateway_ha
+
+  gateway-a:
+    <<: *gateway-service
+    environment:
+      <<: *gateway-env
+    expose:
+      - "8100"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/healthz', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  gateway-b:
+    <<: *gateway-service
+    environment:
+      <<: *gateway-env
+    expose:
+      - "8100"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/healthz', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  lb:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${GATEWAY_HA_HTTP_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      gateway-a:
+        condition: service_healthy
+      gateway-b:
+        condition: service_healthy
+    networks:
+      - gateway_ha
+
+volumes:
+  gateway_pg_data:
+    name: ${COMPOSE_PROJECT_NAME:-erp-gateway-ha}_gateway_pg_data
+
+networks:
+  gateway_ha:
+    name: ${COMPOSE_PROJECT_NAME:-erp-gateway-ha}_gateway_ha

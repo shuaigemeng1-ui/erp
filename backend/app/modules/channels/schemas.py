@@ -158,6 +158,7 @@ class DisconnectOut(BaseModel):
 class ListingOut(BaseModel):
     id: str = Field(description="平台商品行ID")
     store_id: str = Field(description="店铺ID")
+    store_name: str | None = Field(default=None, description="store display name")
     external_item_id: str = Field(description="平台商品ID")
     external_sku_id: str = Field(description="平台规格ID / SKU 编码；无规格为空串")
     title: str = Field(description="平台商品标题")
@@ -212,6 +213,7 @@ def listing_payload(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": id_string(item.get("id")),
         "store_id": id_string(item.get("store_id")),
+          "store_name": item.get("store_name") or "",
         "external_item_id": item.get("external_item_id") or "",
         "external_sku_id": item.get("external_sku_id") or "",
         "title": item.get("title") or "",

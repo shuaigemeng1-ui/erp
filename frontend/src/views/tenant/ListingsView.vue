@@ -166,6 +166,47 @@ function mappingStatus(listing: Listing): string {
   return listing.link_status ?? listing.mapping_status ?? 'missing'
 }
 
+type SpuListing = Listing & {
+  children: Listing[]
+  sku_count: number
+  total_stock: number
+  price_min: number | null
+  price_max: number | null
+  mapped_count: number
+}
+
+const spuRows = computed<SpuListing[]>(() => {
+  const groups = new Map<string, Listing[]>()
+  for (const row of rows.value) {
+    const key = `${row.store_id}:${row.external_item_id}`
+    const list = groups.get(key) ?? []
+    list.push(row)
+    groups.set(key, list)
+  }
+  return Array.from(groups.values()).map((children) => {
+    const first = children[0]
+    const prices = children
+      .map((item) => Number(item.price))
+      .filter((value) => Number.isFinite(value))
+    return {
+      ...first,
+      children,
+      sku_count: children.length,
+      total_stock: children.reduce((sum, item) => sum + Number(item.remote_stock ?? 0), 0),
+      price_min: prices.length ? Math.min(...prices) : null,
+      price_max: prices.length ? Math.max(...prices) : null,
+      mapped_count: children.filter((item) => mappingStatus(item) === 'mapped').length,
+    }
+  })
+})
+
+function priceRange(row: SpuListing): string {
+  if (row.price_min === null) return '-'
+  const currency = row.currency ?? ''
+  if (row.price_min === row.price_max) return `${currency} ${row.price_min.toFixed(2)}`.trim()
+  return `${currency} ${row.price_min.toFixed(2)} - ${row.price_max!.toFixed(2)}`.trim()
+}
+
 onMounted(loadStores)
 </script>
 
@@ -188,48 +229,75 @@ onMounted(loadStores)
       <el-button v-if="canMap" type="primary" @click="openSync">同步平台商品</el-button>
     </div>
 
-    <el-table v-loading="loading" :data="rows" border size="small" row-key="id">
+    <el-table
+      v-loading="loading"
+      :data="spuRows"
+      border
+      size="small"
+      row-key="id"
+      :tree-props="{ children: 'children' }"
+      default-expand-all
+    >
       <el-table-column label="店铺" width="140" show-overflow-tooltip>
         <template #default="{ row }">{{ textOrDash(row.store_name) }}</template>
       </el-table-column>
-      <el-table-column label="平台商品 ID" width="160">
-        <template #default="{ row }"><span class="mono">{{ textOrDash(row.external_item_id) }}</span></template>
-      </el-table-column>
-      <el-table-column label="平台 SKU" width="150">
-        <template #default="{ row }"><span class="mono">{{ textOrDash(row.external_sku_id) }}</span></template>
-      </el-table-column>
-      <el-table-column label="图片" width="76" align="center">
+      <el-table-column label="图片" width="82" align="center">
         <template #default="{ row }">
-          <el-image
-            v-if="row.image_url"
-            :src="row.image_url"
-            fit="cover"
-            style="width: 48px; height: 48px; border-radius: 4px"
-            :preview-src-list="[row.image_url]"
-            preview-teleported
-          />
+          <el-popover v-if="row.image_url" trigger="hover" :width="300" placement="right">
+            <template #reference>
+              <el-image
+                :src="row.image_url"
+                fit="cover"
+                style="width: 48px; height: 48px; border-radius: 4px; cursor: zoom-in"
+              />
+            </template>
+            <el-image :src="row.image_url" fit="contain" style="width: 280px; height: 280px" />
+          </el-popover>
           <span v-else>-</span>
         </template>
       </el-table-column>
-      <el-table-column prop="title" label="标题" min-width="220" show-overflow-tooltip />
-      <el-table-column label="价格" width="130" align="right">
-        <template #default="{ row }">{{ formatDecimal(row.price) }} {{ row.currency ?? '' }}</template>
-      </el-table-column>
-      <el-table-column label="远端库存" width="100" align="right">
-        <template #default="{ row }">{{ formatDecimal(row.remote_stock) }}</template>
-      </el-table-column>
-      <el-table-column label="映射状态" width="130">
+      <el-table-column label="商品" min-width="280" show-overflow-tooltip>
         <template #default="{ row }">
-          <StatusTag :status="mappingStatus(row as Listing)" />
-          <el-tag v-if="row.mapping_source" size="small" type="info" style="margin-left: 4px">
-            {{ row.mapping_source === 'auto' ? '自动' : '手动' }}
-          </el-tag>
+          <div>{{ textOrDash(row.title) }}</div>
+          <div class="text-muted mono">SPU: {{ textOrDash(row.external_item_id) }}</div>
         </template>
       </el-table-column>
-      <el-table-column label="本地商品 / SKU" min-width="190" show-overflow-tooltip>
+      <el-table-column label="状态" width="100">
+        <template #default="{ row }"><StatusTag :status="row.status" /></template>
+      </el-table-column>
+      <el-table-column label="零售价" width="150" align="right">
         <template #default="{ row }">
-          <div>{{ textOrDash(row.product_name) }}</div>
-          <div class="text-muted mono">{{ textOrDash(row.sku_code) }}</div>
+          {{ row.children ? priceRange(row as SpuListing) : `${row.currency ?? ''} ${formatDecimal(row.price)}`.trim() }}
+        </template>
+      </el-table-column>
+      <el-table-column label="库存" width="90" align="right">
+        <template #default="{ row }">
+          {{ row.children ? row.total_stock : formatDecimal(row.remote_stock) }}
+        </template>
+      </el-table-column>
+      <el-table-column label="SKU 数" width="90" align="center">
+        <template #default="{ row }">{{ row.sku_count ?? '-' }}</template>
+      </el-table-column>
+      <el-table-column label="映射" width="150">
+        <template #default="{ row }">
+          <template v-if="row.children">
+            <span>{{ row.mapped_count }}/{{ row.sku_count }} 已映射</span>
+          </template>
+          <template v-else>
+            <StatusTag :status="mappingStatus(row as Listing)" />
+            <el-tag v-if="row.mapping_source" size="small" type="info" style="margin-left: 4px">
+              {{ row.mapping_source === 'auto' ? '自动' : '手动' }}
+            </el-tag>
+          </template>
+        </template>
+      </el-table-column>
+      <el-table-column label="平台 SKU / 本地商品" min-width="220" show-overflow-tooltip>
+        <template #default="{ row }">
+          <template v-if="!row.children">
+            <div class="mono">{{ textOrDash(row.external_sku_id) }}</div>
+            <div class="text-muted">{{ textOrDash(row.product_name) }} {{ textOrDash(row.sku_code) }}</div>
+          </template>
+          <span v-else class="text-muted">展开查看 {{ row.sku_count }} 个 SKU</span>
         </template>
       </el-table-column>
       <el-table-column label="同步时间" width="170">
@@ -237,10 +305,18 @@ onMounted(loadStores)
       </el-table-column>
       <el-table-column label="操作" width="150" fixed="right">
         <template #default="{ row }">
-          <el-button v-if="canMap" text type="primary" size="small" @click="openMap(row as Listing)">映射</el-button>
-          <el-button v-if="canMap && mappingStatus(row as Listing) === 'mapped'" text type="danger" size="small" @click="unlink(row as Listing)">
-            解除
-          </el-button>
+          <template v-if="!row.children">
+            <el-button v-if="canMap" text type="primary" size="small" @click="openMap(row as Listing)">映射</el-button>
+            <el-button
+              v-if="canMap && mappingStatus(row as Listing) === 'mapped'"
+              text
+              type="danger"
+              size="small"
+              @click="unlink(row as Listing)"
+            >
+              解除
+            </el-button>
+          </template>
         </template>
       </el-table-column>
     </el-table>

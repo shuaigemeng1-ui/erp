@@ -2323,6 +2323,15 @@ def list_listing_summaries(
         if link is not None and link.sku_id is not None
     ]
     sku_details = load_sku_details(db, tenant_id, sku_ids)
+    store_names = {
+        int(store.id): store.name
+        for store in db.execute(
+            select(Store).where(
+                Store.tenant_id == tenant_id,
+                Store.id.in_({int(listing.store_id) for listing, _ in rows} or {0}),
+            )
+        ).scalars()
+    }
     items: list[dict[str, Any]] = []
     for listing, link in rows:
         details = sku_details.get(int(link.sku_id)) if link and link.sku_id else None
@@ -2330,6 +2339,7 @@ def list_listing_summaries(
             {
                 "id": listing.id,
                 "store_id": listing.store_id,
+                "store_name": store_names.get(int(listing.store_id), ""),
                 "external_item_id": listing.external_item_id,
                 "external_sku_id": listing.external_sku_id,
                 "title": listing.title,

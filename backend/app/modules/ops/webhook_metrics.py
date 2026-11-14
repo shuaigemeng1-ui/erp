@@ -245,6 +245,7 @@ def _gateway_metrics(window_seconds: int) -> dict[str, Any]:
         "retry": None,
         "leased": None,
         "due": None,
+        "failure_classes": None,
         "success_rate": None,
         "p95_ms": None,
         "last_delivery_latency_ms": None,
@@ -315,6 +316,12 @@ def _gateway_metrics(window_seconds: int) -> dict[str, Any]:
     payload["retry"] = _safe_int(stats.get("retry"))
     payload["leased"] = _safe_int(stats.get("leased"))
     payload["due"] = _safe_int(stats.get("due"))
+    failure_classes = stats.get("failure_classes")
+    payload["failure_classes"] = (
+        {str(key): _safe_int(value) for key, value in failure_classes.items()}
+        if isinstance(failure_classes, Mapping)
+        else None
+    )
     payload["oldest_pending_at"] = stats.get("oldest_pending_at")
     last_latency = stats.get(
         "last_delivery_latency_ms", stats.get("last_latency_ms", stats.get("latency_ms"))

@@ -459,6 +459,7 @@ export interface OpsWebhookGatewayMetrics {
   retry?: number | null
   leased?: number | null
   due?: number | null
+  failure_classes?: Record<string, number> | null
   success_rate?: number | null
   p95_ms?: number | null
   last_delivery_latency_ms?: number | null

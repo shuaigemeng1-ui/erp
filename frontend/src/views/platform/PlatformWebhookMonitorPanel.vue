@@ -395,6 +395,20 @@ onMounted(load)
                   {{ gatewayFieldLabel(field) }}
                 </el-tag>
               </div>
+              <div
+                v-if="gateway.failure_classes && Object.keys(gateway.failure_classes).length"
+                class="webhook-unavailable"
+              >
+                <span class="text-muted">失败分类：</span>
+                <el-tag
+                  v-for="(count, key) in gateway.failure_classes"
+                  :key="key"
+                  type="danger"
+                  size="small"
+                >
+                  {{ key }} {{ count }}
+                </el-tag>
+              </div>
               <div v-if="gateway.unavailable_reason" class="webhook-note text-muted">
                 {{ gateway.unavailable_reason }}
               </div>

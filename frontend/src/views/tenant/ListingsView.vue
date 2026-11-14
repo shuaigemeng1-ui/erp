@@ -207,6 +207,8 @@ function priceRange(row: SpuListing): string {
   return `${currency} ${row.price_min.toFixed(2)} - ${row.price_max!.toFixed(2)}`.trim()
 }
 
+const expandedSpuKeys = computed(() => spuRows.value.map((row) => String(row.id)))
+
 onMounted(loadStores)
 </script>
 
@@ -236,7 +238,7 @@ onMounted(loadStores)
       size="small"
       row-key="id"
       :tree-props="{ children: 'children' }"
-      default-expand-all
+      :expand-row-keys="expandedSpuKeys"
     >
       <el-table-column label="店铺" width="140" show-overflow-tooltip>
         <template #default="{ row }">{{ textOrDash(row.store_name) }}</template>

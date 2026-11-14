@@ -264,10 +264,12 @@ class TikTokClient:
     def search_products(
         self, *, page_size: int = 100, page_token: str = ""
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"page_size": max(1, min(int(page_size), 100))}
+        # TikTok Shop 商品搜索接口把 page_size/page_token 定义为 query 参数；
+        # 放进 JSON body 会被平台判定为未提供（code=36009004）。
+        params: dict[str, Any] = {"page_size": max(1, min(int(page_size), 100))}
         if page_token:
-            body["page_token"] = page_token
-        return self.post("/product/202309/products/search", body=body)
+            params["page_token"] = page_token
+        return self.post("/product/202309/products/search", params=params, body={})
 
     def search_orders(
         self,

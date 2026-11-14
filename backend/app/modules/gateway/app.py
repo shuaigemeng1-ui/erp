@@ -320,7 +320,6 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
         """Best-effort delivery from durable Gateway inbox to the tenant relay."""
         event_id = int(event["id"])
         attempts = int(event.get("attempts") or 0) + 1
-        max_attempts = int(cfg.webhook_max_attempts or 10)
         if not cfg.webhook_relay_secret:
             store.mark_webhook_event(
                 event_id,
@@ -374,16 +373,13 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
         if 200 <= status_code < 300 or status_code == 409:
             store.mark_webhook_event(event_id, status="delivered", attempts=attempts)
             return
-        if 400 <= status_code < 500 and status_code not in {408, 429}:
+        if status_code in {400, 413, 422}:
             store.mark_webhook_event(
                 event_id, status="dead", attempts=attempts, last_error=last_error or f"tenant returned {status_code}"
             )
             return
-        if attempts >= max_attempts:
-            store.mark_webhook_event(
-                event_id, status="dead", attempts=attempts, last_error=last_error or f"tenant returned {status_code}"
-            )
-            return
+        # 5xx、超时、连接失败、401/403/404、以及长期配置故障都不能丢消息：
+        # 保持 pending，持续退避重试；租户升级/故障恢复后自动补投。
         store.mark_webhook_event(
             event_id,
             status="pending",

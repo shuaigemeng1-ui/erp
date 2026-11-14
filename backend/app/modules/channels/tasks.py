@@ -675,13 +675,10 @@ def process_tiktok_webhook_events(tenant_id: int, limit: int = 20) -> dict[str, 
                         row.last_error = str(exc)[:1000]
                         row.lease_owner = None
                         row.lease_expires_at = None
-                        if attempts >= 5:
-                            row.status = "dead"
-                        else:
-                            row.status = "retry_wait"
-                            row.next_attempt_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
-                                seconds=min(1800, 15 * (2 ** attempts))
-                            )
+                        row.status = "retry_wait"
+                        row.next_attempt_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+                            seconds=min(3600, 15 * (2 ** min(attempts, 8)))
+                        )
                     db.commit()
             except Exception:  # noqa: BLE001
                 logger.exception("TikTok webhook refresh failure state write failed")

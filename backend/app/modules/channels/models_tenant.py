@@ -227,6 +227,7 @@ class TiktokOrderRefreshQueue(IdMixin, TimestampMixin, TenantIdMixin, TenantBase
             name="uq_tiktok_order_refresh_queue_scope",
         ),
         Index("ix_tiktok_order_refresh_queue_due", "tenant_id", "status", "next_attempt_at"),
+        Index("ix_tiktok_order_refresh_queue_lease", "tenant_id", "status", "lease_expires_at"),
         table_options("TikTok 订单刷新队列表"),
     )
 
@@ -240,8 +241,14 @@ class TiktokOrderRefreshQueue(IdMixin, TimestampMixin, TenantIdMixin, TenantBase
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="尝试次数")
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="下次尝试时间")
     lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="处理者")
+    lease_token: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment="租约令牌（确认完成前校验，防旧 Worker 覆盖新版本）"
+    )
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="租约过期时间")
     last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True, comment="最近错误")
+    last_failure_code: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, comment="最近失败分类：detail_missing/order_no_mismatch/normalize_failed/..."
+    )
 
 
 class ChannelListing(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):

@@ -32,8 +32,8 @@ from app.modules.tasks.tenancy import active_tenant_ids, load_tenant_route
 
 logger = logging.getLogger("ventasync.tasks.scheduler")
 
-# 调度进程轮询间隔（秒）。最小 5 秒，避免空转。
-DEFAULT_TICK_SECONDS = 30
+# 调度进程轮询间隔（秒）。TikTok Webhook 刷新队列要求每 15 秒扫描一次。
+DEFAULT_TICK_SECONDS = 15
 # 单租户一次最多生成的任务数
 DEFAULT_BATCH_SIZE = 100
 
@@ -79,6 +79,31 @@ def recover_stale_runs_for_tenant(tenant_id: int, *, stale_minutes: int | None =
     from app.modules.tasks.tasks import recover_stale_runs
 
     return recover_stale_runs(tenant_id, stale_minutes=stale_minutes)
+
+
+def tiktok_refresh_for_tenant(tenant_id: int) -> dict[str, int]:
+    """TikTok Webhook 刷新队列维护（延迟 import，渠道模块未就绪时跳过）。
+
+    每轮调度（默认 15 秒）执行：
+    * 历史 received 事件按订单对账（已有业务结果补状态，缺结果重新入队）；
+    * 扫描 pending/retry_wait/lease 过期 processing 队列（FOR UPDATE SKIP LOCKED）；
+    * 仅投递 Celery 唤醒任务，真正的领取与订单拉取在 Worker 中完成。
+    """
+    try:
+        from app.modules.channels.tasks import tiktok_refresh_maintenance
+    except (ImportError, AttributeError):
+        return {"reconciled": 0, "requeued": 0, "due": 0, "woken": 0}
+    try:
+        result = tiktok_refresh_maintenance(int(tenant_id))
+    except Exception:  # noqa: BLE001 - 单租户失败不影响调度轮次
+        logger.exception("TikTok Webhook 刷新队列维护失败 tenant=%s", tenant_id)
+        return {"reconciled": 0, "requeued": 0, "due": 0, "woken": 0}
+    return {
+        "reconciled": int((result or {}).get("reconciled") or 0),
+        "requeued": int((result or {}).get("requeued") or 0),
+        "due": int((result or {}).get("due") or 0),
+        "woken": int(bool((result or {}).get("woken"))),
+    }
 
 
 def compensate_webhook_events_for_tenant(tenant_id: int) -> tuple[int, int]:
@@ -130,6 +155,10 @@ def run_once(
         "recovered": 0,
         "webhook_compensated": 0,
         "webhook_failed": 0,
+        "tiktok_reconciled": 0,
+        "tiktok_requeued": 0,
+        "tiktok_due": 0,
+        "tiktok_woken": 0,
         "skipped_tenants": 0,
         "failed": 0,
     }
@@ -169,17 +198,23 @@ def run_once(
             compensated, compensation_failed = compensate_webhook_events_for_tenant(int(tenant_id))
             summary["webhook_compensated"] += compensated
             summary["webhook_failed"] += compensation_failed
+        tiktok_summary = tiktok_refresh_for_tenant(int(tenant_id))
+        for key in ("reconciled", "requeued", "due", "woken"):
+            summary[f"tiktok_{key}"] += int(tiktok_summary.get(key) or 0)
     if (
         summary["created"]
         or summary["recovered"]
         or summary["webhook_compensated"]
         or summary["webhook_failed"]
+        or summary["tiktok_reconciled"]
+        or summary["tiktok_requeued"]
+        or summary["tiktok_due"]
         or summary["skipped_tenants"]
         or summary["failed"]
     ):
         logger.info(
             "调度轮次: 绑定=%s 租户=%s 跳过=%s 扫描=%s 新建任务=%s 复用=%s 回收中断=%s "
-            "回调补偿=%s 回调补偿失败=%s 失败租户=%s",
+            "回调补偿=%s 回调补偿失败=%s TikTok对账=%s TikTok重入队=%s TikTok到期=%s TikTok唤醒=%s 失败租户=%s",
             binding.describe(),
             summary["tenants"],
             summary["skipped_tenants"],
@@ -189,6 +224,10 @@ def run_once(
             summary["recovered"],
             summary["webhook_compensated"],
             summary["webhook_failed"],
+            summary["tiktok_reconciled"],
+            summary["tiktok_requeued"],
+            summary["tiktok_due"],
+            summary["tiktok_woken"],
             summary["failed"],
         )
     return summary

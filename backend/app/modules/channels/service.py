@@ -25,7 +25,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import or_, select, text, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -3006,42 +3006,209 @@ def find_tiktok_store_by_shop(db: Session, tenant_id: int, platform_shop_id: str
     ).scalar_one_or_none()
 
 
-def enqueue_tiktok_order_refresh(
-    db: Session, tenant_id: int, store_id: int, external_order_no: str, *, reason: str = "webhook"
-) -> bool:
-    """同一订单只保留一行，连续事件只增加 generation。"""
-    order_no = str(external_order_no or "").strip()[:64]
-    if not order_no:
-        return False
-    row = db.execute(
+TIKTOK_REFRESH_STATUS_DUE = ("pending", "retry_wait")
+TIKTOK_REFRESH_STATUS_ACTIVE = ("pending", "processing", "retry_wait")
+TIKTOK_REFRESH_STATUS_DEAD = "dead"
+TIKTOK_REFRESH_STATUS_IDLE = "idle"
+
+
+def _tiktok_refresh_row(
+    db: Session, tenant_id: int, store_id: int, external_order_no: str
+) -> TiktokOrderRefreshQueue | None:
+    return db.execute(
         select(TiktokOrderRefreshQueue).where(
             TiktokOrderRefreshQueue.tenant_id == tenant_id,
             TiktokOrderRefreshQueue.store_id == store_id,
-            TiktokOrderRefreshQueue.external_order_no == order_no,
+            TiktokOrderRefreshQueue.external_order_no == external_order_no,
         )
     ).scalar_one_or_none()
+
+
+def enqueue_tiktok_order_refresh(
+    db: Session, tenant_id: int, store_id: int, external_order_no: str, *, reason: str = "webhook"
+) -> bool:
+    """同一订单只保留一行；新事件原子递增 generation 并把队列置回 pending。
+
+    * 用单条 ``UPDATE ... generation = generation + 1`` 原子递增，避免并发 Webhook 丢版本；
+    * 若该订单正被 Worker 外呼处理（processing），新事件会清空租约并回到 pending，
+      Worker 完成时因 generation/lease_token 不匹配而无法确认旧版本；
+    * 首次插入遇到唯一键竞争时回退为更新，保证不重复建行。
+    """
+    order_no = str(external_order_no or "").strip()[:64]
+    if not order_no:
+        return False
     now = utc_now()
-    if row is None:
+    update_values = {
+        "generation": TiktokOrderRefreshQueue.generation + 1,
+        "status": "pending",
+        "attempts": 0,
+        "next_attempt_at": now,
+        "lease_owner": None,
+        "lease_token": None,
+        "lease_expires_at": None,
+        "last_error": str(reason or "webhook")[:1000],
+        "last_failure_code": None,
+    }
+    scope = (
+        TiktokOrderRefreshQueue.tenant_id == int(tenant_id),
+        TiktokOrderRefreshQueue.store_id == int(store_id),
+        TiktokOrderRefreshQueue.external_order_no == order_no,
+    )
+    result = db.execute(
+        update(TiktokOrderRefreshQueue).where(*scope).values(**update_values)
+    )
+    if int(result.rowcount or 0) > 0:
+        db.flush()
+        return True
+    try:
+        with db.begin_nested():
+            db.add(
+                TiktokOrderRefreshQueue(
+                    tenant_id=int(tenant_id),
+                    store_id=int(store_id),
+                    external_order_no=order_no,
+                    generation=1,
+                    processed_generation=0,
+                    status="pending",
+                    attempts=0,
+                    next_attempt_at=now,
+                    last_error=str(reason or "webhook")[:1000],
+                    last_failure_code=None,
+                )
+            )
+            db.flush()
+    except IntegrityError:
+        # 并发插入竞争：唯一键已存在，按“新事件”原子递增 generation
+        db.execute(update(TiktokOrderRefreshQueue).where(*scope).values(**update_values))
+        db.flush()
+    return True
+
+
+def ensure_tiktok_order_refresh_rows(
+    db: Session,
+    tenant_id: int,
+    store_id: int,
+    order_ids: Sequence[str],
+    *,
+    reason: str = "webhook_duplicate",
+) -> int:
+    """Gateway 重复投递时补建缺失队列行（不递增已有行 generation，避免重复放大版本）。"""
+    created = 0
+    now = utc_now()
+    for order_id in order_ids:
+        order_no = str(order_id or "").strip()[:64]
+        if not order_no:
+            continue
+        row = _tiktok_refresh_row(db, int(tenant_id), int(store_id), order_no)
+        if row is not None:
+            if str(row.status or "") == TIKTOK_REFRESH_STATUS_DEAD:
+                enqueue_tiktok_order_refresh(
+                    db, int(tenant_id), int(store_id), order_no, reason=reason
+                )
+            continue
         db.add(
             TiktokOrderRefreshQueue(
-                tenant_id=tenant_id,
-                store_id=store_id,
+                tenant_id=int(tenant_id),
+                store_id=int(store_id),
                 external_order_no=order_no,
                 generation=1,
                 processed_generation=0,
                 status="pending",
                 attempts=0,
                 next_attempt_at=now,
-                last_error=reason[:1000],
+                last_error=str(reason or "webhook_duplicate")[:1000],
             )
         )
-    else:
-        row.generation = int(row.generation or 0) + 1
-        row.status = "pending"
-        row.next_attempt_at = now
-        row.last_error = reason[:1000]
+        created += 1
     db.flush()
-    return True
+    return created
+
+
+def mark_tiktok_webhook_events_processed(
+    db: Session,
+    tenant_id: int,
+    *,
+    store_id: int,
+    order_ids: Sequence[str],
+    limit: int = 200,
+) -> int:
+    """订单刷新成功后把关联的 received 事件标为 processed（按 payload.order_ids 关联）。"""
+    from app.modules.tasks.models_tenant import WebhookEvent
+
+    wanted = {str(item).strip() for item in order_ids if str(item or "").strip()}
+    if not wanted:
+        return 0
+    rows = db.execute(
+        select(WebhookEvent)
+        .where(
+            WebhookEvent.tenant_id == int(tenant_id),
+            WebhookEvent.channel == CHANNEL_TIKTOK,
+            WebhookEvent.store_id == int(store_id),
+            WebhookEvent.status == "received",
+        )
+        .order_by(WebhookEvent.id.desc())
+        .limit(max(1, int(limit)))
+    ).scalars().all()
+    count = 0
+    now = utc_now()
+    for event in rows:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        event_order_ids = {
+            str(item).strip() for item in (payload.get("order_ids") or []) if str(item or "").strip()
+        }
+        if event_order_ids & wanted:
+            event.status = "processed"
+            event.processed_at = now
+            count += 1
+    db.flush()
+    return count
+
+
+def tiktok_webhook_receipt(
+    *,
+    received: bool,
+    duplicate: bool,
+    mapping_missing: bool,
+    event_id: str | int | None,
+    external_event_id: str,
+    reason: str = "",
+) -> tuple[int, dict[str, Any]]:
+    """构造 relay 严格回执（状态码 + JSON）：Gateway 只在 received/duplicate 时视为已投递。
+
+    * ``received=true`` → HTTP 200（新建或重复已持久化）；
+    * ``mapping_missing=true`` → HTTP 503（网关保持 pending 重试，等待店铺映射修复）；
+    * 其它失败（持久化失败等）→ HTTP 503，明确 reason，绝不返回 200。
+    """
+    event_text = str(event_id if event_id is not None else external_event_id or "")
+    if mapping_missing:
+        return 503, {
+            "received": False,
+            "duplicate": False,
+            "mapping_missing": True,
+            "event_id": event_text,
+            "external_event_id": str(external_event_id or ""),
+            "reason": "mapping_missing",
+            "status": "mapping_missing",
+        }
+    if received:
+        return 200, {
+            "received": True,
+            "duplicate": bool(duplicate),
+            "mapping_missing": False,
+            "event_id": event_text,
+            "external_event_id": str(external_event_id or ""),
+            "reason": "",
+            "status": "duplicate" if duplicate else "received",
+        }
+    return 503, {
+        "received": False,
+        "duplicate": bool(duplicate),
+        "mapping_missing": False,
+        "event_id": event_text,
+        "external_event_id": str(external_event_id or ""),
+        "reason": (reason or "persist_failed")[:200],
+        "status": "failed",
+    }
 
 
 def record_tiktok_webhook_event(
@@ -3054,9 +3221,14 @@ def record_tiktok_webhook_event(
     payload: dict[str, Any],
     order_ids: Sequence[str],
 ) -> tuple[int, bool]:
-    """Persist the relayed event and enqueue authoritative order refreshes."""
-    from app.modules.tasks.service import record_webhook_event as tasks_record
+    """在同一租户 MySQL 事务内持久化事件 + 订单刷新队列（严格回执依赖此事务）。
+
+    * 订单类事件只落到 ``received``：由 Worker 刷新出业务结果后再标 ``processed``；
+    * 非订单类事件（解绑、到期提醒等）标记 processed/ignored，避免历史对账反复入队；
+    * 重复事件直接返回 duplicate，不重复递增 generation / 不重复入队。
+    """
     from app.modules.tasks.service import mark_webhook_event
+    from app.modules.tasks.service import record_webhook_event as tasks_record
 
     event_id, duplicate = tasks_record(
         db,
@@ -3068,14 +3240,22 @@ def record_tiktok_webhook_event(
         signature_ok=True,
         payload=payload,
     )
-    if not duplicate:
-        store.webhook_last_event_at = utc_now()
-        store.webhook_enabled = True
+    if duplicate:
+        return event_id, True
+    store.webhook_last_event_at = utc_now()
+    store.webhook_enabled = True
+    if order_ids:
         for order_id in order_ids:
             enqueue_tiktok_order_refresh(db, tenant_id, int(store.id), order_id, reason=event_type)
-        mark_webhook_event(db, tenant_id=tenant_id, event_id=event_id, status="processed")
-        db.flush()
-    return event_id, duplicate
+    else:
+        mark_webhook_event(
+            db,
+            tenant_id=tenant_id,
+            event_id=event_id,
+            status="processed" if event_type == "SELLER_DEAUTHORIZATION" else "ignored",
+        )
+    db.flush()
+    return event_id, False
 
 
 def handle_tiktok_deauthorization(db: Session, tenant_id: int, store: Store) -> None:

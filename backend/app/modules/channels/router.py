@@ -28,7 +28,7 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, Path, Query, Request
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -52,7 +52,6 @@ from app.modules.channels.constants import (
     LINK_STATUSES,
     LISTING_FILTER_UNMAPPED,
     STORE_STATUS_CONNECTED,
-    STORE_STATUS_PENDING_AUTHORIZATION,
     STORE_STATUS_REAUTH_REQUIRED,
 )
 from app.modules.channels.models_tenant import ChannelListing
@@ -537,17 +536,24 @@ def _handle_webhook(raw_body: bytes, signature: str, request_url: str) -> dict[s
 # --------------------------------------------------------------------------- TikTok Webhook
 @tiktok_integration_router.post("/webhook/relay")
 async def tiktok_webhook_relay(request: Request) -> Response:
-    """接受 Gateway 已完成 TikTok 验签的事件；只做入队，不阻塞 ACK。"""
+    """接受 Gateway 已完成 TikTok 验签的事件。
+
+    严格回执（Gateway 只在 received/duplicate 时视为已投递）：
+    * 事件 + 订单刷新队列必须在同一租户 MySQL 事务内提交，否则返回 503；
+    * 店铺映射缺失返回 503 + ``mapping_missing=true``，Gateway 保持 pending 重试等待修复；
+    * 重复事件返回 200 + ``duplicate=true``，不重复递增 generation；
+    * 成功返回 200 + ``received=true`` + ``event_id``。
+    """
     raw_body = await request.body()
     if len(raw_body) > 1024 * 1024:
-        return Response(status_code=413)
+        return _tiktok_receipt(status=413, received=False, reason="payload_too_large")
     timestamp = (request.headers.get("x-gateway-timestamp") or "").strip()
     try:
         timestamp_value = int(timestamp)
     except ValueError:
-        return Response(status_code=401)
+        return _tiktok_receipt(status=401, received=False, reason="invalid_timestamp")
     if abs(int(time.time()) - timestamp_value) > 300:
-        return Response(status_code=401)
+        return _tiktok_receipt(status=401, received=False, reason="expired_timestamp")
     received_signature = (request.headers.get("x-gateway-signature") or "").strip()
     if not tiktok_webhook.verify_relay_signature(
         relay_secret=str(getattr(settings, "gateway_webhook_relay_secret", "") or ""),
@@ -555,50 +561,111 @@ async def tiktok_webhook_relay(request: Request) -> Response:
         raw_body=raw_body,
         received_signature=received_signature,
     ):
-        return Response(status_code=401)
+        return _tiktok_receipt(status=401, received=False, reason="invalid_signature")
     try:
         tenant_id = int((request.headers.get("x-gateway-tenant-id") or "").strip())
         notification_id, type_code, event_type, shop_id, payload = tiktok_webhook.parse_event(raw_body)
     except (TypeError, ValueError):
-        return Response(status_code=400)
+        return _tiktok_receipt(status=400, received=False, reason="invalid_payload")
     with center_session() as center:
         route = _load_tenant_route(center, tenant_id)
         tenant_status = service.load_tenant_status(center, tenant_id)
     if route is None:
-        return Response(status_code=503)
+        return _tiktok_receipt(
+            status=503, received=False, external_event_id=notification_id, reason="tenant_unavailable"
+        )
+    duplicate = False
+    ensured = 0
     order_ids: list[str] = []
-    with tenant_session(route) as db:
-        store = service.find_tiktok_store_by_shop(db, tenant_id, shop_id)
-        if store is None:
-            logger.warning("TikTok Webhook 未知店铺：tenant=%s shop=%s", tenant_id, shop_id)
-            return Response(status_code=200)
-        sanitized = tiktok_webhook.sanitized_payload(
-            notification_id=notification_id,
-            type_code=type_code,
-            type_name=event_type,
-            shop_id=shop_id,
-            payload=payload,
+    try:
+        with tenant_session(route) as db:
+            store = service.find_tiktok_store_by_shop(db, tenant_id, shop_id)
+            if store is None:
+                logger.warning("TikTok Webhook 未知店铺：tenant=%s shop=%s", tenant_id, shop_id)
+                return _tiktok_receipt(
+                    status=503,
+                    received=False,
+                    mapping_missing=True,
+                    external_event_id=notification_id,
+                )
+            sanitized = tiktok_webhook.sanitized_payload(
+                notification_id=notification_id,
+                type_code=type_code,
+                type_name=event_type,
+                shop_id=shop_id,
+                payload=payload,
+            )
+            order_ids = list(sanitized.get("order_ids") or [])
+            event_id, duplicate = service.record_tiktok_webhook_event(
+                db,
+                tenant_id,
+                store=store,
+                notification_id=notification_id,
+                event_type=event_type,
+                payload=sanitized,
+                order_ids=order_ids,
+            )
+            if duplicate and order_ids:
+                from app.modules.tasks.models_tenant import WebhookEvent
+
+                existing_event = db.get(WebhookEvent, int(event_id))
+                if existing_event is not None and str(existing_event.status or "") == "received":
+                    ensured = service.ensure_tiktok_order_refresh_rows(
+                        db, tenant_id, int(store.id), order_ids, reason="webhook_duplicate"
+                    )
+            elif not duplicate and event_type == "SELLER_DEAUTHORIZATION":
+                service.handle_tiktok_deauthorization(db, tenant_id, store)
+            db.commit()
+    except Exception:  # noqa: BLE001 - 事件/队列未在同一事务提交，必须让 Gateway 重试
+        logger.exception("TikTok Webhook relay 持久化失败：tenant=%s", tenant_id)
+        return _tiktok_receipt(
+            status=503,
+            received=False,
+            external_event_id=notification_id,
+            reason="persist_failed",
         )
-        order_ids = list(sanitized.get("order_ids") or [])
-        event_id, duplicate = service.record_tiktok_webhook_event(
-            db,
-            tenant_id,
-            store=store,
-            notification_id=notification_id,
-            event_type=event_type,
-            payload=sanitized,
-            order_ids=order_ids,
-        )
-        if event_type == "SELLER_DEAUTHORIZATION":
-            service.handle_tiktok_deauthorization(db, tenant_id, store)
-        db.commit()
-    if tenant_status == "active" and order_ids and not duplicate:
+    if tenant_status == "active" and order_ids and (not duplicate or ensured > 0):
         try:
             _dispatch_task("process_tiktok_webhook_events", tenant_id=tenant_id)
         except AppError as exc:
-            # 事件和刷新队列已提交，Celery 暂时不可用时由后续补偿/重试处理。
+            # 事件与刷新队列已提交；Celery 暂时不可用时由调度进程扫描后再唤醒。
             logger.warning("TikTok Webhook 入队失败：tenant=%s code=%s", tenant_id, exc.code.value)
-    return Response(status_code=200)
+    return _tiktok_receipt(
+        status=200,
+        received=True,
+        duplicate=duplicate,
+        event_id=str(event_id),
+        external_event_id=notification_id,
+    )
+
+
+def _tiktok_receipt(
+    *,
+    status: int,
+    received: bool,
+    duplicate: bool = False,
+    mapping_missing: bool = False,
+    event_id: str | None = None,
+    external_event_id: str = "",
+    reason: str = "",
+) -> JSONResponse:
+    """统一严格回执（状态码 + JSON），由 service.tiktok_webhook_receipt 生成，便于测试。"""
+    status_code, payload = service.tiktok_webhook_receipt(
+        received=received,
+        duplicate=duplicate,
+        mapping_missing=mapping_missing,
+        event_id=event_id,
+        external_event_id=external_event_id,
+        reason=reason,
+    )
+    # 解析/鉴权失败需要保留 4xx 状态码，其余由回执语义决定
+    if status in (400, 401, 413):
+        payload = dict(payload)
+        payload.update({"received": False, "duplicate": False, "mapping_missing": False})
+        payload["reason"] = reason or payload.get("reason") or "invalid_request"
+        payload["status"] = "rejected"
+        return JSONResponse(status_code=status, content=payload)
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 def _tiktok_webhook_store(

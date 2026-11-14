@@ -66,6 +66,8 @@ from app.modules.channels.models_tenant import (
     ChannelListingLink,
     Store,
     StoreCredential,
+    TiktokOrderRefreshQueue,
+    TiktokWebhookSubscription,
 )
 from app.modules.channels.shopee import oauth
 from app.modules.channels.shopee.client import (
@@ -174,6 +176,8 @@ class StoreSummary:
     credential_status: str | None
     access_token_expires_at: datetime | None
     refresh_token_expires_at: datetime | None
+    webhook_enabled: bool = False
+    webhook_last_event_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -729,6 +733,8 @@ def list_store_summaries(
             refresh_token_expires_at=(
                 credentials[store.id].refresh_token_expires_at if store.id in credentials else None
             ),
+            webhook_enabled=bool(store.webhook_enabled),
+            webhook_last_event_at=store.webhook_last_event_at,
         )
         for store in stores
     ]
@@ -2960,6 +2966,270 @@ def merge_compensation_meta(
         meta["last_result"] = last_result
     base[WEBHOOK_COMPENSATION_META_KEY] = meta
     return base
+
+
+# --------------------------------------------------------------------------- TikTok Webhook
+TIKTOK_WEBHOOK_EVENT_TYPES = (
+    "ORDER_STATUS_CHANGE",
+    "RECIPIENT_ADDRESS_UPDATE",
+    "PACKAGE_UPDATE",
+    "CANCELLATION_STATUS_CHANGE",
+    "RETURN_STATUS_CHANGE",
+    "SELLER_DEAUTHORIZATION",
+    "UPCOMING_AUTHORIZATION_EXPIRATION",
+)
+
+
+def find_tiktok_store_by_shop(db: Session, tenant_id: int, platform_shop_id: str) -> Store | None:
+    shop_id = normalize_external_id(platform_shop_id)
+    if not shop_id:
+        return None
+    return db.execute(
+        select(Store).where(
+            Store.tenant_id == tenant_id,
+            Store.channel == CHANNEL_TIKTOK,
+            Store.external_store_id == shop_id,
+        )
+    ).scalar_one_or_none()
+
+
+def enqueue_tiktok_order_refresh(
+    db: Session, tenant_id: int, store_id: int, external_order_no: str, *, reason: str = "webhook"
+) -> bool:
+    """同一订单只保留一行，连续事件只增加 generation。"""
+    order_no = str(external_order_no or "").strip()[:64]
+    if not order_no:
+        return False
+    row = db.execute(
+        select(TiktokOrderRefreshQueue).where(
+            TiktokOrderRefreshQueue.tenant_id == tenant_id,
+            TiktokOrderRefreshQueue.store_id == store_id,
+            TiktokOrderRefreshQueue.external_order_no == order_no,
+        )
+    ).scalar_one_or_none()
+    now = utc_now()
+    if row is None:
+        db.add(
+            TiktokOrderRefreshQueue(
+                tenant_id=tenant_id,
+                store_id=store_id,
+                external_order_no=order_no,
+                generation=1,
+                processed_generation=0,
+                status="pending",
+                attempts=0,
+                next_attempt_at=now,
+                last_error=reason[:1000],
+            )
+        )
+    else:
+        row.generation = int(row.generation or 0) + 1
+        row.status = "pending"
+        row.next_attempt_at = now
+        row.last_error = reason[:1000]
+    db.flush()
+    return True
+
+
+def record_tiktok_webhook_event(
+    db: Session,
+    tenant_id: int,
+    *,
+    store: Store,
+    notification_id: str,
+    event_type: str,
+    payload: dict[str, Any],
+    order_ids: Sequence[str],
+) -> tuple[int, bool]:
+    """Persist the relayed event and enqueue authoritative order refreshes."""
+    from app.modules.tasks.service import record_webhook_event as tasks_record
+    from app.modules.tasks.service import mark_webhook_event
+
+    event_id, duplicate = tasks_record(
+        db,
+        tenant_id=tenant_id,
+        channel=CHANNEL_TIKTOK,
+        store_id=int(store.id),
+        event_type=event_type,
+        external_event_id=notification_id,
+        signature_ok=True,
+        payload=payload,
+    )
+    if not duplicate:
+        store.webhook_last_event_at = utc_now()
+        store.webhook_enabled = True
+        for order_id in order_ids:
+            enqueue_tiktok_order_refresh(db, tenant_id, int(store.id), order_id, reason=event_type)
+        mark_webhook_event(db, tenant_id=tenant_id, event_id=event_id, status="processed")
+        db.flush()
+    return event_id, duplicate
+
+
+def handle_tiktok_deauthorization(db: Session, tenant_id: int, store: Store) -> None:
+    """授权被平台撤销：停止继续调用 seller-scoped API。"""
+    store.status = STORE_STATUS_DISCONNECTED
+    store.disconnected_at = utc_now()
+    store.webhook_enabled = False
+    credential = repo.get_credential(db, tenant_id, int(store.id))
+    if credential is not None:
+        credential.status = CREDENTIAL_STATUS_REVOKED
+        credential.last_error = "TikTok seller deauthorization webhook"
+    db.execute(
+        update(TiktokWebhookSubscription)
+        .where(
+            TiktokWebhookSubscription.tenant_id == tenant_id,
+            TiktokWebhookSubscription.store_id == int(store.id),
+        )
+        .values(status="disabled", last_error="seller deauthorization")
+    )
+    db.flush()
+
+
+def tiktok_webhook_callback_url() -> str:
+    configured = str(getattr(settings, "gateway_webhook_callback_url", "") or "").strip()
+    if configured:
+        return configured
+    base = str(getattr(settings, "gateway_base_url", "") or "").strip().rstrip("/")
+    if base:
+        return f"{base}/api/v1/gateway/webhooks/tiktok"
+    return ""
+
+
+def register_gateway_webhook_shop(store: Store) -> None:
+    """Tell gateway that this platform shop belongs to the current instance."""
+    gateway_base = str(getattr(settings, "gateway_base_url", "") or "").strip().rstrip("/")
+    token = str(getattr(settings, "gateway_instance_token", "") or "").strip()
+    if not gateway_base or not token:
+        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "未配置 Gateway，无法注册 Webhook 店铺")
+    import httpx
+
+    response = httpx.post(
+        f"{gateway_base}/api/v1/gateway/instance/webhook-shops",
+        headers={"x-gateway-instance-token": token},
+        json={"store_id": int(store.id), "platform_shop_id": store.external_store_id},
+        timeout=float(getattr(settings, "gateway_timeout_seconds", 5.0)),
+    )
+    if response.status_code >= 400:
+        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, f"Gateway 店铺注册失败：HTTP {response.status_code}")
+
+
+def unregister_gateway_webhook_shop(store: Store) -> None:
+    gateway_base = str(getattr(settings, "gateway_base_url", "") or "").strip().rstrip("/")
+    token = str(getattr(settings, "gateway_instance_token", "") or "").strip()
+    if not gateway_base or not token:
+        return
+    import httpx
+
+    httpx.delete(
+        f"{gateway_base}/api/v1/gateway/instance/webhook-shops/{store.external_store_id}",
+        headers={"x-gateway-instance-token": token},
+        timeout=float(getattr(settings, "gateway_timeout_seconds", 5.0)),
+    )
+
+
+def enable_tiktok_webhook(center: Session, db: Session, tenant_id: int, store: Store) -> dict[str, Any]:
+    if store.channel != CHANNEL_TIKTOK or store.status != STORE_STATUS_CONNECTED:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "店铺不是已连接的 TikTok 店铺")
+    callback_url = tiktok_webhook_callback_url()
+    if not callback_url:
+        raise AppError(ErrorCode.SERVICE_UNAVAILABLE, "未配置 TikTok Webhook 回调地址")
+    register_gateway_webhook_shop(store)
+    client = build_tiktok_client(center, db, tenant_id, store)
+    errors: dict[str, str] = {}
+    for event_type in TIKTOK_WEBHOOK_EVENT_TYPES:
+        try:
+            client.update_shop_webhook(event_type=event_type, address=callback_url)
+        except Exception as exc:  # noqa: BLE001 - per-topic failure is reported, not rolled back
+            errors[event_type] = str(exc)[:500]
+    observed = _tiktok_observed_webhooks(client)
+    now = utc_now()
+    for event_type in TIKTOK_WEBHOOK_EVENT_TYPES:
+        row = db.execute(
+            select(TiktokWebhookSubscription).where(
+                TiktokWebhookSubscription.tenant_id == tenant_id,
+                TiktokWebhookSubscription.store_id == int(store.id),
+                TiktokWebhookSubscription.event_type == event_type,
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            row = TiktokWebhookSubscription(
+                tenant_id=tenant_id,
+                store_id=int(store.id),
+                event_type=event_type,
+                callback_url=callback_url,
+            )
+            db.add(row)
+        row.callback_url = callback_url
+        row.status = "error" if event_type in errors or observed.get(event_type) != callback_url else "enabled"
+        row.last_checked_at = now
+        row.last_error = errors.get(event_type) or (
+            "" if observed.get(event_type) == callback_url else "平台实际订阅地址不一致"
+        )
+    store.webhook_enabled = not errors
+    db.flush()
+    return {
+        "callback_url": callback_url,
+        "enabled": not errors,
+        "errors": errors,
+        "observed": observed,
+    }
+
+
+def _tiktok_observed_webhooks(client: TikTokClient) -> dict[str, str]:
+    try:
+        payload = client.get_shop_webhooks()
+    except Exception:  # noqa: BLE001
+        return {}
+    data = payload.get("data") if isinstance(payload, Mapping) else None
+    rows = data.get("webhooks") if isinstance(data, Mapping) else None
+    if not isinstance(rows, Sequence):
+        return {}
+    result: dict[str, str] = {}
+    for row in rows:
+        if isinstance(row, Mapping):
+            event_type = str(row.get("event_type") or "").strip()
+            address = str(row.get("address") or "").strip()
+            if event_type and address:
+                result[event_type] = address
+    return result
+
+
+def disable_tiktok_webhook(center: Session, db: Session, tenant_id: int, store: Store) -> dict[str, Any]:
+    client = build_tiktok_client(center, db, tenant_id, store)
+    errors: dict[str, str] = {}
+    for event_type in TIKTOK_WEBHOOK_EVENT_TYPES:
+        try:
+            client.delete_shop_webhook(event_type=event_type)
+        except Exception as exc:  # noqa: BLE001
+            errors[event_type] = str(exc)[:500]
+    db.execute(
+        update(TiktokWebhookSubscription)
+        .where(
+            TiktokWebhookSubscription.tenant_id == tenant_id,
+            TiktokWebhookSubscription.store_id == int(store.id),
+        )
+        .values(status="disabled", last_error="")
+    )
+    store.webhook_enabled = False
+    try:
+        unregister_gateway_webhook_shop(store)
+    except Exception:  # noqa: BLE001 - platform unsubscribe is authoritative
+        pass
+    db.flush()
+    return {"enabled": False, "errors": errors}
+
+
+def list_tiktok_webhook_subscriptions(db: Session, tenant_id: int, store_id: int) -> list[TiktokWebhookSubscription]:
+    return list(
+        db.execute(
+            select(TiktokWebhookSubscription)
+            .where(
+                TiktokWebhookSubscription.tenant_id == tenant_id,
+                TiktokWebhookSubscription.store_id == store_id,
+            )
+            .order_by(TiktokWebhookSubscription.event_type.asc())
+        ).scalars()
+    )
 
 
 def record_webhook_event(

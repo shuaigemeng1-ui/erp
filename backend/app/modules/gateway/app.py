@@ -14,15 +14,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.request import Request as UrlRequest, urlopen
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
 from app.modules.gateway.config import GatewayConfig
@@ -36,6 +39,14 @@ from app.modules.gateway.security import (
     oauth_state_hash,
 )
 from app.modules.gateway.store import GatewayStore, epoch_now, utc_now
+from app.modules.gateway.webhook import (
+    WEBHOOK_PATH,
+    WebhookPayloadError,
+    parse_notification,
+    relay_signature,
+    tenant_relay_url,
+    verify_tiktok_signature,
+)
 
 INSTANCE_TOKEN_HEADER = "x-gateway-instance-token"
 ADMIN_TOKEN_HEADER = "x-gateway-token"
@@ -126,6 +137,11 @@ class DeliveryIn(BaseModel):
 
 class DeliveryRetryIn(BaseModel):
     error: str = Field(default="", max_length=500)
+
+
+class WebhookShopIn(BaseModel):
+    store_id: int = Field(gt=0)
+    platform_shop_id: str = Field(min_length=1, max_length=64)
 
 
 class MigrationSwitchIn(BaseModel):
@@ -298,6 +314,213 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
             require_admin(request)
             return {"mode": "legacy_admin"}
         raise _error(401, "gateway_token_required", "缺少实例令牌或管理令牌")
+
+    # ------------------------------------------------------------------ Webhook 分发
+    def _deliver_webhook_event(event: Mapping[str, Any]) -> None:
+        """Best-effort delivery from durable Gateway inbox to the tenant relay."""
+        event_id = int(event["id"])
+        attempts = int(event.get("attempts") or 0) + 1
+        max_attempts = int(cfg.webhook_max_attempts or 10)
+        if not cfg.webhook_relay_secret:
+            store.mark_webhook_event(
+                event_id,
+                status="pending",
+                attempts=attempts,
+                next_attempt_at=epoch_now() + 60,
+                last_error="GATEWAY_WEBHOOK_RELAY_SECRET is not configured",
+            )
+            return
+        instance = store.get_instance(int(event["instance_id"])) if event.get("instance_id") else None
+        if instance is None:
+            store.mark_webhook_event(event_id, status="dead", attempts=attempts, last_error="instance not found")
+            return
+        relay_url = tenant_relay_url(str(instance.get("callback_url") or ""))
+        if not relay_url:
+            store.mark_webhook_event(event_id, status="dead", attempts=attempts, last_error="tenant relay url missing")
+            return
+        try:
+            raw_body = decrypt_secret(cfg, str(event.get("payload_cipher") or "")).encode("utf-8")
+        except Exception:
+            store.mark_webhook_event(event_id, status="dead", attempts=attempts, last_error="payload decrypt failed")
+            return
+        timestamp = str(epoch_now())
+        signature = relay_signature(
+            relay_secret=cfg.webhook_relay_secret,
+            timestamp=timestamp,
+            raw_body=raw_body,
+        )
+        request = UrlRequest(
+            relay_url,
+            data=raw_body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Gateway-Instance-Id": str(instance.get("id") or ""),
+                "X-Gateway-Tenant-Id": str(instance.get("tenant_id") or ""),
+                "X-Gateway-Event-Id": str(event.get("notification_id") or event_id),
+                "X-Gateway-Timestamp": timestamp,
+                "X-Gateway-Signature": signature,
+            },
+        )
+        try:
+            with urlopen(request, timeout=10) as response:
+                status_code = int(response.status)
+                response.read(2048)
+        except Exception as exc:  # network/timeout/TLS
+            status_code = 0
+            last_error = str(exc)[:500]
+        else:
+            last_error = ""
+        if 200 <= status_code < 300 or status_code == 409:
+            store.mark_webhook_event(event_id, status="delivered", attempts=attempts)
+            return
+        if 400 <= status_code < 500 and status_code not in {408, 429}:
+            store.mark_webhook_event(
+                event_id, status="dead", attempts=attempts, last_error=last_error or f"tenant returned {status_code}"
+            )
+            return
+        if attempts >= max_attempts:
+            store.mark_webhook_event(
+                event_id, status="dead", attempts=attempts, last_error=last_error or f"tenant returned {status_code}"
+            )
+            return
+        store.mark_webhook_event(
+            event_id,
+            status="pending",
+            attempts=attempts,
+            next_attempt_at=epoch_now() + min(3600, 5 * (2 ** min(attempts, 8))),
+            last_error=last_error or f"tenant returned {status_code}",
+        )
+
+    async def _webhook_dispatcher_loop() -> None:
+        interval = max(1, int(cfg.webhook_dispatch_interval_seconds or 2))
+        while True:
+            try:
+                if cfg.webhook_dispatch_enabled:
+                    pending = await asyncio.to_thread(store.list_pending_webhook_events, limit=20)
+                    for event in pending:
+                        await asyncio.to_thread(_deliver_webhook_event, event)
+            except Exception:  # noqa: BLE001 - dispatcher must survive one bad row
+                pass
+            await asyncio.sleep(interval)
+
+    @application.on_event("startup")
+    async def _start_webhook_dispatcher() -> None:
+        if not cfg.webhook_dispatch_enabled:
+            return
+        task = asyncio.create_task(_webhook_dispatcher_loop())
+        application.state.webhook_dispatcher_task = task
+
+    @application.on_event("shutdown")
+    async def _stop_webhook_dispatcher() -> None:
+        task = getattr(application.state, "webhook_dispatcher_task", None)
+        if task is not None:
+            task.cancel()
+
+    @application.post(WEBHOOK_PATH)
+    async def receive_tiktok_webhook(request: Request) -> Response:
+        """Public TikTok callback: verify raw body, persist, ACK, then dispatch."""
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > int(cfg.webhook_max_body_bytes):
+                    return Response(status_code=413)
+            except ValueError:
+                return Response(status_code=400)
+        raw_body = await request.body()
+        if len(raw_body) > int(cfg.webhook_max_body_bytes):
+            return Response(status_code=413)
+        channel_app = store.get_channel_app("tiktok", "production")
+        if channel_app is None or not channel_app.get("app_key") or not channel_app.get("secret_cipher"):
+            return Response(status_code=503)
+        signature = (request.headers.get("authorization") or request.headers.get("x-tiktok-signature") or "").strip()
+        if signature.lower().startswith("bearer "):
+            signature = signature[7:].strip()
+        app_secret = decrypt_secret(cfg, str(channel_app.get("secret_cipher") or ""))
+        if not verify_tiktok_signature(
+            app_key=str(channel_app.get("app_key") or ""),
+            app_secret=app_secret,
+            raw_body=raw_body,
+            received_signature=signature,
+        ):
+            return Response(status_code=401)
+        try:
+            notification = parse_notification(raw_body)
+        except WebhookPayloadError:
+            return Response(status_code=400)
+        shop = store.get_webhook_shop("tiktok", notification.platform_shop_id)
+        try:
+            payload_cipher = encrypt_secret(
+                cfg,
+                json.dumps(notification.payload, ensure_ascii=False, separators=(",", ":")),
+            )
+            payload_sha256 = hashlib.sha256(raw_body).hexdigest()
+            store.create_webhook_event(
+                channel="tiktok",
+                notification_id=notification.notification_id,
+                event_type_code=notification.event_type_code,
+                event_type_name=notification.event_type_name,
+                platform_shop_id=notification.platform_shop_id,
+                instance_id=int(shop["instance_id"]) if shop else None,
+                tenant_id=int(shop["tenant_id"]) if shop else None,
+                store_id=int(shop["store_id"]) if shop else None,
+                payload_cipher=payload_cipher,
+                payload_sha256=payload_sha256,
+                status="pending" if shop else "unroutable",
+                next_attempt_at=0 if shop else 0,
+            )
+        except Exception:  # noqa: BLE001 - persistence failure must trigger platform retry
+            return Response(status_code=503)
+        if not shop:
+            store.audit(
+                action="webhook.unroutable",
+                actor="tiktok",
+                summary=f"未知 TikTok 店铺 {notification.platform_shop_id}",
+                payload={"notification_id": notification.notification_id},
+            )
+        return Response(status_code=200)
+
+    @application.post("/api/v1/gateway/instance/webhook-shops")
+    def register_webhook_shop(body: WebhookShopIn, request: Request) -> dict[str, Any]:
+        instance = require_instance(request)
+        limit_instance(instance, request)
+        if "tiktok" not in (instance.get("channels") or []):
+            raise _error(403, "gateway_instance_channel_denied", "实例无权访问 TikTok 渠道")
+        store_check(instance, int(body.store_id))
+        existing = store.get_webhook_shop("tiktok", body.platform_shop_id)
+        if existing is not None and int(existing["instance_id"]) != int(instance["id"]):
+            raise _error(409, "gateway_webhook_shop_conflict", "该平台店铺已绑定其他实例")
+        row = store.upsert_webhook_shop(
+            channel="tiktok",
+            platform_shop_id=body.platform_shop_id,
+            instance_id=int(instance["id"]),
+            tenant_id=int(instance["tenant_id"]),
+            store_id=int(body.store_id),
+        )
+        store.audit(
+            action="webhook.shop.register",
+            actor="instance",
+            instance_id=int(instance["id"]),
+            summary=f"注册 TikTok Webhook 店铺 {body.platform_shop_id}",
+            payload={"store_id": body.store_id},
+        )
+        return {"shop": row}
+
+    @application.delete("/api/v1/gateway/instance/webhook-shops/{platform_shop_id}")
+    def unregister_webhook_shop(platform_shop_id: str, request: Request) -> dict[str, Any]:
+        instance = require_instance(request)
+        limit_instance(instance, request)
+        existing = store.get_webhook_shop("tiktok", platform_shop_id)
+        if existing is not None and int(existing["instance_id"]) != int(instance["id"]):
+            raise _error(404, "gateway_webhook_shop_not_found", "店铺映射不存在")
+        store.deactivate_webhook_shop("tiktok", platform_shop_id)
+        store.audit(
+            action="webhook.shop.unregister",
+            actor="instance",
+            instance_id=int(instance["id"]),
+            summary=f"停用 TikTok Webhook 店铺 {platform_shop_id}",
+        )
+        return {"deactivated": True}
 
     # ------------------------------------------------------------------ 健康检查
     def health_payload() -> dict[str, Any]:

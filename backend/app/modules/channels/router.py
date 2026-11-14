@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, Path, Query, Request
@@ -42,6 +43,7 @@ from app.core.context import TenantContext
 from app.core.errors import AppError, ErrorCode
 from app.core.http import accepted, paged, success
 from app.core.permissions import Permission
+from app.core.config import settings
 from app.db.session import center_session, tenant_session
 from app.modules.access.service import AccessSnapshot
 from app.modules.channels import schemas, service
@@ -57,6 +59,7 @@ from app.modules.channels.models_tenant import ChannelListing
 from app.modules.channels.shopee import oauth
 from app.modules.channels.shopee.oauth import callback_error_redirect, exchange_authorization_code
 from app.modules.channels.tiktok import oauth as tiktok_oauth
+from app.modules.channels.tiktok import webhook as tiktok_webhook
 
 logger = logging.getLogger("ventasync.channels.router")
 
@@ -530,6 +533,163 @@ def _handle_webhook(raw_body: bytes, signature: str, request_url: str) -> dict[s
             "tenant_active": tenant_status == "active",
         }
     )
+
+# --------------------------------------------------------------------------- TikTok Webhook
+@tiktok_integration_router.post("/webhook/relay")
+async def tiktok_webhook_relay(request: Request) -> Response:
+    """接受 Gateway 已完成 TikTok 验签的事件；只做入队，不阻塞 ACK。"""
+    raw_body = await request.body()
+    if len(raw_body) > 1024 * 1024:
+        return Response(status_code=413)
+    timestamp = (request.headers.get("x-gateway-timestamp") or "").strip()
+    try:
+        timestamp_value = int(timestamp)
+    except ValueError:
+        return Response(status_code=401)
+    if abs(int(time.time()) - timestamp_value) > 300:
+        return Response(status_code=401)
+    received_signature = (request.headers.get("x-gateway-signature") or "").strip()
+    if not tiktok_webhook.verify_relay_signature(
+        relay_secret=str(getattr(settings, "gateway_webhook_relay_secret", "") or ""),
+        timestamp=timestamp,
+        raw_body=raw_body,
+        received_signature=received_signature,
+    ):
+        return Response(status_code=401)
+    try:
+        tenant_id = int((request.headers.get("x-gateway-tenant-id") or "").strip())
+        notification_id, type_code, event_type, shop_id, payload = tiktok_webhook.parse_event(raw_body)
+    except (TypeError, ValueError):
+        return Response(status_code=400)
+    with center_session() as center:
+        route = _load_tenant_route(center, tenant_id)
+        tenant_status = service.load_tenant_status(center, tenant_id)
+    if route is None:
+        return Response(status_code=503)
+    order_ids: list[str] = []
+    with tenant_session(route) as db:
+        store = service.find_tiktok_store_by_shop(db, tenant_id, shop_id)
+        if store is None:
+            logger.warning("TikTok Webhook 未知店铺：tenant=%s shop=%s", tenant_id, shop_id)
+            return Response(status_code=200)
+        sanitized = tiktok_webhook.sanitized_payload(
+            notification_id=notification_id,
+            type_code=type_code,
+            type_name=event_type,
+            shop_id=shop_id,
+            payload=payload,
+        )
+        order_ids = list(sanitized.get("order_ids") or [])
+        event_id, duplicate = service.record_tiktok_webhook_event(
+            db,
+            tenant_id,
+            store=store,
+            notification_id=notification_id,
+            event_type=event_type,
+            payload=sanitized,
+            order_ids=order_ids,
+        )
+        if event_type == "SELLER_DEAUTHORIZATION":
+            service.handle_tiktok_deauthorization(db, tenant_id, store)
+        db.commit()
+    if tenant_status == "active" and order_ids and not duplicate:
+        try:
+            _dispatch_task("process_tiktok_webhook_events", tenant_id=tenant_id)
+        except AppError as exc:
+            # 事件和刷新队列已提交，Celery 暂时不可用时由后续补偿/重试处理。
+            logger.warning("TikTok Webhook 入队失败：tenant=%s code=%s", tenant_id, exc.code.value)
+    return Response(status_code=200)
+
+
+def _tiktok_webhook_store(
+    db: Session, center: Session, tenant_id: int, store_id: int, snapshot: AccessSnapshot
+) -> Any:
+    allowed = service.allowed_store_ids(snapshot.effective, Permission.STORE_CONNECT.value)
+    if not service.store_in_scope(store_id, allowed):
+        raise AppError(ErrorCode.NOT_FOUND, "店铺不存在或不可见")
+    store = service.get_store_or_raise(db, tenant_id, store_id)
+    if store.channel != CHANNEL_TIKTOK:
+        raise AppError(ErrorCode.VALIDATION_ERROR, "该店铺不是 TikTok Shop 渠道")
+    return store
+
+
+@router.post("/tenants/{tenant_id}/stores/{store_id}/webhook/enable", summary="启用 TikTok Webhook")
+def enable_tiktok_webhook(
+    tenant_id: int = Path(ge=1),
+    store_id: int = Path(ge=1),
+    ctx: TenantContext = Depends(tenant_context),
+    db: Session = Depends(get_tenant_db),
+    center: Session = Depends(get_center_db),
+    snapshot: AccessSnapshot = Depends(require_permission(Permission.STORE_CONNECT.value)),
+) -> dict[str, Any]:
+    store = _tiktok_webhook_store(db, center, ctx.tenant_id, store_id, snapshot)
+    result = service.enable_tiktok_webhook(center, db, ctx.tenant_id, store)
+    db.commit()
+    return success(result)
+
+
+@router.post("/tenants/{tenant_id}/stores/{store_id}/webhook/disable", summary="停用 TikTok Webhook")
+def disable_tiktok_webhook(
+    tenant_id: int = Path(ge=1),
+    store_id: int = Path(ge=1),
+    ctx: TenantContext = Depends(tenant_context),
+    db: Session = Depends(get_tenant_db),
+    center: Session = Depends(get_center_db),
+    snapshot: AccessSnapshot = Depends(require_permission(Permission.STORE_CONNECT.value)),
+) -> dict[str, Any]:
+    store = _tiktok_webhook_store(db, center, ctx.tenant_id, store_id, snapshot)
+    result = service.disable_tiktok_webhook(center, db, ctx.tenant_id, store)
+    db.commit()
+    return success(result)
+
+
+@router.get("/tenants/{tenant_id}/stores/{store_id}/webhook/status", summary="TikTok Webhook 状态")
+def tiktok_webhook_status(
+    tenant_id: int = Path(ge=1),
+    store_id: int = Path(ge=1),
+    ctx: TenantContext = Depends(tenant_context),
+    db: Session = Depends(get_tenant_db),
+    snapshot: AccessSnapshot = Depends(require_permission(Permission.STORE_READ.value)),
+) -> dict[str, Any]:
+    store = service.get_store_or_raise(db, ctx.tenant_id, store_id)
+    allowed = service.allowed_store_ids(snapshot.effective, Permission.STORE_READ.value)
+    if not service.store_in_scope(store_id, allowed):
+        raise AppError(ErrorCode.NOT_FOUND, "店铺不存在或不可见")
+    rows = service.list_tiktok_webhook_subscriptions(db, ctx.tenant_id, store_id)
+    return success(
+        {
+            "store_id": str(store_id),
+            "enabled": bool(store.webhook_enabled),
+            "last_event_at": store.webhook_last_event_at,
+            "callback_url": service.tiktok_webhook_callback_url(),
+            "subscriptions": [
+                {
+                    "event_type": row.event_type,
+                    "status": row.status,
+                    "callback_url": row.callback_url,
+                    "last_checked_at": row.last_checked_at,
+                    "last_error": row.last_error,
+                }
+                for row in rows
+            ],
+        }
+    )
+
+
+@router.post("/tenants/{tenant_id}/stores/{store_id}/webhook/reconcile", summary="重检 TikTok Webhook 订阅")
+def reconcile_tiktok_webhook(
+    tenant_id: int = Path(ge=1),
+    store_id: int = Path(ge=1),
+    ctx: TenantContext = Depends(tenant_context),
+    db: Session = Depends(get_tenant_db),
+    center: Session = Depends(get_center_db),
+    snapshot: AccessSnapshot = Depends(require_permission(Permission.STORE_CONNECT.value)),
+) -> dict[str, Any]:
+    store = _tiktok_webhook_store(db, center, ctx.tenant_id, store_id, snapshot)
+    result = service.enable_tiktok_webhook(center, db, ctx.tenant_id, store)
+    db.commit()
+    return success(result)
+
 
 # --------------------------------------------------------------------------- TikTok Shop
 @router.post("/tenants/{tenant_id}/stores/{store_id}/tiktok/authorize")

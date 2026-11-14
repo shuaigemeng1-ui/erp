@@ -72,6 +72,11 @@ class GatewayConfig:
     sqlite_busy_timeout_ms: int = 5000
     # 状态/锁清理：过期记录可在健康检查时顺手清理
     purge_expired_on_health: bool = True
+    webhook_relay_secret: str = ""
+    webhook_dispatch_enabled: bool = True
+    webhook_max_body_bytes: int = 1024 * 1024
+    webhook_dispatch_interval_seconds: int = 2
+    webhook_max_attempts: int = 10
     extra: dict = field(default_factory=dict)
 
     @classmethod
@@ -102,6 +107,13 @@ class GatewayConfig:
             verify_window_seconds=_env_int("GATEWAY_VERIFY_WINDOW_SECONDS", 600, 30),
             sqlite_busy_timeout_ms=_env_int("GATEWAY_SQLITE_BUSY_TIMEOUT_MS", 5000, 100),
             purge_expired_on_health=_env_bool("GATEWAY_PURGE_EXPIRED_ON_HEALTH", True),
+            webhook_relay_secret=os.environ.get("GATEWAY_WEBHOOK_RELAY_SECRET", "").strip(),
+            webhook_dispatch_enabled=_env_bool("GATEWAY_WEBHOOK_DISPATCH_ENABLED", True),
+            webhook_max_body_bytes=_env_int("GATEWAY_WEBHOOK_MAX_BODY_BYTES", 1024 * 1024, 1024),
+            webhook_dispatch_interval_seconds=_env_int(
+                "GATEWAY_WEBHOOK_DISPATCH_INTERVAL_SECONDS", 2, 1
+            ),
+            webhook_max_attempts=_env_int("GATEWAY_WEBHOOK_MAX_ATTEMPTS", 10, 1),
         )
 
     def validate(self) -> None:

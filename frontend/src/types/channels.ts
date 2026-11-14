@@ -29,6 +29,8 @@ export interface Store {
   credential?: StoreCredential | null
   credential_status?: string | null
   access_token_expires_at?: string | null
+  webhook_enabled?: boolean
+  webhook_last_event_at?: string | null
 }
 
 export type MappingStatus = 'mapped' | 'pending' | 'ambiguous' | 'missing' | string

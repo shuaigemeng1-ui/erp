@@ -49,7 +49,7 @@ from app.core.security import utc_now
 from app.db.session import center_session, tenant_session
 from app.modules.channels import repository as repo
 from app.modules.channels import service
-from app.modules.channels.constants import CHANNEL_SHOPEE, STORE_STATUS_CONNECTED
+from app.modules.channels.constants import CHANNEL_SHOPEE, CHANNEL_TIKTOK, STORE_STATUS_CONNECTED
 from app.modules.channels.shopee.client import ShopeeApiError
 from app.workers.celery_app import celery_app
 
@@ -594,3 +594,96 @@ __all__ = [
     "sync_store_listings",
     "tenant_owner_user_id",
 ]
+
+
+# --------------------------------------------------------------------------- TikTok Webhook order refresh
+@celery_app.task(
+    name="app.modules.channels.tasks.process_tiktok_webhook_events",
+    max_retries=0,
+)
+def process_tiktok_webhook_events(tenant_id: int, limit: int = 20) -> dict[str, Any]:
+    """Consume webhook refresh queue and re-query authoritative order details."""
+    from datetime import datetime, timezone, timedelta
+    from app.modules.channels.models_tenant import TiktokOrderRefreshQueue
+    from app.modules.sales.service import ingest_platform_orders
+
+    result: dict[str, Any] = {"tenant_id": int(tenant_id), "scanned": 0, "processed": 0, "failed": 0}
+    with job_tenant_context(int(tenant_id)) as (context, db):
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        rows = list(
+            db.execute(
+                select(TiktokOrderRefreshQueue)
+                .where(
+                    TiktokOrderRefreshQueue.tenant_id == context.tenant_id,
+                    TiktokOrderRefreshQueue.status.in_(("pending", "retry_wait")),
+                    (TiktokOrderRefreshQueue.next_attempt_at.is_(None))
+                    | (TiktokOrderRefreshQueue.next_attempt_at <= now + timedelta(seconds=60)),
+                )
+                .order_by(TiktokOrderRefreshQueue.id.asc())
+                .limit(max(1, min(int(limit), 50)))
+                .with_for_update(skip_locked=True)
+            ).scalars()
+        )
+        result["scanned"] = len(rows)
+        if not rows:
+            return result
+        claims = []
+        for row in rows:
+            row.status = "processing"
+            row.lease_owner = "tiktok-webhook"
+            row.lease_expires_at = now + timedelta(minutes=2)
+            row.attempts = int(row.attempts or 0) + 1
+            claims.append((int(row.id), int(row.store_id), str(row.external_order_no)))
+        db.commit()
+
+    for queue_id, store_id, order_no in claims:
+        try:
+            with job_tenant_context(int(tenant_id)) as (context, db):
+                store = service.get_store_or_raise(db, context.tenant_id, store_id)
+                with center_session() as center:
+                    client = service.build_tiktok_client(center, db, context.tenant_id, store)
+                payload = client.get_order_details([order_no])
+                data = payload.get("data") if isinstance(payload, dict) else None
+                orders = data.get("orders") if isinstance(data, dict) else None
+                if not isinstance(orders, list) or not orders:
+                    raise AppError(ErrorCode.ORDER_NOT_FOUND, "TikTok order detail is empty")
+                summary = ingest_platform_orders(
+                    db,
+                    tenant_id=context.tenant_id,
+                    store_id=store_id,
+                    channel=CHANNEL_TIKTOK,
+                    payloads=[item for item in orders if isinstance(item, dict)],
+                    triggered_by="webhook",
+                )
+                row = db.get(TiktokOrderRefreshQueue, queue_id)
+                if row is not None:
+                    row.status = "idle"
+                    row.processed_generation = int(row.generation or 0)
+                    row.lease_owner = None
+                    row.lease_expires_at = None
+                    row.last_error = None
+                db.commit()
+                result["processed"] += 1
+                result["last_summary"] = summary
+        except Exception as exc:  # noqa: BLE001 - one order must not block others
+            logger.warning("TikTok webhook order refresh failed: tenant=%s order=%s error=%s", tenant_id, order_no, exc)
+            try:
+                with job_tenant_context(int(tenant_id)) as (context, db):
+                    row = db.get(TiktokOrderRefreshQueue, queue_id)
+                    if row is not None:
+                        attempts = int(row.attempts or 0)
+                        row.last_error = str(exc)[:1000]
+                        row.lease_owner = None
+                        row.lease_expires_at = None
+                        if attempts >= 5:
+                            row.status = "dead"
+                        else:
+                            row.status = "retry_wait"
+                            row.next_attempt_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+                                seconds=min(1800, 15 * (2 ** attempts))
+                            )
+                    db.commit()
+            except Exception:  # noqa: BLE001
+                logger.exception("TikTok webhook refresh failure state write failed")
+            result["failed"] += 1
+    return result

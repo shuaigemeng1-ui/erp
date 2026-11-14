@@ -19,6 +19,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     DateTime,
     Index,
     Integer,
@@ -125,6 +126,16 @@ class Store(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
     warehouse_id: Mapped[str | None] = mapped_column(
         String(64), nullable=True, comment="TikTok Shop 仓库ID（库存推送使用；Shopee 为空）"
     )
+    webhook_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("0"),
+        comment="是否启用平台 Webhook",
+    )
+    webhook_last_event_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, comment="最近一次 Webhook 事件时间（UTC）"
+    )
 
 
 class StoreCredential(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
@@ -181,6 +192,56 @@ class StoreCredential(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
     last_error: Mapped[str | None] = mapped_column(
         String(500), nullable=True, comment="最近一次刷新错误摘要（不含凭据）"
     )
+
+
+class TiktokWebhookSubscription(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
+    """TikTok Shop Webhook 订阅状态（按店铺 + 事件类型）。"""
+
+    __tablename__ = "tiktok_webhook_subscriptions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "store_id", "event_type",
+            name="uq_tiktok_webhook_subscriptions_scope",
+        ),
+        Index("ix_tiktok_webhook_subscriptions_tenant_store", "tenant_id", "store_id"),
+        table_options("TikTok Webhook 订阅表"),
+    )
+
+    store_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="店铺ID")
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, comment="TikTok 事件类型")
+    callback_url: Mapped[str] = mapped_column(String(500), nullable=False, default="", comment="回调地址")
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="enabled", comment="enabled/disabled/error"
+    )
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="最近校验时间")
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True, comment="最近错误")
+
+
+class TiktokOrderRefreshQueue(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):
+    """Webhook 触发的订单定向刷新队列。"""
+
+    __tablename__ = "tiktok_order_refresh_queue"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "store_id", "external_order_no",
+            name="uq_tiktok_order_refresh_queue_scope",
+        ),
+        Index("ix_tiktok_order_refresh_queue_due", "tenant_id", "status", "next_attempt_at"),
+        table_options("TikTok 订单刷新队列表"),
+    )
+
+    store_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="店铺ID")
+    external_order_no: Mapped[str] = mapped_column(String(64), nullable=False, comment="TikTok 订单ID")
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1, comment="事件合并代数")
+    processed_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="已处理代数")
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", comment="pending/processing/retry_wait/dead/idle"
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, comment="尝试次数")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="下次尝试时间")
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="处理者")
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, comment="租约过期时间")
+    last_error: Mapped[str | None] = mapped_column(String(1000), nullable=True, comment="最近错误")
 
 
 class ChannelListing(IdMixin, TimestampMixin, TenantIdMixin, TenantBase):

@@ -302,6 +302,33 @@ class TikTokClient:
             body=body,
         )
 
+    def get_order_details(self, order_ids: list[str]) -> dict[str, Any]:
+        """按订单 ID 回查权威订单详情；Webhook 只作为变化通知。"""
+        ids = [str(item).strip() for item in order_ids if str(item).strip()]
+        if not ids:
+            raise TikTokApiError("订单 ID 为空")
+        return self.get(
+            "/order/202309/orders",
+            params={"ids": ",".join(ids[:50])},
+        )
+
+    def get_shop_webhooks(self) -> dict[str, Any]:
+        return self.get("/event/202309/webhooks")
+
+    def update_shop_webhook(self, *, event_type: str, address: str) -> dict[str, Any]:
+        return self.request(
+            "PUT",
+            "/event/202309/webhooks",
+            body={"event_type": event_type, "address": address},
+        )
+
+    def delete_shop_webhook(self, *, event_type: str) -> dict[str, Any]:
+        return self.request(
+            "DELETE",
+            "/event/202309/webhooks",
+            body={"event_type": event_type},
+        )
+
     def update_inventory(
         self, product_id: str, skus: list[dict[str, Any]]
     ) -> dict[str, Any]:

@@ -180,6 +180,26 @@ async function disconnect(store: Store): Promise<void> {
   }
 }
 
+const webhookLoadingId = ref('')
+
+async function toggleWebhook(store: Store): Promise<void> {
+  webhookLoadingId.value = String(store.id)
+  try {
+    const result = store.webhook_enabled
+      ? await channelsApi.disableWebhook(tid(), store.id)
+      : await channelsApi.enableWebhook(tid(), store.id)
+    const errors = Object.keys(result.errors ?? {})
+    if (errors.length) {
+      ElMessage.warning(`Webhook 部分订阅失败：${errors.join(', ')}`)
+    } else {
+      ElMessage.success(store.webhook_enabled ? 'Webhook 已停用' : 'Webhook 已启用')
+    }
+    await load()
+  } finally {
+    webhookLoadingId.value = ''
+  }
+}
+
 function credentialStatus(store: Store): string {
   return store.credential?.status ?? store.credential_status ?? store.status
 }
@@ -260,13 +280,22 @@ onMounted(async () => {
       <el-table-column label="凭据状态" width="120">
         <template #default="{ row }"><StatusTag :status="credentialStatus(row as Store)" /></template>
       </el-table-column>
+      <el-table-column label="Webhook" width="120">
+        <template #default="{ row }">
+          <el-tag v-if="row.webhook_enabled" size="small" type="success">已启用</el-tag>
+          <el-tag v-else size="small" type="info">未启用</el-tag>
+          <div v-if="row.webhook_last_event_at" class="text-muted" style="font-size: 11px">
+            {{ formatDateTime(row.webhook_last_event_at) }}
+          </div>
+        </template>
+      </el-table-column>
       <el-table-column label="授权时间" width="170">
         <template #default="{ row }">{{ formatDateTime(row.authorized_at) }}</template>
       </el-table-column>
       <el-table-column label="最近同步" width="170">
         <template #default="{ row }">{{ formatDateTime(row.last_synced_at) }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="150" fixed="right">
+      <el-table-column label="操作" width="220" fixed="right">
         <template #default="{ row }">
           <template v-if="canConnect">
             <el-button
@@ -280,6 +309,16 @@ onMounted(async () => {
               复制授权链接
             </el-button>
             <el-button v-permission="'store.connect'" link type="warning" @click="revokeAuthLink(row as Store)">撤销链接</el-button>
+            <el-button
+              v-if="row.status === 'connected' && row.channel === 'tiktok'"
+              text
+              type="primary"
+              size="small"
+              :loading="webhookLoadingId === String(row.id)"
+              @click="toggleWebhook(row as Store)"
+            >
+              {{ row.webhook_enabled ? '停用回调' : '启用回调' }}
+            </el-button>
             <el-button
               v-if="row.status === 'connected'"
               text

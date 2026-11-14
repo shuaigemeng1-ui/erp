@@ -127,6 +127,9 @@ class Settings(BaseSettings):
     gateway_instance_token: str = ""
     gateway_channel_config: bool = False
     gateway_timeout_seconds: float = 5.0
+    # Gateway 统一 TikTok Webhook：租户只接收 Gateway 已验签的 relay 事件
+    gateway_webhook_relay_secret: str = ""
+    gateway_webhook_callback_url: str = ""
 
     tiktok_api_base: str = "https://open-api.tiktokglobalshop.com"
     tiktok_auth_redirect_url: str = ""

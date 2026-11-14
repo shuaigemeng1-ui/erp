@@ -150,6 +150,44 @@ CREATE TABLE IF NOT EXISTS gateway_audit_logs (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_gateway_audit_created ON gateway_audit_logs(created_at);
+
+CREATE TABLE IF NOT EXISTS gateway_webhook_shops (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel TEXT NOT NULL,
+    platform_shop_id TEXT NOT NULL,
+    instance_id INTEGER NOT NULL,
+    tenant_id INTEGER NOT NULL,
+    store_id INTEGER NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(channel, platform_shop_id)
+);
+CREATE INDEX IF NOT EXISTS ix_gateway_webhook_shops_instance ON gateway_webhook_shops(instance_id);
+
+CREATE TABLE IF NOT EXISTS gateway_webhook_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel TEXT NOT NULL,
+    notification_id TEXT NOT NULL,
+    event_type_code INTEGER NOT NULL DEFAULT 0,
+    event_type_name TEXT NOT NULL DEFAULT '',
+    platform_shop_id TEXT NOT NULL DEFAULT '',
+    instance_id INTEGER,
+    tenant_id INTEGER,
+    store_id INTEGER,
+    payload_cipher TEXT NOT NULL DEFAULT '',
+    payload_sha256 TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    duplicate_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(channel, notification_id)
+);
+CREATE INDEX IF NOT EXISTS ix_gateway_webhook_events_status
+    ON gateway_webhook_events(status, next_attempt_at);
 """
 
 DEFAULT_SETTINGS: dict[str, str] = {
@@ -504,6 +542,153 @@ class GatewayStore:
                     updated_by,
                     utc_now(),
                 ),
+            )
+
+    # ------------------------------------------------------------------ Webhook 路由与 Inbox
+    def upsert_webhook_shop(
+        self,
+        *,
+        channel: str,
+        platform_shop_id: str,
+        instance_id: int,
+        tenant_id: int,
+        store_id: int,
+    ) -> dict[str, Any]:
+        self._ensure()
+        now = utc_now()
+        with self._write() as connection:
+            connection.execute(
+                """INSERT INTO gateway_webhook_shops
+                   (channel, platform_shop_id, instance_id, tenant_id, store_id, active, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                   ON CONFLICT(channel, platform_shop_id) DO UPDATE SET
+                     instance_id=excluded.instance_id,
+                     tenant_id=excluded.tenant_id,
+                     store_id=excluded.store_id,
+                     active=1,
+                     updated_at=excluded.updated_at""",
+                (channel, platform_shop_id, int(instance_id), int(tenant_id), int(store_id), now, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM gateway_webhook_shops WHERE channel = ? AND platform_shop_id = ?",
+                (channel, platform_shop_id),
+            ).fetchone()
+        return dict(row) if row is not None else {}
+
+    def get_webhook_shop(self, channel: str, platform_shop_id: str) -> dict[str, Any] | None:
+        self._ensure()
+        with self._read() as connection:
+            row = connection.execute(
+                """SELECT * FROM gateway_webhook_shops
+                   WHERE channel = ? AND platform_shop_id = ? AND active = 1""",
+                (channel, platform_shop_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def deactivate_webhook_shop(self, channel: str, platform_shop_id: str) -> None:
+        self._ensure()
+        with self._write() as connection:
+            connection.execute(
+                """UPDATE gateway_webhook_shops
+                   SET active = 0, updated_at = ?
+                   WHERE channel = ? AND platform_shop_id = ?""",
+                (utc_now(), channel, platform_shop_id),
+            )
+
+    def create_webhook_event(
+        self,
+        *,
+        channel: str,
+        notification_id: str,
+        event_type_code: int,
+        event_type_name: str,
+        platform_shop_id: str,
+        instance_id: int | None,
+        tenant_id: int | None,
+        store_id: int | None,
+        payload_cipher: str,
+        payload_sha256: str,
+        status: str = "pending",
+        next_attempt_at: int = 0,
+    ) -> tuple[int, bool]:
+        self._ensure()
+        now = utc_now()
+        try:
+            with self._write() as connection:
+                cursor = connection.execute(
+                    """INSERT INTO gateway_webhook_events
+                       (channel, notification_id, event_type_code, event_type_name,
+                        platform_shop_id, instance_id, tenant_id, store_id,
+                        payload_cipher, payload_sha256, status, next_attempt_at,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        channel,
+                        notification_id,
+                        int(event_type_code),
+                        event_type_name,
+                        platform_shop_id,
+                        instance_id,
+                        tenant_id,
+                        store_id,
+                        payload_cipher,
+                        payload_sha256,
+                        status,
+                        int(next_attempt_at),
+                        now,
+                        now,
+                    ),
+                )
+                return int(cursor.lastrowid), False
+        except sqlite3.IntegrityError:
+            with self._write() as connection:
+                connection.execute(
+                    """UPDATE gateway_webhook_events
+                       SET duplicate_count = duplicate_count + 1, updated_at = ?
+                       WHERE channel = ? AND notification_id = ?""",
+                    (now, channel, notification_id),
+                )
+                row = connection.execute(
+                    """SELECT id FROM gateway_webhook_events
+                       WHERE channel = ? AND notification_id = ?""",
+                    (channel, notification_id),
+                ).fetchone()
+            return int(row["id"]) if row is not None else 0, True
+
+    def list_pending_webhook_events(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        self._ensure()
+        with self._read() as connection:
+            rows = connection.execute(
+                """SELECT * FROM gateway_webhook_events
+                   WHERE status = 'pending' AND next_attempt_at <= ?
+                   ORDER BY id ASC LIMIT ?""",
+                (int(time.time()), int(limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_webhook_event(
+        self,
+        event_id: int,
+        *,
+        status: str,
+        attempts: int | None = None,
+        next_attempt_at: int | None = None,
+        last_error: str = "",
+    ) -> None:
+        self._ensure()
+        fields = ["status = ?", "updated_at = ?", "last_error = ?"]
+        values: list[Any] = [status, utc_now(), last_error[:1000]]
+        if attempts is not None:
+            fields.append("attempts = ?")
+            values.append(int(attempts))
+        if next_attempt_at is not None:
+            fields.append("next_attempt_at = ?")
+            values.append(int(next_attempt_at))
+        values.append(int(event_id))
+        with self._write() as connection:
+            connection.execute(
+                f"UPDATE gateway_webhook_events SET {', '.join(fields)} WHERE id = ?",
+                tuple(values),
             )
 
     def channel_app_count(self) -> int:

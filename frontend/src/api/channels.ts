@@ -19,6 +19,20 @@ export interface ListingQuery extends PageParams {
   q?: string
 }
 
+export interface StoreWebhookStatus {
+  store_id: string
+  enabled: boolean
+  last_event_at?: string | null
+  callback_url: string
+  subscriptions: Array<{
+    event_type: string
+    status: string
+    callback_url: string
+    last_checked_at?: string | null
+    last_error?: string | null
+  }>
+}
+
 function toList<T>(raw: T[] | { items?: T[] } | null): T[] {
   if (!raw) return []
   return Array.isArray(raw) ? raw : (raw.items ?? [])
@@ -81,5 +95,21 @@ export const channelsApi = {
 
   unlinkListing(tenantId: EntityId, listingId: EntityId): Promise<void> {
     return http.post<void>(tenantPath(tenantId, `/listings/${segment(listingId)}/unlink`))
+  },
+
+  webhookStatus(tenantId: EntityId, storeId: EntityId): Promise<StoreWebhookStatus> {
+    return http.get<StoreWebhookStatus>(tenantPath(tenantId, `/stores/${segment(storeId)}/webhook/status`))
+  },
+
+  enableWebhook(tenantId: EntityId, storeId: EntityId): Promise<{ enabled: boolean; errors: Record<string, string> }> {
+    return http.post(tenantPath(tenantId, `/stores/${segment(storeId)}/webhook/enable`))
+  },
+
+  disableWebhook(tenantId: EntityId, storeId: EntityId): Promise<{ enabled: boolean; errors: Record<string, string> }> {
+    return http.post(tenantPath(tenantId, `/stores/${segment(storeId)}/webhook/disable`))
+  },
+
+  reconcileWebhook(tenantId: EntityId, storeId: EntityId): Promise<{ enabled: boolean; errors: Record<string, string> }> {
+    return http.post(tenantPath(tenantId, `/stores/${segment(storeId)}/webhook/reconcile`))
   },
 }

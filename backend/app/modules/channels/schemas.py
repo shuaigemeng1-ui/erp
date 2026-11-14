@@ -128,6 +128,8 @@ class StoreOut(BaseModel):
     credential_status: str | None = Field(default=None, description="凭据状态")
     access_token_expires_at: str | None = Field(default=None, description="访问令牌过期时间（UTC）")
     refresh_token_expires_at: str | None = Field(default=None, description="刷新令牌过期时间（UTC）")
+    webhook_enabled: bool = Field(default=False, description="Webhook enabled")
+    webhook_last_event_at: str | None = Field(default=None, description="Last webhook event (UTC)")
 
 
 class StoreCreateIn(BaseModel):
@@ -205,6 +207,8 @@ def store_payload(summary: Any) -> dict[str, Any]:
         "credential_status": summary.credential_status,
         "access_token_expires_at": utc_iso(summary.access_token_expires_at),
         "refresh_token_expires_at": utc_iso(summary.refresh_token_expires_at),
+        "webhook_enabled": bool(getattr(summary, "webhook_enabled", False)),
+        "webhook_last_event_at": utc_iso(getattr(summary, "webhook_last_event_at", None)),
     }
 
 
@@ -213,7 +217,7 @@ def listing_payload(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": id_string(item.get("id")),
         "store_id": id_string(item.get("store_id")),
-          "store_name": item.get("store_name") or "",
+        "store_name": item.get("store_name") or "",
         "external_item_id": item.get("external_item_id") or "",
         "external_sku_id": item.get("external_sku_id") or "",
         "title": item.get("title") or "",

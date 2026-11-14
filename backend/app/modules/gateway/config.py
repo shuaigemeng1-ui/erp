@@ -87,8 +87,8 @@ class GatewayConfig:
     # SQLite 持久性：WAL + synchronous=FULL（默认，接收延迟换持久性；测试/边缘环境可改 NORMAL）
     sqlite_synchronous: str = "FULL"
     # Webhook 分发并发与租约（批次4 task-41）
-    webhook_dispatch_global_concurrency: int = 16
-    webhook_dispatch_tenant_concurrency: int = 8
+    webhook_dispatch_global_concurrency: int = 64
+    webhook_dispatch_tenant_concurrency: int = 32
     webhook_dispatch_store_concurrency: int = 1
     webhook_claim_batch_size: int = 200
     webhook_lease_seconds: int = 60
@@ -138,10 +138,10 @@ class GatewayConfig:
                 "GATEWAY_SQLITE_SYNCHRONOUS", "FULL", {"NORMAL", "FULL"}
             ),
             webhook_dispatch_global_concurrency=_env_int(
-                "GATEWAY_WEBHOOK_DISPATCH_GLOBAL_CONCURRENCY", 16, 1
+                "GATEWAY_WEBHOOK_DISPATCH_GLOBAL_CONCURRENCY", 64, 1
             ),
             webhook_dispatch_tenant_concurrency=_env_int(
-                "GATEWAY_WEBHOOK_DISPATCH_TENANT_CONCURRENCY", 8, 1
+                "GATEWAY_WEBHOOK_DISPATCH_TENANT_CONCURRENCY", 32, 1
             ),
             webhook_dispatch_store_concurrency=_env_int(
                 "GATEWAY_WEBHOOK_DISPATCH_STORE_CONCURRENCY", 1, 1

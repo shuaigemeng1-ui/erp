@@ -613,36 +613,6 @@ def _tiktok_webhook_store(
     return store
 
 
-@router.post("/tenants/{tenant_id}/stores/{store_id}/webhook/enable", summary="启用 TikTok Webhook")
-def enable_tiktok_webhook(
-    tenant_id: int = Path(ge=1),
-    store_id: int = Path(ge=1),
-    ctx: TenantContext = Depends(tenant_context),
-    db: Session = Depends(get_tenant_db),
-    center: Session = Depends(get_center_db),
-    snapshot: AccessSnapshot = Depends(require_permission(Permission.STORE_CONNECT.value)),
-) -> dict[str, Any]:
-    store = _tiktok_webhook_store(db, center, ctx.tenant_id, store_id, snapshot)
-    result = service.enable_tiktok_webhook(center, db, ctx.tenant_id, store)
-    db.commit()
-    return success(result)
-
-
-@router.post("/tenants/{tenant_id}/stores/{store_id}/webhook/disable", summary="停用 TikTok Webhook")
-def disable_tiktok_webhook(
-    tenant_id: int = Path(ge=1),
-    store_id: int = Path(ge=1),
-    ctx: TenantContext = Depends(tenant_context),
-    db: Session = Depends(get_tenant_db),
-    center: Session = Depends(get_center_db),
-    snapshot: AccessSnapshot = Depends(require_permission(Permission.STORE_CONNECT.value)),
-) -> dict[str, Any]:
-    store = _tiktok_webhook_store(db, center, ctx.tenant_id, store_id, snapshot)
-    result = service.disable_tiktok_webhook(center, db, ctx.tenant_id, store)
-    db.commit()
-    return success(result)
-
-
 @router.get("/tenants/{tenant_id}/stores/{store_id}/webhook/status", summary="TikTok Webhook 状态")
 def tiktok_webhook_status(
     tenant_id: int = Path(ge=1),
@@ -674,21 +644,6 @@ def tiktok_webhook_status(
             ],
         }
     )
-
-
-@router.post("/tenants/{tenant_id}/stores/{store_id}/webhook/reconcile", summary="重检 TikTok Webhook 订阅")
-def reconcile_tiktok_webhook(
-    tenant_id: int = Path(ge=1),
-    store_id: int = Path(ge=1),
-    ctx: TenantContext = Depends(tenant_context),
-    db: Session = Depends(get_tenant_db),
-    center: Session = Depends(get_center_db),
-    snapshot: AccessSnapshot = Depends(require_permission(Permission.STORE_CONNECT.value)),
-) -> dict[str, Any]:
-    store = _tiktok_webhook_store(db, center, ctx.tenant_id, store_id, snapshot)
-    result = service.enable_tiktok_webhook(center, db, ctx.tenant_id, store)
-    db.commit()
-    return success(result)
 
 
 # --------------------------------------------------------------------------- TikTok Shop

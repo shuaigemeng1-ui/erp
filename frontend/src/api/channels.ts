@@ -101,15 +101,6 @@ export const channelsApi = {
     return http.get<StoreWebhookStatus>(tenantPath(tenantId, `/stores/${segment(storeId)}/webhook/status`))
   },
 
-  enableWebhook(tenantId: EntityId, storeId: EntityId): Promise<{ enabled: boolean; errors: Record<string, string> }> {
-    return http.post(tenantPath(tenantId, `/stores/${segment(storeId)}/webhook/enable`))
-  },
 
-  disableWebhook(tenantId: EntityId, storeId: EntityId): Promise<{ enabled: boolean; errors: Record<string, string> }> {
-    return http.post(tenantPath(tenantId, `/stores/${segment(storeId)}/webhook/disable`))
-  },
 
-  reconcileWebhook(tenantId: EntityId, storeId: EntityId): Promise<{ enabled: boolean; errors: Record<string, string> }> {
-    return http.post(tenantPath(tenantId, `/stores/${segment(storeId)}/webhook/reconcile`))
-  },
 }

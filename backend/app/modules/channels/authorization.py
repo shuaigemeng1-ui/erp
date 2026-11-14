@@ -255,6 +255,21 @@ def persist_result(payload: dict, result: dict | None = None) -> dict:
                 output = tiktok.complete_authorization(center, db, session=payload,
                     token=result["token"], shop=result["shop"], warehouse_id=result.get("warehouse_id", ""))
         finish_result(center, link_id)
+        if row.channel == "tiktok":
+            # Webhook 是应用级集成配置，由平台侧在授权成功后自动启用；
+            # 租户只能查看状态，不能自行打开/关闭平台事件订阅。
+            try:
+                from app.modules.channels import service
+                with tenant_session(route) as db:
+                    store = service.get_store_or_raise(db, int(output["tenant_id"]), int(output["store_id"]))
+                    service.enable_tiktok_webhook(center, db, int(output["tenant_id"]), store)
+                    db.commit()
+            except Exception:  # noqa: BLE001 - 授权成功不能因 webhook 平台配置失败而回滚
+                logger.warning(
+                    "TikTok 授权成功但 Webhook 自动配置失败：tenant=%s store=%s",
+                    output.get("tenant_id"),
+                    output.get("store_id"),
+                )
         return output
 
 

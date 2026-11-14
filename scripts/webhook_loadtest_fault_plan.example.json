@@ -1,0 +1,32 @@
+[
+  {
+    "at_seconds": 60,
+    "label": "tenant-offline",
+    "command": "<ISOLATED_ONLY> /opt/ventasync/deploy/scripts/loadtest-fault.sh tenant-offline"
+  },
+  {
+    "at_seconds": 1860,
+    "label": "tenant-online",
+    "command": "<ISOLATED_ONLY> /opt/ventasync/deploy/scripts/loadtest-fault.sh tenant-online"
+  },
+  {
+    "at_seconds": 1920,
+    "label": "redis-stop",
+    "command": "<ISOLATED_ONLY> /opt/ventasync/deploy/scripts/loadtest-fault.sh redis-stop"
+  },
+  {
+    "at_seconds": 1980,
+    "label": "redis-start",
+    "command": "<ISOLATED_ONLY> /opt/ventasync/deploy/scripts/loadtest-fault.sh redis-start"
+  },
+  {
+    "at_seconds": 2040,
+    "label": "worker-stop",
+    "command": "<ISOLATED_ONLY> /opt/ventasync/deploy/scripts/loadtest-fault.sh worker-stop"
+  },
+  {
+    "at_seconds": 2100,
+    "label": "worker-start",
+    "command": "<ISOLATED_ONLY> /opt/ventasync/deploy/scripts/loadtest-fault.sh worker-start"
+  }
+]

@@ -784,7 +784,7 @@ def _business_db_status(center) -> tuple[str, str]:
     """业务库：tenant 模式绑定单一租户；中心模式未绑定单一租户。"""
     tenant_id = int(getattr(settings, "tenant_id", 0) or 0)
     if tenant_id <= 0:
-        return "unknown", "中心模式未绑定单一租户，业务库按租户独立"
+        return "not_applicable", "中心模式未绑定单一租户；业务库按租户实例独立监控"
     from app.db.session import tenant_session
     from app.modules.identity.service import load_tenant_db_route
 
@@ -900,7 +900,7 @@ def overall_status(components: Sequence[dict[str, Any]]) -> str:
         return "unhealthy"
     degraded = False
     for name in ("business_db", "worker", "scheduler"):
-        if by_name.get(name) not in (None, "ok"):
+        if by_name.get(name) not in (None, "ok", "not_applicable"):
             degraded = True
     return "degraded" if degraded else "healthy"
 

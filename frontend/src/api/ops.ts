@@ -244,6 +244,14 @@ const MONITOR_OK_VALUES = new Set([
   'online',
   'active',
 ])
+const MONITOR_NOT_APPLICABLE_VALUES = new Set([
+  'not_applicable',
+  'not-applicable',
+  'n/a',
+  'na',
+  'not_configured',
+  '不适用',
+])
 const MONITOR_DEGRADED_VALUES = new Set(['degraded', 'warning', 'warn', 'stale', 'partial', 'slow'])
 const MONITOR_ERROR_VALUES = new Set([
   'error',
@@ -273,6 +281,7 @@ function nullableString(value: unknown): string | null {
 function normalizeComponentStatusValue(value: unknown): OpsMonitorComponentStatus {
   const text = String(value ?? '').trim().toLowerCase()
   if (MONITOR_OK_VALUES.has(text)) return 'ok'
+  if (MONITOR_NOT_APPLICABLE_VALUES.has(text)) return 'not_applicable'
   if (MONITOR_DEGRADED_VALUES.has(text)) return 'degraded'
   if (MONITOR_ERROR_VALUES.has(text)) return 'error'
   return 'unknown'
@@ -348,7 +357,12 @@ export function normalizeMonitorOverall(
   }
   if (components.some((item) => item.status === 'error')) return 'unhealthy'
   if (components.some((item) => item.status === 'degraded')) return 'degraded'
-  if (components.length > 0 && components.every((item) => item.status === 'ok')) return 'healthy'
+  if (
+    components.length > 0 &&
+    components.every((item) => item.status === 'ok' || item.status === 'not_applicable')
+  ) {
+    return 'healthy'
+  }
   return 'unknown'
 }
 

@@ -233,6 +233,7 @@ function componentStatusText(status: OpsMonitorComponentStatus): string {
   if (status === 'ok') return '正常'
   if (status === 'degraded') return '降级'
   if (status === 'error') return '异常'
+  if (status === 'not_applicable') return '不适用'
   return '未知'
 }
 

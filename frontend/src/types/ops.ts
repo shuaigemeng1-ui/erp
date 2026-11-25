@@ -271,7 +271,7 @@ export interface OpsNodeSshExecResult {
  * ------------------------------------------------------------------ */
 
 /** 监控分项状态（归一化）：ok=正常，degraded=降级，error=异常，unknown=未知 */
-export type OpsMonitorComponentStatus = 'ok' | 'degraded' | 'error' | 'unknown'
+export type OpsMonitorComponentStatus = 'ok' | 'degraded' | 'error' | 'unknown' | 'not_applicable'
 
 /** 监控分项（归一化后，页面直接渲染） */
 export interface OpsMonitorComponent {

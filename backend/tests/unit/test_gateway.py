@@ -1326,8 +1326,8 @@ def test_webhook_health_stats_and_dispatch_config(tmp_path) -> None:
         webhook = health["webhook"]
         for key in ("pending", "delivered", "dead", "retry", "oldest_pending_at", "last_delivery_latency_ms"):
             assert key in webhook
-        assert health["webhook_dispatch"]["global_concurrency"] == 16
-        assert health["webhook_dispatch"]["tenant_concurrency"] == 8
+        assert health["webhook_dispatch"]["global_concurrency"] == 64
+        assert health["webhook_dispatch"]["tenant_concurrency"] == 32
         assert health["storage"]["backend"] == "sqlite"
         assert client.get("/api/v1/gateway/admin/webhook-stats").status_code == 401
         stats = client.get(

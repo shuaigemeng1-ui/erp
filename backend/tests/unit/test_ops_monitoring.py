@@ -513,6 +513,17 @@ def test_components_status(center, monkeypatch):
     assert monitoring.overall_status(components) == "unhealthy"
 
 
+def test_overall_status_ignores_not_applicable_business_db():
+    components = [
+        {"name": "identity_db", "status": "ok"},
+        {"name": "business_db", "status": "not_applicable"},
+        {"name": "redis", "status": "ok"},
+        {"name": "worker", "status": "ok"},
+        {"name": "scheduler", "status": "ok"},
+    ]
+    assert monitoring.overall_status(components) == "healthy"
+
+
 def test_monitoring_overview_contract(center, monkeypatch):
     monkeypatch.setattr(monitoring, "_ping_center", lambda c: None)
     monkeypatch.setattr(monitoring, "_ping_redis", lambda: None)
